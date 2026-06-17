@@ -1,0 +1,78 @@
+# Default configuration for Exit Manager
+# All paths are absolute or relative to working directory
+
+ib:
+  host: "127.0.0.1"
+  port: 4001  # IB Gateway LIVE
+  client_id: 88
+  market_data_type: 1  # LIVE — OPRA options + real-time stock subscribed 2026-06-12
+
+journal:
+  path: "./trades.log"
+
+state:
+  path: "./exitmgr_state.json"
+
+kill_switch:
+  path: "./KILL_SWITCH"
+
+loop:
+  interval_seconds: 60
+
+scope:
+  # "journal" = only contracts in trades.log (default)
+  # "all" = all long call positions in account
+  mode: "all"
+
+caps:
+  max_orders_per_cycle: 5
+  max_orders_per_day: 20
+  max_notional_per_day: 50000.0  # dollars
+
+rules:
+  profit_target_pct: 100.0   # close at +100% of entry cost (optional, set null to disable)
+  stop_pct: 50.0             # close at -50% of entry cost (optional, set null to disable)
+  time_stop_days: 3          # close when DTE <= N
+  exit_market_orders: true   # exits fill as MARKET orders (triggered stop/target always executes)          # close when DTE <= N (optional, set null to disable)
+  trailing:
+    enabled: false
+    activation_gain_pct: 50.0  # activate after +50% gain
+    giveback_fraction: 0.5     # close if gives back 50% of peak gain
+
+# ---- LLM trading orchestrator (turnkey loop) ----
+trading:
+  slack_channel: "YOUR_SLACK_CHANNEL_ID"   # #trading-approvals (recommendations)
+  summary_channel: "YOUR_SLACK_CHANNEL_ID"  # #trading-positions
+  alerts_channel: "YOUR_SLACK_CHANNEL_ID"   # #trading-alerts (real-time exit pings)  # #trading-positions (daily P&L summary)   # #trading-approvals
+  approver_ids: [YOUR_SLACK_USER_ID]             # YOUR Slack user id(s) -- only these can approve
+  llm_endpoint: "http://127.0.0.1:8082/v1/chat/completions"
+  llm_model: "/Users/alfredpennyworth/models/MiniMax-M3-8bit"
+  approved_names:
+  - SPY
+  - MU
+  - NBIS
+  - ASTS
+  - RKLB
+  - CRWV
+  - LITE
+  - LUMN
+  - NOK
+  - DRAM
+  - SOXL
+  - TQQQ
+  - UPRO
+  - URTY
+# names quoted in the strategist's market brief each cycle (e.g. [NVDA, AAPL])
+  allow_model_names: true      # open universe (any liquid name) MINUS the blocklist below
+  blocked_names: [TSLA, ARKK, ARKQ, ARKW, ARKG, ARKF, ARKX]        # Elon-linked; edit freely (ASTS/RKLB/RDW intentionally NOT blocked)
+  blocked_sector_keywords: [biotech, drug manufacturers, pharmaceutical]  # auto-block biotech/pharma by sector      # model may propose ANY liquid single name (size/exposure caps + your 👍 still required)
+  pot_cap_usd: null            # optional ring-fence; null = use full live NetLiquidation
+  confident_full_size: true   # high-conviction ideas may use the whole pot (Trevor 6/12)
+  confident_conviction: 7   # 7-10 -> may use whole pot (lowered from 8 6/17, matches add-suggest bar)
+  max_trade_pct: 0.30          # <=30% of pot per trade (raised from 12% 6/17 — small pot was producing tiny trades)
+  add_suggest_min_conviction: 7   # add-from-discovery -> same-day one-tap only if conviction >= this
+  entry_limit_buffer_pct: 0.05   # BUY entries placed at mid*(1+this) = marketable, so they FILL instead of resting at the mid. 0 = old behavior.
+  max_concurrent: 4
+  daily_halt_pct: 0.08         # -8% daily circuit breaker
+  baseline_path: "./day_baseline.json"
+  audit_path: "./audit.jsonl"

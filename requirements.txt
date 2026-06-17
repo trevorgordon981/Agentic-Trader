@@ -1,0 +1,9 @@
+# maintained fork (py3.10+); on py3.9 the exitmgr/ibkr.py shim auto-falls back to ib_insync
+ib_async>=2.0 ; python_version >= '3.10'
+ib_insync>=0.9.86 ; python_version < '3.10'
+pyyaml
+typer
+pytest
+pytest-asyncio
+pytest-timeout
+yfinance>=0.2  # optional: earnings dates for the research brief (research.py)

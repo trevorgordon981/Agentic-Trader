@@ -1,0 +1,5 @@
+{"ts": "2026-01-15T14:31:00+00:00", "event": "cycle_start", "net_liq": 1000.0, "available": 1000.0, "day_pnl_pct": 0.0, "dry_run": false}
+{"ts": "2026-01-15T14:31:05+00:00", "event": "daily_recommend", "count": 2, "scores": [7, 5]}
+{"ts": "2026-01-15T14:31:20+00:00", "event": "daily_rec_posted", "underlying": "IWM", "conviction": 7, "order": "BUY 1x IWM 20260220 300/310C debit spread @ $2.00 LMT  (max loss ~$200, max value $1,000)", "profit_target_pct": 75.0, "stop_pct": 40.0, "over_default": false}
+{"ts": "2026-01-15T15:02:00+00:00", "event": "daily_rec_executed", "underlying": "IWM", "order": "BUY 1x IWM 20260220 300/310C debit spread @ $2.00 LMT"}
+{"ts": "2026-01-15T15:45:00+00:00", "event": "exit", "underlying": "IWM", "reason": "take_profit", "pnl_pct": 76.0}

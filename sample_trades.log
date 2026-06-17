@@ -1,0 +1,1 @@
+{"ts": "2026-01-15T15:02:00", "contract_id": 100000001, "symbol": "IWM", "right": "C", "expiry": "20260220", "strike": 300.0, "quantity": 1, "debit": 200.0, "profit_target_pct": 75.0, "stop_pct": 40.0, "spread": {"short_con_id": 100000002, "short_strike": 310.0, "width": 10.0}}

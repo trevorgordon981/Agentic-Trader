@@ -1,0 +1,10 @@
+config.yaml
+audit.jsonl
+trades.log
+*.bak*
+__pycache__/
+*.pyc
+.env
+day_baseline.json
+exitmgr_state.json
+*.local.*
