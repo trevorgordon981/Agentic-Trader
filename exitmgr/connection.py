@@ -180,6 +180,13 @@ class IBConnection:
             contracts.append(contract)
             con_id_to_idx[con_id] = i
 
+        # Qualify the conId-only contracts FIRST -- reqTickers on unqualified contracts hangs/times
+        # out; qualifying makes option quotes actually stream (restores mechanical TP/SL evaluation).
+        try:
+            qc = await self.ib.qualifyContractsAsync(*contracts)
+            contracts = [c for c in qc if getattr(c, "conId", None)] or contracts
+        except Exception as e:
+            print(f"[WARN] qualify failed in fetch_quotes: {e}")
         # Request tickers
         tickers = await self.ib.reqTickersAsync(*contracts)
 

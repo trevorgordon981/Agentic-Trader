@@ -21,7 +21,7 @@ import yaml
 
 from exitmgr.account import get_pot_snapshot
 from exitmgr.connection import IBConnection
-from exitmgr.ibkr import Stock, Option, Order
+from exitmgr.ibkr import Stock, Option, Order, pick_chain, strikes_near, underlying_price
 from exitmgr.strategist import propose, discover_names, propose_one, TradeIdea
 from exitmgr.trader import ResolvedOrder, order_summary, audit
 from exitmgr import approval, research
@@ -68,11 +68,14 @@ async def _resolve(ib, idea, available):
     params = await ib.reqSecDefOptParamsAsync(idea.underlying, "", "STK", stk.conId)
     if not params:
         return None, "no option chain"
-    p = params[0]
+    p = pick_chain(params, idea.underlying)
+    if p is None:
+        return None, "no SMART option chain"
     today = datetime.now(timezone.utc).date()
     expiry = min(p.expirations, key=lambda e:
                  abs((datetime.strptime(e, "%Y%m%d").date() - today).days - idea.target_dte))
-    cands = [Option(idea.underlying, expiry, k, right, p.exchange or "SMART") for k in sorted(p.strikes)]
+    spot = await underlying_price(ib, stk)
+    cands = [Option(idea.underlying, expiry, k, right, "SMART") for k in strikes_near(p.strikes, spot)]
     qualified = await ib.qualifyContractsAsync(*cands)
     tickers = await ib.reqTickersAsync(*[c for c in qualified if getattr(c, "conId", None)])
     best, best_err = None, 1e9
@@ -215,7 +218,7 @@ async def run(args):
             # Morning discovery: scout NEW watchlist candidates worth researching (not trades to place).
             try:
                 cands = discover_names(tr.get("llm_endpoint"), tr.get("llm_model"), brief,
-                                       exclude=set(names), timeout=1200,
+                                       exclude=set(names), timeout=400,
                                        blocked=tr.get("blocked_names", []))
                 if cands:
                     disc_cands = [t for t, _ in cands]
@@ -227,7 +230,13 @@ async def run(args):
             except Exception as e:
                 audit(audit_path, "discovery_error", error=str(e))
 
-            ideas = propose(tr.get("llm_endpoint"), tr.get("llm_model"), brief, timeout=1800, recommend=True)
+            try:
+                ideas = propose(tr.get("llm_endpoint"), tr.get("llm_model"), brief, timeout=400, recommend=True)
+            except Exception as e:
+                audit(audit_path, "propose_error", error=str(e))
+                approval.post_proposal(token, channel,
+                    f":warning: *Daily slate* — couldn't reach the model to generate ideas ({e}). Retry with slate-now.")
+                print(f"[ERROR] propose failed: {e}"); return 1
             ideas.sort(key=lambda i: -i.conviction)
             audit(audit_path, "daily_recommend", count=len(ideas),
                   scores=[i.conviction for i in ideas])
@@ -240,6 +249,19 @@ async def run(args):
         default_pct = float(tr.get("max_trade_pct", 0.12))     # conservative default slice of the pot
         cons_budget = min(pot.available_funds, default_pct * pot.net_liq)
         pending = []  # (ts, ResolvedOrder, tp_pct, sl_pct, idea, over_default)
+
+        # Book review + funding rotation (2026-06-18): synopsis of hold/trim/sell per open position,
+        # and if the top idea outruns available cash, which position to sell to fund it. Advisory.
+        try:
+            from portfolio import review_positions, format_synopsis
+            _top = ideas[0]
+            _rev = await review_positions(ib, idea={"symbol": _top.underlying, "structure": _top.structure,
+                                                    "est_cost_usd": round(_top.est_debit_usd), "conviction": _top.conviction})
+            if _rev.get("book"):
+                approval.post_proposal(token, channel, format_synopsis(_rev))
+                audit(audit_path, "book_review", reviews=_rev.get("reviews"), rotation=_rev.get("rotation"))
+        except Exception as _e:
+            audit(audit_path, "review_error", error=str(_e))
         for idea in ideas:
             # CONSERVATIVE DEFAULT: size to ~default_pct of the pot; go full only on an opt-in reply.
             await _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pending)
@@ -274,7 +296,7 @@ async def run(args):
                         min_conv = float(tr.get("add_suggest_min_conviction", 6))
                         for tk in really:
                             try:
-                                idea = propose_one(tr.get("llm_endpoint"), tr.get("llm_model"), brief, tk, timeout=1800)
+                                idea = propose_one(tr.get("llm_endpoint"), tr.get("llm_model"), brief, tk, timeout=400)
                             except Exception as e:
                                 audit(audit_path, "add_suggest_error", ticker=tk, error=str(e))
                                 continue
@@ -364,10 +386,27 @@ async def run(args):
                 if r.short_contract is not None:
                     combo = conn.create_combo_contract(
                         r.underlying, [(r.contract.conId, "BUY"), (r.short_contract.conId, "SELL")])
-                    ib.placeOrder(combo, order)
+                    trade = ib.placeOrder(combo, order)
                 else:
-                    ib.placeOrder(r.contract, order)
-                await asyncio.sleep(1.5)  # let it transmit before we move on
+                    trade = ib.placeOrder(r.contract, order)
+                # Wait for IBKR to ACK (live) or REJECT — never assume it landed (Error 201 etc.).
+                _reject_states = {"Cancelled", "ApiCancelled", "Inactive"}
+                _live_states = {"PreSubmitted", "Submitted", "Filled"}
+                for _ in range(16):  # up to ~8s
+                    await asyncio.sleep(0.5)
+                    st = trade.orderStatus.status
+                    if st in _live_states or st in _reject_states:
+                        break
+                st = trade.orderStatus.status
+                _reasons = [le.message for le in trade.log if getattr(le, "errorCode", 0)]
+                if st in _reject_states:
+                    reason = _reasons[-1] if _reasons else f"order status {st}"
+                    approval.post_proposal(token, channel,
+                        f":x: *Order REJECTED by IBKR* — `{order_summary(r)}` was NOT placed.\n{reason}")
+                    audit(audit_path, "daily_rec_rejected", underlying=r.underlying,
+                          order=order_summary(r), status=st, reason=reason)
+                    done.add(ts)
+                    continue
                 with open(journal_path, "a") as f:
                     import json as _j
                     spread_j = ({"spread": {"short_con_id": r.short_contract.conId,

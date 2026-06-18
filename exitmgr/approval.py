@@ -226,8 +226,18 @@ def _api(method: str, token: str, params: dict, http_post: bool = True) -> dict:
         req = urllib.request.Request(
             url + "?" + urlencode(params), headers={"Authorization": f"Bearer {token}"}
         )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read())
+    # Self-healing: a transient network blip (e.g. Errno 51 Network unreachable) must NOT crash
+    # the watch loop. Retry, then return a benign not-ok dict -- every caller checks .get("ok"),
+    # so a failed poll simply skips this tick and retries on the next iteration.
+    last_err = None
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read())
+        except (OSError, ValueError) as e:
+            last_err = e
+            time.sleep(min(8, 2 * (attempt + 1)))
+    return {"ok": False, "error": f"transient: {last_err}"}
 
 
 def post_proposal(token: str, channel: str, text: str) -> Optional[str]:

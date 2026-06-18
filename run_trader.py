@@ -57,14 +57,31 @@ def main(
     )
 
     async def run():
-        if not await ib_conn.connect():
+        if not await ib_conn.connect(retries=3, retry_delay=10):
             print("[ERROR] could not connect to IBKR"); return
         if not await exit_mgr._reconcile_on_startup():
             print("[ERROR] reconciliation failed - aborting"); await ib_conn.disconnect(); return
         print(f"[INFO] {'LIVE (--arm)' if arm else 'DRY RUN'} | port {cfg.ib.port}")
         if loop:
             while True:
-                await trader.run_once(dry_run)
+                try:
+                    # SELF-HEAL: a dropped IBKR link must not leave exits blind. Reconnect each cycle.
+                    if not (ib_conn.ib and ib_conn.ib.isConnected()):
+                        print("[WARN] IBKR connection lost -- reconnecting")
+                        ib_conn._connected = False
+                        try:
+                            if ib_conn.ib: ib_conn.ib.disconnect()
+                        except Exception:
+                            pass
+                        if await ib_conn.connect(retries=3, retry_delay=10):
+                            await exit_mgr._reconcile_on_startup()
+                            print("[INFO] reconnected to IBKR")
+                        else:
+                            print("[ERROR] reconnect failed; retrying next cycle")
+                            await asyncio.sleep(interval); continue
+                    await trader.run_once(dry_run)
+                except Exception as e:
+                    print(f"[ERROR] cycle error (loop continues): {e}")
                 await asyncio.sleep(interval)
         else:
             await trader.run_once(dry_run)

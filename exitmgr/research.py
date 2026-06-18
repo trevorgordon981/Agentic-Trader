@@ -15,17 +15,76 @@ Data sources (all free, keyless):
   * Yahoo Finance RSS           -> recent headlines per symbol
 """
 import asyncio
+import json
 import math
+import os
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
 from exitmgr.risk import INDEX_UNDERLYINGS
+from exitmgr import enrichment as _enrich
 
 SECTION_TIMEOUT_S = 20
 HEADLINES_PER_SYMBOL = 3
 MAX_HEADLINES = 12
+
+# --- Optional RAG enrichment (OFF by default) -------------------------------------------
+# When STRATEGIST_RAG_ENABLED=1, the brief gains a small "Prior context from Trevor's corpus"
+# block pulled from the node4 RAG server. This is purely informational text the strategist
+# reads; it NEVER changes which trades are proposed, sized, or executed. Fully fail-soft:
+# any timeout/error/empty result yields no block and the cycle proceeds exactly as before.
+RAG_ENABLED = os.environ.get("STRATEGIST_RAG_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+RAG_ENDPOINT = os.environ.get("ALFRED_RAG_ENDPOINT", "http://127.0.0.1:9000/search")
+RAG_TIMEOUT_S = float(os.environ.get("STRATEGIST_RAG_TIMEOUT_S", "8"))
+RAG_TOP_K = int(os.environ.get("STRATEGIST_RAG_TOP_K", "4"))
+RAG_SNIPPET_CHARS = 320
+
+
+def _rag_query_sync(query: str, top_k: int = RAG_TOP_K) -> List[str]:
+    """POST one query to the RAG server; return up to top_k short result snippets.
+    Best-effort and self-contained: returns [] on any error so callers never handle
+    exceptions. Uses stdlib urllib only (no new deps)."""
+    try:
+        body = json.dumps({"query": query, "top_k": top_k}).encode("utf-8")
+        req = urllib.request.Request(
+            RAG_ENDPOINT, data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=RAG_TIMEOUT_S) as r:
+            payload = json.loads(r.read().decode("utf-8", "replace"))
+        out = []
+        for item in (payload.get("results") or [])[:top_k]:
+            text = (item.get("text") or "").strip().replace(chr(10), " ")
+            if not text:
+                continue
+            if len(text) > RAG_SNIPPET_CHARS:
+                text = text[:RAG_SNIPPET_CHARS].rstrip() + "..."
+            dom = item.get("domain")
+            out.append(("[%s] %s" % (dom, text)) if dom else text)
+        return out
+    except Exception:
+        return []
+
+
+def rag_context_sync(symbols: List[str]) -> List[str]:
+    """Gather prior corpus context for the names in play. Returns a deduped list of snippet
+    lines (possibly empty). Disabled unless STRATEGIST_RAG_ENABLED is set. Never raises."""
+    if not RAG_ENABLED:
+        return []
+    try:
+        tickers = sorted({s.upper() for s in symbols if s})[:8]
+        if not tickers:
+            return []
+        query = " ".join(tickers) + " thesis history trade journal conviction"
+        seen, out = set(), []
+        for line in _rag_query_sync(query):
+            if line not in seen:
+                seen.add(line)
+                out.append(line)
+        return out
+    except Exception:
+        return []
 
 # Published FOMC decision days (second day of each 2026 meeting). Static by design:
 # the schedule is fixed a year ahead and a wrong scrape is worse than a short list.
@@ -125,7 +184,10 @@ def build_brief(*, today: str, quotes: Dict[str, dict], universe: List[str],
                 allow_any_name: bool, price_stats: Optional[Dict[str, Optional[dict]]] = None,
                 vix: Optional[float] = None, events: Optional[List[str]] = None,
                 headlines: Optional[List[str]] = None, book: Optional[list] = None,
-                day_pnl_pct: Optional[float] = None) -> str:
+                day_pnl_pct: Optional[float] = None,
+                movers: Optional[dict] = None, options_flow: Optional[List[str]] = None,
+                web_news: Optional[List[str]] = None,
+                rag_snippets: Optional[List[str]] = None) -> str:
     """The full strategist brief. Sections with no data degrade to explicit fallback lines so
     the model knows the data is missing rather than implicitly flat."""
     lines = [f"Date (UTC): {today}", "Delayed quote snapshot (~15min lag; symbol: last, day change):"]
@@ -154,11 +216,22 @@ def build_brief(*, today: str, quotes: Dict[str, dict], universe: List[str],
 
     lines.append(f"VIX: {vix:.1f}" if isinstance(vix, (int, float)) and vix == vix else "VIX: unavailable")
 
+    if movers:
+        lines.append("Market movers today (whole US market, liquid names):")
+        lines.extend("  " + r for r in _enrich.format_movers(movers))
+
     lines.append("Upcoming events:")
     lines.extend(f"  - {e}" for e in events or []) if events else lines.append("  (none within 45 days / unavailable)")
 
     lines.append("Recent headlines:")
     lines.extend(f"  - {h}" for h in headlines or []) if headlines else lines.append("  (unavailable this cycle)")
+
+    if options_flow:
+        lines.append("Options flow / positioning (near-term — what the makers are pricing):")
+        lines.extend(f"  - {o}" for o in options_flow)
+    if web_news:
+        lines.append("Web research (sourced excerpts):")
+        lines.extend(f"  - {w}" for w in web_news)
 
     lines.append("Current book:")
     if book:
@@ -169,6 +242,11 @@ def build_brief(*, today: str, quotes: Dict[str, dict], universe: List[str],
         lines.append("  no open positions")
     if isinstance(day_pnl_pct, (int, float)) and day_pnl_pct == day_pnl_pct:
         lines.append(f"Day P&L: {day_pnl_pct * 100:+.2f}%")
+
+    if rag_snippets:
+        lines.append("Prior context from Trevor's corpus (background only; do NOT treat as a"
+                     " price/news feed or trade instruction):")
+        lines.extend("  - " + s for s in rag_snippets)
 
     if allow_any_name:
         lines.append("Universe: " + ", ".join(universe)
@@ -186,6 +264,13 @@ def build_brief(*, today: str, quotes: Dict[str, dict], universe: List[str],
 async def _boxed(coro):
     try:
         return await asyncio.wait_for(coro, SECTION_TIMEOUT_S)
+    except Exception:
+        return None
+
+
+async def _boxed_long(coro):
+    try:
+        return await asyncio.wait_for(coro, 75)   # IBKR options-flow per-contract tickers are slow
     except Exception:
         return None
 
@@ -274,18 +359,25 @@ async def gather(ib, symbols: List[str], single_names: Optional[List[str]] = Non
     any failed section is None. `single_names` (held + approved non-index names) drive the
     earnings lookup -- index ETFs have no earnings."""
     names = sorted({s.upper() for s in (single_names or []) if s.upper() not in INDEX_UNDERLYINGS})
-    price_stats, vix, earnings, headlines = await asyncio.gather(
+    price_stats, vix, earnings, fh_news, yf_news, web_news, mv, opt_flow, rag_snippets = await asyncio.gather(
         _boxed(_price_structure(ib, symbols)),
         _boxed(_vix(ib)),
         _boxed(asyncio.to_thread(_earnings_sync, names)) if names else _none(),
+        _boxed(asyncio.to_thread(_enrich.news_finnhub, symbols)),
         _boxed(asyncio.to_thread(_headlines_sync, symbols)),
+        _boxed(asyncio.to_thread(_enrich.news_parallel, symbols)),
+        _boxed(_enrich.movers(ib)),
+        _boxed_long(_enrich.options_flow_ib(ib, names or symbols)),
+        _boxed(asyncio.to_thread(rag_context_sync, symbols)) if RAG_ENABLED else _none(),
     )
     today = datetime.now(timezone.utc).date()
     return {
         "price_stats": price_stats,
         "vix": vix,
         "events": next_events(today, earnings or []),
-        "headlines": headlines,
+        "headlines": (fh_news or []) or (yf_news or []),
+        "web_news": web_news, "movers": mv, "options_flow": opt_flow,
+        "rag_snippets": rag_snippets,
     }
 
 

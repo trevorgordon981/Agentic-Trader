@@ -270,17 +270,21 @@ class Trader:
     async def _resolve_order(self, idea: TradeIdea, per_trade_cap: float) -> Optional[ResolvedOrder]:
         """Select the concrete option contract from target DTE/delta and size it. Returns a
         ResolvedOrder (no order placed yet) or None if nothing usable. Validate on first live run."""
-        from exitmgr.ibkr import Option
+        from exitmgr.ibkr import Option, Stock, pick_chain, strikes_near, underlying_price
         ib = self.ib_conn.ib
         right = "C" if idea.direction == "bullish" else "P"
-        params = await ib.reqSecDefOptParamsAsync(idea.underlying, "", "STK", 0)
+        stk = (await ib.qualifyContractsAsync(Stock(idea.underlying, "SMART", "USD")))[0]
+        params = await ib.reqSecDefOptParamsAsync(idea.underlying, "", "STK", stk.conId)
         if not params:
             return None
-        p = params[0]
+        p = pick_chain(params, idea.underlying)
+        if p is None:
+            return None
         def dte(exp):
             return abs((datetime.strptime(exp, "%Y%m%d").date() - datetime.now(timezone.utc).date()).days - idea.target_dte)
         expiry = min(sorted(p.expirations), key=dte)
-        cands = [Option(idea.underlying, expiry, k, right, p.exchange or "SMART") for k in sorted(p.strikes)]
+        spot = await underlying_price(ib, stk)
+        cands = [Option(idea.underlying, expiry, k, right, "SMART") for k in strikes_near(p.strikes, spot)]
         qualified = await ib.qualifyContractsAsync(*cands)
         tickers = await ib.reqTickersAsync(*[c for c in qualified if getattr(c, "conId", None)])
         best, best_err = None, 1e9

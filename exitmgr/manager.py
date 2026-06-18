@@ -1,6 +1,7 @@
 """Main manager orchestrating the exit management loop."""
 
 import asyncio
+import os
 import json
 import signal
 import sys
@@ -91,6 +92,41 @@ class ExitManager:
             print(f"[KILL SWITCH] Kill switch file detected at {self.config.kill_switch.path} - halting order placement")
             return True
         return False
+
+    def _manual_exit_path(self):
+        return os.path.join(os.path.dirname(self.config.journal.path) or ".", "manual_exits.json")
+
+    def _read_manual_exits(self) -> Set[int]:
+        try:
+            with open(self._manual_exit_path()) as f:
+                return {int(x) for x in json.load(f)}
+        except Exception:
+            return set()
+
+    def _manual_exit_fail(self, sym, cid, reason) -> None:
+        # NO silent failure: record the error + ping Slack, then drop the request (avoid retry-spam).
+        try:
+            with open(os.path.join(os.path.dirname(self.config.journal.path) or ".", "manual_exit_errors.log"), "a") as f:
+                f.write(f"{datetime.utcnow().isoformat()} {sym} con_id={cid} FAILED: {reason}\n")
+        except Exception:
+            pass
+        try:
+            ch = getattr(self.config, "alerts_channel", "") or ""; tok = os.environ.get("SLACK_BOT_TOKEN", "")
+            if ch and tok:
+                from exitmgr import approval
+                approval.post_proposal(tok, ch, f":warning: *Could not auto-sell {sym}* (one-tap early-exit): {reason}. Sell it manually if you want out.")
+        except Exception:
+            pass
+        print(f"[MANUAL-EXIT] {sym} con_id={cid} FAILED: {reason}")
+        self._clear_manual_exit(cid)
+
+    def _clear_manual_exit(self, con_id) -> None:
+        try:
+            cur = self._read_manual_exits(); cur.discard(int(con_id))
+            with open(self._manual_exit_path(), "w") as f:
+                json.dump(sorted(cur), f)
+        except Exception:
+            pass
 
     def _get_scope_con_ids(self, live_positions: Dict[int, PositionData]) -> Set[int]:
         """Get set of contract IDs to manage based on scope setting."""
@@ -191,6 +227,12 @@ class ExitManager:
         # and scope=journal must see them without a restart
         self._load_journal()
 
+        # Manual early-exits (2026-06-18): con_ids the user one-tapped "sell" on in the book review.
+        # Force-closed below (before any mechanical stop) via the same close path -> single executor.
+        manual_exit_ids = self._read_manual_exits()
+        if manual_exit_ids:
+            print(f"[CYCLE] manual early-exit requests: {sorted(manual_exit_ids)}")
+
         # Check kill switch first
         if self._check_kill_switch():
             print("[CYCLE] Kill switch active - skipping order placement this cycle")
@@ -231,6 +273,37 @@ class ExitManager:
             print("[CYCLE] No positions to evaluate")
             self.state_manager.update_last_cycle()
             return
+        # MANUAL EARLY-EXITS (force MARKET close, no quote needed): process here, BEFORE the
+        # quote-gated eval loop, so an unpriceable option leg can still be sold on a one-tap request.
+        if manual_exit_ids and not dry_run and not self._check_kill_switch():
+            try:
+                _loo_raw = await self.ib_conn.get_open_orders()
+                _loo = {od.con_id: {"order_id": od.order_id, "remaining": od.remaining} for od in _loo_raw.values()}
+            except Exception:
+                _loo = {}
+            import types as _t
+            for _p in managed_positions:
+                cid = _p.con_id
+                if cid not in manual_exit_ids:
+                    continue
+                je = self._journal_entries.get(cid) or {}
+                sym = je.get("symbol", _p.symbol)
+                qty = min(_p.quantity, je.get("quantity", _p.quantity))
+                edebit = je.get("debit", _p.avg_cost * 100 * _p.quantity)
+                try:
+                    res = await self.order_manager.place_close_order(
+                        con_id=cid, symbol=sym, quantity=qty, limit_price=0.0, entry_debit=edebit,
+                        live_open_orders=_loo, spread=je.get("spread"), market=True)
+                    if res.success:
+                        _loo[cid] = {"order_id": res.order_id, "remaining": qty}
+                        self._post_exit_alert(sym, _t.SimpleNamespace(trigger_type="manual early-exit",
+                            pnl_pct=0.0, message="early exit via book-review one-tap (market, ahead of stop)"))
+                        print(f"[MANUAL-EXIT] {sym} con_id={cid} MARKET close placed")
+                        self._clear_manual_exit(cid)   # clear ONLY on success
+                    else:
+                        self._manual_exit_fail(sym, cid, res.message)
+                except Exception as _e:
+                    self._manual_exit_fail(sym, cid, repr(_e))
 
         # Get quotes for managed positions (+ short legs of journaled spreads, for net pricing)
         con_ids_to_fetch = [p.con_id for p in managed_positions]
@@ -239,7 +312,10 @@ class ExitManager:
             if sp and sp.get("short_con_id"):
                 con_ids_to_fetch.append(int(sp["short_con_id"]))
         try:
-            quotes = await self.ib_conn.fetch_quotes(con_ids_to_fetch)
+            quotes = await asyncio.wait_for(self.ib_conn.fetch_quotes(con_ids_to_fetch), timeout=40)
+        except asyncio.TimeoutError:
+            print("[ERROR] fetch_quotes timed out (40s) -- option quotes not streaming; skipping eval this cycle (manual one-tap exits still work)")
+            self.state_manager.update_last_cycle(); return
         except Exception as e:
             print(f"[ERROR] Could not fetch quotes: {e}")
             return

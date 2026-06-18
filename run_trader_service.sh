@@ -5,4 +5,5 @@ set -uo pipefail
 cd "$HOME/exitmgr-app" || exit 1
 source "$HOME/.hermes/.env" 2>/dev/null   # provides SLACK_BOT_TOKEN
 export SLACK_BOT_TOKEN
+export PYTHONUNBUFFERED=1
 exec "$HOME/ib-grader-venv/bin/python" run_trader.py --arm --loop --interval 900
