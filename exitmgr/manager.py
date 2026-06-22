@@ -13,6 +13,7 @@ from exitmgr.config import Config
 from exitmgr.connection import IBConnection, PositionData
 from exitmgr.order import OrderManager
 from exitmgr.rules import evaluate_position, ExitTrigger, days_to_expiry
+from exitmgr.position_manager import assess_positions
 from exitmgr.state import StateManager
 
 
@@ -216,6 +217,76 @@ class ExitManager:
             print("[RECONCILE] Reconciliation found inconsistencies - ABORTING for safety")
             return False
 
+    def _build_position_views(self, managed_positions, quotes):
+        """Compact, read-only per-position state for the model to assess.
+        Mirrors the eval loop's net-price logic (spreads valued long-minus-short)."""
+        views = []
+        for p in managed_positions:
+            cid = p.con_id
+            q = quotes.get(cid)
+            if q is None:
+                continue
+            cur = q["price"]
+            je = self._journal_entries.get(cid) or {}
+            sp = je.get("spread")
+            if sp and sp.get("short_con_id"):
+                sq = quotes.get(int(sp["short_con_id"]))
+                if sq is None:
+                    continue
+                cur = cur - sq["price"]
+            qty = min(p.quantity, je.get("quantity", p.quantity))
+            entry_debit = je.get("debit") or (p.avg_cost * 100 * p.quantity)
+            current_value = cur * 100 * qty
+            pnl_pct = round((current_value - entry_debit) / entry_debit * 100, 1) if entry_debit else 0.0
+            peak = self.state_manager.state.peak_prices.get(str(cid), cur)
+            from_peak = round((cur / peak - 1) * 100, 1) if peak else 0.0
+            tc = self.config.rules.trailing
+            views.append({
+                "con_id": cid,
+                "symbol": je.get("symbol", p.symbol),
+                "structure": "spread" if sp else "single",
+                "pnl_pct": pnl_pct,
+                "pct_from_peak": from_peak,
+                "dte": days_to_expiry(getattr(p, "expiry", "")),
+                "profit_target_pct": je.get("profit_target_pct") or self.config.rules.profit_target_pct,
+                "stop_pct": je.get("stop_pct") or self.config.rules.stop_pct,
+                "trail_armed": bool(tc.enabled),
+                "trail_activation_gain_pct": tc.activation_gain_pct,
+                "trail_giveback_fraction": tc.giveback_fraction,
+            })
+        return views
+
+    def _apply_decision(self, rules, decision, current_price, entry_debit, quantity, con_id, symbol):
+        """Apply a model decision to a RulesConfig with MONOTONIC guardrails.
+        Returns (rules, forced_trigger). forced_trigger != None => exit this cycle."""
+        from dataclasses import replace
+        action = (decision or {}).get("action", "hold")
+        if action in ("take_profit", "cut"):
+            current_value = current_price * 100 * quantity
+            pnl = (current_value - entry_debit) / entry_debit * 100 if entry_debit > 0 else 0.0
+            reason = (decision.get("reason") or "").strip()
+            return rules, ExitTrigger(
+                con_id=con_id, trigger_type=("take_profit" if action == "take_profit" else "model_cut"),
+                current_price=current_price, entry_debit=entry_debit, current_value=current_value,
+                pnl_pct=pnl, message=(f"model {action}: {reason}" if reason else f"model {action}"))
+        if action == "arm_trail":
+            tc = rules.trailing
+            act, gb = decision.get("trail_activation_gain_pct"), decision.get("trail_giveback_fraction")
+            new_act, new_gb = tc.activation_gain_pct, tc.giveback_fraction
+            if act is not None:  # only arm earlier (lower activation), never later
+                new_act = min(float(act), tc.activation_gain_pct) if tc.enabled else float(act)
+            if gb is not None:   # only tighten giveback, clamp sane
+                gb = max(0.1, min(0.9, float(gb)))
+                new_gb = min(gb, tc.giveback_fraction) if tc.enabled else gb
+            return replace(rules, trailing=replace(tc, enabled=True, activation_gain_pct=new_act, giveback_fraction=new_gb)), None
+        if action == "tighten_stop":
+            ns = decision.get("stop_pct")
+            if ns is not None and float(ns) > 0:
+                cur = rules.stop_pct  # tighter = smaller pct (smaller max loss); only reduce
+                new_stop = min(float(ns), cur) if cur is not None else float(ns)
+                return replace(rules, stop_pct=new_stop), None
+        return rules, None
+
     async def run_cycle(self, dry_run: bool) -> None:
         """Run one evaluation cycle."""
         cycle_start = datetime.utcnow()
@@ -336,6 +407,20 @@ class ExitManager:
             print(f"[ERROR] Could not fetch open orders: {e}")
             live_open_orders = {}
 
+        # Model-driven position management: one LLM call per cycle assesses every open
+        # position and returns per-con_id decisions (arm/tighten trail, tighten stop,
+        # take-profit, cut), applied below with monotonic guardrails. {} -> static rules.
+        model_decisions = {}
+        if getattr(self.config, "manage_positions", False):
+            try:
+                views = self._build_position_views(managed_positions, quotes)
+                model_decisions = assess_positions(self.config.llm_endpoint, self.config.llm_model, views)
+                if model_decisions:
+                    print(f"[POSMGMT] model decisions for con_ids {sorted(model_decisions)}")
+            except Exception as e:
+                print(f"[POSMGMT] assessment skipped ({e}); using static rules")
+                model_decisions = {}
+
         for pos_data in managed_positions:
             con_id = pos_data.con_id
             quote = quotes.get(con_id)
@@ -387,16 +472,26 @@ class ExitManager:
                 rules = replace(self.config.rules,
                                 profit_target_pct=je.get("profit_target_pct") or self.config.rules.profit_target_pct,
                                 stop_pct=je.get("stop_pct") or self.config.rules.stop_pct)
-            trigger = evaluate_position(
-                con_id=con_id,
-                symbol=symbol,
-                quantity=quantity,
-                entry_debit=entry_debit,
-                current_price=current_price,
-                days_to_expiry=dte,
-                peak_price=peaks.get(k),
-                rules=rules,
-            )
+            # Apply the model's per-position decision (monotonic guardrails). A take_profit/cut
+            # forces an immediate exit this cycle; otherwise the (possibly tuned) rules drive eval.
+            forced = None
+            decision = model_decisions.get(con_id)
+            if decision and decision.get("action", "hold") != "hold":
+                rules, forced = self._apply_decision(
+                    rules, decision, current_price, entry_debit, quantity, con_id, symbol)
+            if forced is not None:
+                trigger = forced
+            else:
+                trigger = evaluate_position(
+                    con_id=con_id,
+                    symbol=symbol,
+                    quantity=quantity,
+                    entry_debit=entry_debit,
+                    current_price=current_price,
+                    days_to_expiry=dte,
+                    peak_price=peaks.get(k),
+                    rules=rules,
+                )
 
             if trigger:
                 trigger.con_id = con_id

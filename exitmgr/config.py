@@ -77,6 +77,12 @@ class Config:
     scope: ScopeConfig = field(default_factory=ScopeConfig)
     caps: CapsConfig = field(default_factory=CapsConfig)
     rules: RulesConfig = field(default_factory=RulesConfig)
+    # Model-driven position management: each cycle the LLM assesses open positions and
+    # may arm/tighten trailing stops or exit (take-profit/cut), applied with monotonic
+    # guardrails over the static rules above. Set False to fall back to static rules only.
+    manage_positions: bool = True
+    llm_endpoint: str = "http://127.0.0.1:8082/v1/chat/completions"
+    llm_model: str = ""
 
     @classmethod
     def from_yaml(cls, path: str) -> "Config":
@@ -114,6 +120,9 @@ class Config:
             scope=scope_cfg,
             caps=caps_cfg,
             rules=rules_cfg,
+            manage_positions=bool(data.get("manage_positions", True)),
+            llm_endpoint=data.get("llm_endpoint", "http://127.0.0.1:8082/v1/chat/completions"),
+            llm_model=data.get("llm_model", ""),
         )
 
 
