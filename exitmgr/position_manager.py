@@ -91,9 +91,11 @@ def _extract_json(raw):
 _VALID = {"hold", "arm_trail", "tighten_stop", "take_profit", "cut"}
 
 
-def assess_positions(endpoint, model, positions, timeout=120):
+def assess_positions(endpoint, model, positions, timeout=75):
     """positions: list of per-position view dicts (see ExitManager._build_position_views).
-    Returns {int(con_id): {action, ...}}; {} on any error (caller falls back to static rules)."""
+    Returns {int(con_id): {action, ...}}; {} on any error (caller falls back to static rules).
+    Tuned to fail FAST to the static-rules fallback (retries=2) so a slow/down model never
+    stalls the exit cycle -- protecting stop execution is more important than the assessment."""
     if not positions:
         return {}
     if not model:
@@ -101,7 +103,7 @@ def assess_positions(endpoint, model, positions, timeout=120):
         return {}
     try:
         user = json.dumps({"positions": positions}, default=str)
-        raw = _post_json(endpoint, model, SYSTEM, user, timeout=timeout)
+        raw = _post_json(endpoint, model, SYSTEM, user, timeout=timeout, retries=2, backoff=5)
         data = _extract_json(raw)
         if not isinstance(data, dict):
             return {}

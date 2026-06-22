@@ -120,9 +120,6 @@ class Config:
             scope=scope_cfg,
             caps=caps_cfg,
             rules=rules_cfg,
-            manage_positions=bool(data.get("manage_positions", True)),
-            llm_endpoint=data.get("llm_endpoint", "http://127.0.0.1:8082/v1/chat/completions"),
-            llm_model=data.get("llm_model", ""),
         )
 
 
@@ -170,7 +167,8 @@ def load_config(
     for _k, _d in [('slack_channel', ''), ('approver_ids', []),
                    ('alerts_channel', ''), ('summary_channel', ''),
                    ('llm_endpoint', 'http://127.0.0.1:8082/v1/chat/completions'),
-                   ('llm_model', ''), ('approved_names', []), ('allow_model_names', False),
+                   ('llm_model', ''), ('manage_positions', True),
+                   ('approved_names', []), ('allow_model_names', False),
                    ('pot_cap_usd', None), ('confident_full_size', False), ('confident_conviction', 4),
                    ('blocked_names', []), ('blocked_sector_keywords', []),
                    ('max_trade_pct', 0.12), ('max_concurrent', 4), ('daily_halt_pct', 0.08),
