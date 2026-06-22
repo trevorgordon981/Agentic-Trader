@@ -257,6 +257,23 @@ class Trader:
                       order=order_summary(resolved))
                 continue
 
+            # GROSS-POSITION SCREEN (live only): IBKR rejects (Error 201) when an order's gross
+            # position value exceeds 30x NetLiquidation. Estimate from leg strikes (single ~1.1x
+            # strike*100; spread ~2.4x sum-of-strikes*100 -- empirical from observed rejections,
+            # e.g. AA 57/49.5P spread -> gross $25,196). Skip BEFORE asking the human so we never
+            # propose an un-fillable trade. (whatIfOrder would be exact; this is the cheap guard.)
+            _legs = resolved.strike + ((resolved.short_strike or 0) if resolved.short_contract is not None else 0)
+            _mult = 2.4 if resolved.short_contract is not None else 1.1
+            _est_gross = 100 * resolved.qty * _legs * _mult
+            if pot.net_liq > 0 and _est_gross > 0.95 * 30 * pot.net_liq:
+                audit(self.audit_path, "gross_rejected", underlying=idea.underlying,
+                      order=order_summary(resolved), est_gross=round(_est_gross), cap=round(30 * pot.net_liq))
+                approval.post_proposal(self.slack_token, self.slack_channel,
+                    f":no_entry: Skipped *{idea.underlying}* {order_summary(resolved)} — est. gross "
+                    f"position ${_est_gross:,.0f} exceeds IBKR's 30x-NetLiq cap (${30*pot.net_liq:,.0f}). "
+                    f"Underlying too large for this ${pot.net_liq:,.0f} pot (would be Error-201 rejected).")
+                continue
+
             ts = approval.post_proposal(self.slack_token, self.slack_channel, msg)
             if not ts:
                 audit(self.audit_path, "slack_post_failed", underlying=idea.underlying)
@@ -268,9 +285,18 @@ class Trader:
             if decision != "approve":
                 continue
             try:
-                await self._submit_order(resolved)
-                audit(self.audit_path, "executed", underlying=idea.underlying, order=order_summary(resolved))
-                positions.append(OpenPosition(idea.underlying, idea.est_debit_usd, idea.is_index))
+                status, reasons = await self._submit_order(resolved)
+                if status in ("Cancelled", "ApiCancelled", "Inactive"):
+                    reason = reasons[-1] if reasons else f"order {status}"
+                    audit(self.audit_path, "rejected", underlying=idea.underlying,
+                          order=order_summary(resolved), status=status, reason=reason)
+                    approval.post_proposal(self.slack_token, self.slack_channel,
+                        f":x: *Order REJECTED by IBKR* — {idea.underlying} {order_summary(resolved)} "
+                        f"was NOT placed.\n{reason}")
+                else:
+                    audit(self.audit_path, "executed", underlying=idea.underlying,
+                          order=order_summary(resolved), status=status)
+                    positions.append(OpenPosition(idea.underlying, idea.est_debit_usd, idea.is_index))
             except Exception as e:
                 audit(self.audit_path, "submit_error", underlying=idea.underlying, error=str(e))
 
@@ -338,19 +364,31 @@ class Trader:
         return ResolvedOrder(idea.underlying, right, expiry, float(contract.strike),
                              qty, round(mid, 2), contract)
 
-    async def _submit_order(self, r: ResolvedOrder) -> None:
+    async def _submit_order(self, r: ResolvedOrder):
+        """Place the entry as a MARKET order (these options don't stream bid/ask, so limit orders
+        rest unfilled). Wait for a decisive IBKR status and return (status, [reason msgs]); journal
+        only if it was NOT rejected, so a bounced order never pollutes the exit-managed book."""
         from exitmgr.ibkr import Order
-        lmt = round(r.limit * (1 + self.entry_limit_buffer_pct), 2)   # marketable -> entry fills, not rests
-        order = Order(action="BUY", orderType="LMT", totalQuantity=r.qty, lmtPrice=lmt, tif="DAY")
+        order = Order(action="BUY", orderType="MKT", totalQuantity=r.qty, tif="DAY")
         if r.short_contract is not None:
             # spreads trade as ONE combo order -- legs can never fill/close independently
             combo = self.ib_conn.create_combo_contract(
                 r.underlying,
                 [(r.contract.conId, "BUY"), (r.short_contract.conId, "SELL")])
-            self.ib_conn.ib.placeOrder(combo, order)
+            trade = self.ib_conn.ib.placeOrder(combo, order)
         else:
-            self.ib_conn.ib.placeOrder(r.contract, order)
-        self._journal_entry(r)
+            trade = self.ib_conn.ib.placeOrder(r.contract, order)
+        live = {"Filled", "Submitted", "PreSubmitted"}
+        dead = {"Cancelled", "ApiCancelled", "Inactive"}
+        for _ in range(24):  # up to ~12s for IBKR to ACK or REJECT
+            await asyncio.sleep(0.5)
+            if trade.orderStatus.status in live or trade.orderStatus.status in dead:
+                break
+        status = trade.orderStatus.status
+        reasons = [le.message for le in trade.log if getattr(le, "errorCode", 0)]
+        if status not in dead:
+            self._journal_entry(r)
+        return status, reasons
 
     def _journal_entry(self, r: ResolvedOrder) -> None:
         """Append the entry to trades.log so the exit manager picks it up. Journal-at-submit is

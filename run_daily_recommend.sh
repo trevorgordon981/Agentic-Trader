@@ -3,7 +3,7 @@ set -uo pipefail
 cd "$HOME/exitmgr-app" || exit 1
 source "$HOME/.hermes/.env" 2>/dev/null
 export SLACK_BOT_TOKEN
-APPROVALS_CHANNEL="YOUR_SLACK_CHANNEL_ID"  # #trading-approvals
+APPROVALS_CHANNEL="C0BA42N472M"  # #trading-approvals
 notify(){ curl -s -m 10 -X POST https://slack.com/api/chat.postMessage \
   -H "Authorization: Bearer ${SLACK_BOT_TOKEN:-}" -H "Content-type: application/json" \
   -d "{\"channel\":\"$APPROVALS_CHANNEL\",\"text\":\"$1\"}" >/dev/null 2>&1; }

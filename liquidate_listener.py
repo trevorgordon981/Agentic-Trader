@@ -1,5 +1,5 @@
 import json, os, time, subprocess, urllib.request, urllib.parse
-CHANNEL="YOUR_SLACK_CHANNEL_ID"; APPROVERS={"YOUR_SLACK_USER_ID"}; PHRASE="liquidate everything"; POLL=15
+CHANNEL="C0BA42N472M"; APPROVERS={"U0ABVDL7C9M"}; PHRASE="liquidate everything"; POLL=15
 STATE=os.path.expanduser("~/exitmgr-app/.liq_listener_state.json")
 PYBIN=os.path.expanduser("~/ib-grader-venv/bin/python"); LIQ=os.path.expanduser("~/exitmgr-app/liquidate.py")
 def tok():

@@ -315,3 +315,62 @@ def discover_names(endpoint: str, model: str, market_context: str, exclude, time
         seen.add(t)
         out.append((t, str(c.get("reason", "")).strip()[:120]))
     return out[:5]
+
+
+# ============================================================================================
+# FINE-TUNED GEMMA integration hook (technical-card path).
+#
+# The QLoRA Gemma fine-tune was trained on byte-exact technical cards (see exitmgr.technical_card,
+# ported verbatim from gordon-gauntlet/trading/gen_train_huge3.py). It emits a DIRECTIONAL signal
+# -- {"call":"BULLISH|BEARISH|NEUTRAL","conviction":1-10} -- NOT a full TradeIdea. The existing
+# structure-building / sizing path then turns that signal into an actual contract.
+#
+# This is intentionally SEPARATE from propose()/propose_one() (the MiniMax brief path). It is only
+# wired in when config.trading.llm_model points at the Gemma fine-tune. Nothing here touches IBKR,
+# restarts services, or alters the live MiniMax brief. READ-ONLY signal generation.
+#
+# CALL SITE (where it plugs in): daily_recommend.main(), around the
+#   ideas = propose(tr.get("llm_endpoint"), tr.get("llm_model"), brief, ...)
+# block. When _is_gemma(tr.get("llm_model")) is true, call gemma_signal(endpoint, model, ticker)
+# per name to get its directional call+conviction (built from the byte-exact technical card), then
+# feed that into the same structure/pricing path the slate already uses. The MiniMax propose()
+# call stays as the default branch -- this is additive.
+# ============================================================================================
+def _is_gemma(model_name: str) -> bool:
+    """True when the configured model is the fine-tuned Gemma (so we feed it technical cards
+    rather than the MiniMax market brief)."""
+    return "gemma" in (model_name or "").lower()
+
+
+def gemma_signal(endpoint: str, model: str, ticker: str, horizon_label: str = "~2 weeks",
+                 timeout: int = 120, vix_series=None):
+    """Query the fine-tuned Gemma with the BYTE-EXACT technical card for `ticker`'s latest bar.
+
+    Returns dict {"ticker","call","conviction","card"} or None if the model/parse fails or there's
+    insufficient history to build the card. `call` in {BULLISH,BEARISH,NEUTRAL}, conviction 1-10.
+
+    This is the model-query path for the fine-tune: the user content MUST be the exact card string
+    the model trained on -- that byte-exactness is the whole point (test_card_match.py proves it).
+    """
+    from exitmgr.technical_card import fetch_card, card_messages, InsufficientHistory
+    try:
+        card = fetch_card(ticker, vix_series=vix_series, horizon_label=horizon_label)
+    except InsufficientHistory:
+        return None
+    body = {
+        "model": model,
+        "messages": card_messages(ticker, card, horizon_label=horizon_label),
+        "max_tokens": 64,
+        "temperature": 0.0,
+    }
+    d = _post_json(endpoint, body, timeout)
+    obj = _extract_json(d["choices"][0]["message"].get("content") or "") or {}
+    call = str(obj.get("call", "")).upper().strip()
+    if call not in ("BULLISH", "BEARISH", "NEUTRAL"):
+        return None
+    try:
+        conv = int(obj.get("conviction", 0))
+    except (TypeError, ValueError):
+        return None
+    conv = min(10, max(1, conv))
+    return {"ticker": ticker.upper(), "call": call, "conviction": conv, "card": card}

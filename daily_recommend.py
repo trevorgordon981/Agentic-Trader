@@ -59,7 +59,7 @@ def _score_tag(s):
     return "_below-average / middle_"
 
 
-async def _resolve(ib, idea, available):
+async def _resolve(ib, idea, available, net_liq=None):
     """Pick the concrete option (nearest expiry to target DTE, strike by delta) and price it via
     OPRA. Single-leg long call/put; sizes to >=1 contract within available funds. None if it
     can't price or even one contract is unaffordable."""
@@ -75,6 +75,11 @@ async def _resolve(ib, idea, available):
     expiry = min(p.expirations, key=lambda e:
                  abs((datetime.strptime(e, "%Y%m%d").date() - today).days - idea.target_dte))
     spot = await underlying_price(ib, stk)
+    # IBKR gross-position rule: ~100*spot per contract must not exceed 30x net_liq. High-priced
+    # underlyings (NVDA ~$233, MU ~$989) blow this cap on a small account -> reject before IBKR Error 201.
+    if net_liq and spot and 100 * spot > 0.9 * 30 * net_liq:
+        return None, (f"underlying ${spot:,.0f}/sh too high-priced for ${net_liq:,.0f} acct: "
+                      f"1-contract notional ${100*spot:,.0f} exceeds 30x net_liq cap ${30*net_liq:,.0f}")
     cands = [Option(idea.underlying, expiry, k, right, "SMART") for k in strikes_near(p.strikes, spot)]
     qualified = await ib.qualifyContractsAsync(*cands)
     tickers = await ib.reqTickersAsync(*[c for c in qualified if getattr(c, "conId", None)])
@@ -123,12 +128,24 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
     to `pending` so the watch loop manages approval/execution. Returns the Slack ts (or None).
     Shared by the daily slate and the same-day 'add a name -> suggest it now' path."""
     cons_budget = min(pot.available_funds, default_pct * pot.net_liq)
-    resolved, why = await _resolve(ib, idea, cons_budget)
+    resolved, why = await _resolve(ib, idea, cons_budget, net_liq=pot.net_liq)
     over_default = False
     if not resolved:
         # too pricey for the default slice -> offer it at full size so you can opt in
-        resolved, why = await _resolve(ib, idea, pot.available_funds)
+        resolved, why = await _resolve(ib, idea, pot.available_funds, net_liq=pot.net_liq)
         over_default = resolved is not None
+    # spread-aware GROSS-POSITION screen (mirrors the trader loop): skip orders IBKR would reject
+    # with Error 201 (gross position value > 30x NetLiq). single ~1.1x strike*100; spread ~2.4x sum.
+    if resolved is not None and pot.net_liq:
+        _legs = resolved.strike + ((resolved.short_strike or 0) if resolved.short_contract is not None else 0)
+        _eg = 100 * resolved.qty * _legs * (2.4 if resolved.short_contract is not None else 1.1)
+        if _eg > 0.95 * 30 * pot.net_liq:
+            audit(audit_path, "daily_rec_gross_rejected", underlying=idea.underlying,
+                  order=order_summary(resolved), est_gross=round(_eg), cap=round(30 * pot.net_liq))
+            approval.post_proposal(token, channel,
+                f":no_entry: *{idea.underlying}* {order_summary(resolved)} skipped — est. gross position "
+                f"${_eg:,.0f} exceeds IBKR's 30x-NetLiq cap (${30*pot.net_liq:,.0f}). Too large for this ${pot.net_liq:,.0f} pot.")
+            return None
     head = (f":calendar: *{label} — {idea.underlying}* {idea.direction} {idea.structure}\n"
             f"Conviction *{idea.conviction}/10* — {_score_tag(idea.conviction)}\n"
             f"_Thesis:_ {idea.thesis}\n")
@@ -209,7 +226,10 @@ async def run(args):
             audit(audit_path, "user_directed_proposal", underlying=args.ticker.upper(),
                   direction=direction, structure=structure, dte=args.dte, delta=args.delta)
         else:
-            names = sorted({"SPY", "QQQ", "IWM"} | {n.upper() for n in tr.get("approved_names", [])})
+            _all = sorted({"SPY", "QQQ", "IWM"} | {n.upper() for n in tr.get("approved_names", [])})
+            _core = ["SPY", "QQQ", "IWM"]; _watch = [n for n in _all if n not in _core]
+            _off = datetime.now(timezone.utc).timetuple().tm_yday % max(1, len(_watch))
+            names = _core + (_watch[_off:] + _watch[:_off])[:35]  # rotating deep-research cap; all approved names still tradeable via open universe
             today = str(datetime.now(timezone.utc).date())
             quotes = await fetch_universe_quotes(ib, names)
             data = await research.gather(ib, names, single_names=[n for n in names if n not in ("SPY", "QQQ", "IWM")])
@@ -360,7 +380,7 @@ async def run(args):
                     snap = await get_pot_snapshot(ib)
                     avail = (snap.available_funds if (full_size or over_default)
                              else min(snap.available_funds, default_pct * snap.net_liq))
-                    r2, why2 = await _resolve(ib, _replace(idea, direction=nd, structure=ns), avail)
+                    r2, why2 = await _resolve(ib, _replace(idea, direction=nd, structure=ns), avail, net_liq=snap.net_liq)
                     if r2 is not None:
                         r = r2
                     else:
@@ -382,7 +402,7 @@ async def run(args):
                 eff_sl = max(10.0, min(90.0, ov_sl)) if ov_sl else sl_pct
                 buf_pct = float(tr.get("entry_limit_buffer_pct", 0.05))
                 lmt = round(r.limit * (1 + buf_pct), 2)   # marketable -> entry fills instead of resting at mid
-                order = Order(action="BUY", orderType="LMT", totalQuantity=r.qty, lmtPrice=lmt, tif="DAY")
+                order = Order(action="BUY", orderType="MKT", totalQuantity=r.qty, tif="DAY")  # MKT: these options do not stream bid/ask -> LMT rests unfilled
                 if r.short_contract is not None:
                     combo = conn.create_combo_contract(
                         r.underlying, [(r.contract.conId, "BUY"), (r.short_contract.conId, "SELL")])

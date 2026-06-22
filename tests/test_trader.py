@@ -55,8 +55,8 @@ def _trader(tmp_path, **over):
                approver_ids={"OWNER"}, baseline_path=str(tmp_path / "b.json"),
                audit_path=str(tmp_path / "a.jsonl"), approve_timeout_s=60)
     from exitmgr.trader import ResolvedOrder
-    t._resolve_order = AsyncMock(return_value=ResolvedOrder("SPY", "C", "20260620", 610.0, 1, 1.20, object()))
-    t._submit_order = AsyncMock()
+    t._resolve_order = AsyncMock(return_value=ResolvedOrder("SPY", "C", "20260620", 50.0, 1, 1.20, object()))
+    t._submit_order = AsyncMock(return_value=("Filled", []))
     return t
 
 

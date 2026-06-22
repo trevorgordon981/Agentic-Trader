@@ -36,7 +36,7 @@ MAX_HEADLINES = 12
 # reads; it NEVER changes which trades are proposed, sized, or executed. Fully fail-soft:
 # any timeout/error/empty result yields no block and the cycle proceeds exactly as before.
 RAG_ENABLED = os.environ.get("STRATEGIST_RAG_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
-RAG_ENDPOINT = os.environ.get("ALFRED_RAG_ENDPOINT", "http://127.0.0.1:9000/search")
+RAG_ENDPOINT = os.environ.get("ALFRED_RAG_ENDPOINT", "http://100.114.142.47:9000/search")
 RAG_TIMEOUT_S = float(os.environ.get("STRATEGIST_RAG_TIMEOUT_S", "8"))
 RAG_TOP_K = int(os.environ.get("STRATEGIST_RAG_TOP_K", "4"))
 RAG_SNIPPET_CHARS = 320
@@ -96,9 +96,60 @@ FOMC_DECISIONS_2026 = [
 
 # ---------------------------------------------------------------- pure helpers (unit-tested)
 
+def _ann_vol_20(closes: List[float], end: int) -> Optional[float]:
+    """Annualized 20-day realized vol of the window ENDING at index `end` (inclusive),
+    from a clean oldest-first closes list. None if the window is too short."""
+    window = closes[max(0, end - 20):end + 1]
+    if len(window) < 6:
+        return None
+    rets = [(window[i] - window[i - 1]) / window[i - 1] for i in range(1, len(window))]
+    if len(rets) < 5:
+        return None
+    m = sum(rets) / len(rets)
+    var = sum((r - m) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var) * math.sqrt(252) * 100.0
+
+
+def realized_vol_rank(closes: List[float], lookback: int = 252) -> Optional[int]:
+    """IVR proxy: rank today's annualized 20d realized vol as a 0-100 percentile over the
+    trailing `lookback` days. Historical option IV isn't available, so the fine-tune is
+    trained on realized-vol-rank; live MUST use the same so the model sees one signal.
+    None if there isn't enough history to compute a meaningful rank."""
+    closes = [c for c in closes if c is not None and c == c and c > 0]
+    if len(closes) < 26:  # need a 20d vol window + a few prior points to rank against
+        return None
+    series = []
+    start = max(20, len(closes) - lookback)
+    for end in range(start, len(closes)):
+        v = _ann_vol_20(closes, end)
+        if v is not None:
+            series.append(v)
+    if len(series) < 6:
+        return None
+    cur = series[-1]
+    below = sum(1 for v in series if v < cur)
+    return int(round(below / (len(series) - 1) * 100.0)) if len(series) > 1 else None
+
+
+def vix_regime(level: Optional[float]) -> Optional[str]:
+    """Map a VIX level to a coarse regime label. None if level is unusable."""
+    if level is None or level != level:
+        return None
+    if level < 14:
+        return "calm"
+    if level < 19:
+        return "normal"
+    if level < 26:
+        return "elevated"
+    if level < 36:
+        return "high"
+    return "extreme"
+
+
 def momentum_stats(closes: List[float]) -> Optional[dict]:
-    """5d/20d return, distance from the 20d high/low, and annualized 20d realized vol,
-    from daily closes oldest-first. None if there isn't enough usable history."""
+    """5d/20d return, distance from the 20d high/low, annualized 20d realized vol, and the
+    realized-vol rank (IVR proxy, 0-100), from daily closes oldest-first. None if there
+    isn't enough usable history."""
     closes = [c for c in closes if c is not None and c == c and c > 0]
     if len(closes) < 6:
         return None
@@ -120,6 +171,7 @@ def momentum_stats(closes: List[float]) -> Optional[dict]:
         "from_high_pct": (last - hi) / hi * 100.0,
         "from_low_pct": (last - lo) / lo * 100.0,
         "vol_20d_ann": vol,
+        "ivr": realized_vol_rank(closes),
     }
 
 
@@ -187,9 +239,19 @@ def build_brief(*, today: str, quotes: Dict[str, dict], universe: List[str],
                 day_pnl_pct: Optional[float] = None,
                 movers: Optional[dict] = None, options_flow: Optional[List[str]] = None,
                 web_news: Optional[List[str]] = None,
-                rag_snippets: Optional[List[str]] = None) -> str:
+                rag_snippets: Optional[List[str]] = None,
+                opt_iv: Optional[Dict[str, float]] = None) -> str:
     """The full strategist brief. Sections with no data degrade to explicit fallback lines so
-    the model knows the data is missing rather than implicitly flat."""
+    the model knows the data is missing rather than implicitly flat.
+
+    `opt_iv` (optional) maps symbol -> live OPRA option implied vol; when present it's appended
+    to that name's IVR field as context. It's normally absent at brief-build time (the chosen
+    contract isn't priced until after the model proposes), so each name emits a plain IVR."""
+    # Parse the brief date once so the per-name days-to-earnings is computed against it.
+    try:
+        _today_date = datetime.strptime(today, "%Y-%m-%d").date()
+    except Exception:
+        _today_date = datetime.now(timezone.utc).date()
     lines = [f"Date (UTC): {today}", "Delayed quote snapshot (~15min lag; symbol: last, day change):"]
     shown = 0
     for sym in universe:
@@ -203,14 +265,25 @@ def build_brief(*, today: str, quotes: Dict[str, dict], universe: List[str],
     if shown == 0:
         lines.append("  (quotes unavailable this cycle)")
 
+    vix_reg = vix_regime(vix)
     lines.append("Price structure (daily closes):")
     if price_stats:
         for sym, st in price_stats.items():
             if not st:
                 lines.append(f"  {sym}: history unavailable")
                 continue
+            # IVR (realized-vol-rank proxy; matches the fine-tune's training signal). Append the
+            # live OPRA option IV as context when it's available at build time, e.g. "IVR 72 (optIV 45%)".
+            ivr = st.get("ivr")
+            ivr_s = f"IVR {ivr}" if ivr is not None else "IVR n/a"
+            oiv = (opt_iv or {}).get(sym)
+            if ivr is not None and isinstance(oiv, (int, float)) and oiv == oiv:
+                ivr_s += f" (optIV {oiv * 100:.0f}%)" if oiv < 5 else f" (optIV {oiv:.0f}%)"
+            earn_s = _earnings_field(sym, today=_today_date)
+            vix_s = f"VIX {vix:.0f} {vix_reg}" if vix_reg else "VIX n/a"
             lines.append(f"  {sym}: {st['last']:.2f} | 5d {_pct(st['ret_5d'])} | 20d {_pct(st['ret_20d'])}"
-                         f" | {_pct(st['from_high_pct'])} from 20d high | 20d vol {_pct(st['vol_20d_ann'], signed=False)}")
+                         f" | {_pct(st['from_high_pct'])} from 20d high | 20d vol {_pct(st['vol_20d_ann'], signed=False)}"
+                         f" | {ivr_s}. {earn_s}. {vix_s}.")
     else:
         lines.append("  (unavailable this cycle)")
 
@@ -284,7 +357,7 @@ async def _price_structure(ib, symbols: List[str]) -> Dict[str, Optional[dict]]:
             continue
         try:
             bars = await ib.reqHistoricalDataAsync(
-                c, endDateTime="", durationStr="30 D", barSizeSetting="1 day",
+                c, endDateTime="", durationStr="1 Y", barSizeSetting="1 day",
                 whatToShow="TRADES", useRTH=True, formatDate=1)
             out[c.symbol] = momentum_stats([b.close for b in bars])
         except Exception:
@@ -320,6 +393,49 @@ def _earnings_sync(symbols: List[str]) -> List[tuple]:
         except Exception:
             continue
     return out
+
+
+# Per-run cache of days-to-next-earnings so the per-name brief line doesn't refetch yfinance
+# for the same ticker. Reset at the start of each `gather` so a long-lived process stays fresh.
+_EARNINGS_DAYS_CACHE: Dict[str, Optional[int]] = {}
+
+
+def days_to_earnings(ticker: str, today: Optional[date] = None,
+                     horizon_days: int = 90) -> Optional[int]:
+    """Integer days to the next earnings date via yfinance get_earnings_dates(); None if no
+    upcoming date within `horizon_days` (or lookup fails). Index/ETF underlyings have no
+    earnings and are filtered by the caller. Cached per run."""
+    sym = (ticker or "").upper()
+    if not sym or sym in INDEX_UNDERLYINGS:
+        return None
+    if sym in _EARNINGS_DAYS_CACHE:
+        return _EARNINGS_DAYS_CACHE[sym]
+    ref = today or datetime.now(timezone.utc).date()
+    result: Optional[int] = None
+    try:
+        import yfinance as yf
+        df = yf.Ticker(sym).get_earnings_dates(limit=12)
+        future = []
+        for idx in (df.index if df is not None else []):
+            try:
+                d = idx.date()
+            except Exception:
+                continue
+            n = (d - ref).days
+            if 0 <= n <= horizon_days:
+                future.append(n)
+        if future:
+            result = min(future)
+    except Exception:
+        result = None
+    _EARNINGS_DAYS_CACHE[sym] = result
+    return result
+
+
+def _earnings_field(ticker: str, today: Optional[date] = None) -> str:
+    """The training-format earnings token: '{n}d to earnings' within 90 days else 'earn n/a'."""
+    n = days_to_earnings(ticker, today=today)
+    return f"{n}d to earnings" if n is not None else "earn n/a"
 
 
 def _symbol_headlines_sync(sym: str) -> List[str]:
@@ -359,6 +475,7 @@ async def gather(ib, symbols: List[str], single_names: Optional[List[str]] = Non
     any failed section is None. `single_names` (held + approved non-index names) drive the
     earnings lookup -- index ETFs have no earnings."""
     names = sorted({s.upper() for s in (single_names or []) if s.upper() not in INDEX_UNDERLYINGS})
+    _EARNINGS_DAYS_CACHE.clear()  # fresh per-run days-to-earnings cache for the per-name brief line
     price_stats, vix, earnings, fh_news, yf_news, web_news, mv, opt_flow, rag_snippets = await asyncio.gather(
         _boxed(_price_structure(ib, symbols)),
         _boxed(_vix(ib)),

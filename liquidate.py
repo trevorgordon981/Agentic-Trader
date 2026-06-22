@@ -8,7 +8,7 @@ import argparse, asyncio, json, os, sys
 sys.path.insert(0, os.path.expanduser("~/exitmgr-app"))
 from exitmgr.connection import IBConnection
 
-ALERTS = "YOUR_SLACK_CHANNEL_ID"  # #trading-alerts
+ALERTS = "C0AE7J9KB8E"  # #trading-alerts
 
 def slack(msg, channel=ALERTS):
     try:

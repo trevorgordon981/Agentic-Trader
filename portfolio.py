@@ -9,7 +9,7 @@ from exitmgr.ibkr import IB, Contract
 from exitmgr.account import get_pot_snapshot
 
 ENDPOINT = os.environ.get("LLM_ENDPOINT", "http://127.0.0.1:8082/v1/chat/completions")
-MODEL = os.environ.get("LLM_MODEL", "your-llm-model-id")
+MODEL = os.environ.get("LLM_MODEL", "/Users/alfredpennyworth/models/MiniMax-M3-8bit")
 JOURNAL = os.environ.get("JOURNAL_PATH", os.path.expanduser("~/exitmgr-app/trades.log"))
 
 REVIEW_PROMPT = (
@@ -149,7 +149,7 @@ def arm_sell_approvals(r, mins=30):
     import yaml
     from exitmgr import approval
     cfg = yaml.safe_load(open(os.path.expanduser("~/exitmgr-app/config.yaml"))).get("trading", {})
-    tok = os.environ.get("SLACK_BOT_TOKEN", ""); ch = cfg.get("slack_channel", "")
+    tok = os.environ.get("SLACK_BOT_TOKEN", ""); ch = cfg.get("slack_channel", "C0BA42N472M")
     if not tok:
         return
     bym = {b["symbol"]: b for b in r.get("book", [])}
@@ -189,7 +189,7 @@ async def _main():
     if "--arm-sells" in sys.argv:
         arm_sell_approvals(r)
     if "--post" in sys.argv:
-        tok = os.environ.get("SLACK_BOT_TOKEN"); ch = os.environ.get("POSITIONS_CHANNEL", "")
+        tok = os.environ.get("SLACK_BOT_TOKEN"); ch = os.environ.get("POSITIONS_CHANNEL", "C0AEH1NRFNY")
         try:
             urllib.request.urlopen(urllib.request.Request(
                 "https://slack.com/api/chat.postMessage",
