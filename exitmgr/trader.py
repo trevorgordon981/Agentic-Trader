@@ -22,7 +22,7 @@ from exitmgr.risk import (
     RiskLimits, OpenPosition, ProposedTrade, GateDecision, evaluate_trade, day_pnl_pct,
 )
 from exitmgr.strategist import propose, TradeIdea
-from exitmgr import approval, research
+from exitmgr import approval, research, regime
 
 
 # ---------------------------------------------------------------- pure helpers (unit-tested)
@@ -52,12 +52,13 @@ class Plan:
 
 def plan_idea(idea: TradeIdea, *, net_liq: float, available_funds: float,
               positions: List[OpenPosition], baseline: float,
-              approved_names: Set[str], limits: RiskLimits) -> Plan:
-    trade = ProposedTrade(idea.underlying, idea.est_debit_usd, idea.is_index, idea.conviction)
+              approved_names: Set[str], limits: RiskLimits, regime=None) -> Plan:
+    trade = ProposedTrade(idea.underlying, idea.est_debit_usd, idea.is_index, idea.conviction,
+                          is_long=(getattr(idea, "direction", "bullish") == "bullish"))
     gate = evaluate_trade(
         trade, net_liq=net_liq, available_funds=available_funds,
         open_positions=positions, pot_day_start=baseline,
-        approved_names=approved_names, limits=limits,
+        approved_names=approved_names, limits=limits, regime_info=regime,
     )
     return Plan(idea, trade, gate, "needs_approval" if gate.approved else "gate_rejected")
 
@@ -125,6 +126,10 @@ class Trader:
         self.journal_path = journal_path
         self.blocked_sector_keywords = [k for k in (blocked_sector_keywords or []) if k.strip()]
         self.entry_limit_buffer_pct = float(entry_limit_buffer_pct)
+        # market regime + per-underlying momentum, refreshed each cycle in _market_context;
+        # feeds both regime-aware sizing (entries) and the position manager (exits)
+        self._regime = None
+        self._price_stats = {}
 
     def _load_baselines(self) -> Dict[str, float]:
         p = Path(self.baseline_path)
@@ -164,6 +169,12 @@ class Trader:
             single_names = sorted(self.approved_names
                                   | {p.underlying for p in positions or [] if not p.is_index})
             data = await research.gather(self.ib_conn.ib, names, single_names=single_names)
+            # Classify the market regime from the index momentum + VIX gather() already fetched,
+            # and keep the per-underlying momentum -- feeds regime-aware sizing + the position manager.
+            ps = data.get("price_stats") or {}
+            self._price_stats = ps
+            self._regime = regime.classify_regime([ps.get("SPY"), ps.get("QQQ"), ps.get("IWM")], data.get("vix"))
+            audit(self.audit_path, "regime", **(self._regime or {}))
             brief = research.build_brief(today=today, quotes=quotes, universe=names,
                                          allow_any_name=self.limits.allow_any_name,
                                          book=positions, day_pnl_pct=day_pnl, **data)
@@ -219,7 +230,8 @@ class Trader:
         for idea in ideas:
             plan = plan_idea(idea, net_liq=pot.net_liq, available_funds=pot.available_funds,
                              positions=positions, baseline=baseline,
-                             approved_names=self.approved_names, limits=self.limits)
+                             approved_names=self.approved_names, limits=self.limits,
+                             regime=self._regime)
             audit(self.audit_path, "gated", idea=asdict(idea),
                   approved=plan.gate.approved, reasons=plan.gate.reasons,
                   per_trade_cap=plan.gate.per_trade_cap)
@@ -263,7 +275,7 @@ class Trader:
                 audit(self.audit_path, "submit_error", underlying=idea.underlying, error=str(e))
 
         try:
-            await self.exit_manager.run_cycle(dry_run)
+            await self.exit_manager.run_cycle(dry_run, regime=self._regime, price_stats=self._price_stats)
         except Exception as e:
             audit(self.audit_path, "exit_cycle_error", error=str(e))
 

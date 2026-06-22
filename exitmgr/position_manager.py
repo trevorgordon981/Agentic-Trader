@@ -32,8 +32,11 @@ SYSTEM = (
     "- \"tighten_stop\": momentum is weakening but not broken — raise the stop to a TIGHTER stop_pct (smaller loss) to cut risk.\n"
     "- \"take_profit\": momentum has stalled at a strong gain — exit now and bank it.\n"
     "- \"cut\": the thesis is broken / it is bleeding — exit now.\n\n"
-    "Rules: never loosen a stop or widen a trail you already have (the engine enforces this anyway). Prefer arming a "
-    "trail over taking profit on a strong winner — let winners run. Cut losers without hesitation. When uncertain, HOLD.\n\n"
+    "You are also given the current market_regime (bull / neutral / risk_off) and each position's trend. ADAPT to it:\n"
+    "- BULL regime + a strong-uptrending winner: LET IT RUN. Prefer arm_trail with a WIDE giveback (0.4-0.5); you MAY "
+    "widen an existing trail to give it room; AVOID take_profit on a strong winner — do not choke your biggest winner.\n"
+    "- NEUTRAL or RISK_OFF: manage TIGHT — tighter trails, quicker take_profit, and never loosen a stop or widen a trail.\n"
+    "- ASYMMETRIC in every regime: cut LOSERS fast; stops only ever tighten. When uncertain, HOLD.\n\n"
     "Reply with ONE JSON object and nothing after it:\n"
     "{\"decisions\": {\"<con_id>\": {\"action\": \"...\", \"trail_activation_gain_pct\": 40, "
     "\"trail_giveback_fraction\": 0.35, \"stop_pct\": 30, \"reason\": \"...\"}, ...}}\n"
@@ -91,8 +94,9 @@ def _extract_json(raw):
 _VALID = {"hold", "arm_trail", "tighten_stop", "take_profit", "cut"}
 
 
-def assess_positions(endpoint, model, positions, timeout=75):
+def assess_positions(endpoint, model, positions, market_regime=None, timeout=75):
     """positions: list of per-position view dicts (see ExitManager._build_position_views).
+    market_regime: dict from regime.classify_regime (bull/neutral/risk_off + trend_score/vix).
     Returns {int(con_id): {action, ...}}; {} on any error (caller falls back to static rules).
     Tuned to fail FAST to the static-rules fallback (retries=2) so a slow/down model never
     stalls the exit cycle -- protecting stop execution is more important than the assessment."""
@@ -102,7 +106,7 @@ def assess_positions(endpoint, model, positions, timeout=75):
         # model name unset -> skip model management, stay on static rules
         return {}
     try:
-        user = json.dumps({"positions": positions}, default=str)
+        user = json.dumps({"market_regime": market_regime, "positions": positions}, default=str)
         raw = _post_json(endpoint, model, SYSTEM, user, timeout=timeout, retries=2, backoff=5)
         data = _extract_json(raw)
         if not isinstance(data, dict):

@@ -10,6 +10,8 @@ halt new entries at -8% on the day, index = SPY/QQQ/IWM, single names must be us
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
 
+from exitmgr import regime as regime_mod
+
 INDEX_UNDERLYINGS: Set[str] = {"SPY", "QQQ", "IWM"}
 
 
@@ -42,6 +44,7 @@ class ProposedTrade:
     notional: float        # $ debit to open the trade
     is_index: bool
     conviction: int = 1    # 1-5, from the strategist; drives the confident-sizing bypass
+    is_long: bool = True   # bullish (long call / call debit) vs bearish; gates bull size-up
 
 
 @dataclass
@@ -74,6 +77,7 @@ def evaluate_trade(
     pot_day_start: float,
     approved_names: Set[str],
     limits: RiskLimits,
+    regime_info: Optional[dict] = None,
 ) -> GateDecision:
     """Pure risk gate. Returns approved + every reason it was blocked. ALL checks run so the
     caller can log the full picture (we don't short-circuit on the first failure)."""
@@ -88,7 +92,11 @@ def evaluate_trade(
     # every entry all still apply -- you remain the sizing control by seeing the % of pot before
     # you tap. (Trevor 2026-06-12: "don't care about sizing if the model is confident.")
     confident = (limits.confident_full_size and trade.conviction >= limits.confident_conviction)
-    per_trade_cap = available_funds if confident else limits.max_trade_pct * pot
+    # Regime-aware sizing: lean BIGGER into a bullish idea in a confirmed bull (mult > 1 only for
+    # is_long in a bull; 1.0 otherwise). Caps below still bind -- buying power, concurrent, breaker,
+    # and the scaled % cap is floored at available_funds so it can never exceed cash.
+    size_mult = regime_mod.size_multiplier(regime_info, getattr(trade, "is_long", True))
+    per_trade_cap = available_funds if confident else min(limits.max_trade_pct * pot * size_mult, available_funds)
 
     # 1a. blocklist -- specific single-name tickers are always rejected (index ETFs exempt)
     if u not in INDEX_UNDERLYINGS and u in {n.upper() for n in limits.blocked_names}:

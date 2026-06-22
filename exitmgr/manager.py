@@ -14,6 +14,7 @@ from exitmgr.connection import IBConnection, PositionData
 from exitmgr.order import OrderManager
 from exitmgr.rules import evaluate_position, ExitTrigger, days_to_expiry
 from exitmgr.position_manager import assess_positions
+from exitmgr import regime as regime_mod
 from exitmgr.state import StateManager
 
 
@@ -217,9 +218,11 @@ class ExitManager:
             print("[RECONCILE] Reconciliation found inconsistencies - ABORTING for safety")
             return False
 
-    def _build_position_views(self, managed_positions, quotes):
+    def _build_position_views(self, managed_positions, quotes, price_stats=None):
         """Compact, read-only per-position state for the model to assess.
-        Mirrors the eval loop's net-price logic (spreads valued long-minus-short)."""
+        Mirrors the eval loop's net-price logic (spreads valued long-minus-short).
+        price_stats: optional {symbol: momentum_stats} so each view carries the underlying's
+        trend strength (lets the model let strong winners run in a bull)."""
         views = []
         for p in managed_positions:
             cid = p.con_id
@@ -241,12 +244,16 @@ class ExitManager:
             peak = self.state_manager.state.peak_prices.get(str(cid), cur)
             from_peak = round((cur / peak - 1) * 100, 1) if peak else 0.0
             tc = self.config.rules.trailing
+            sym = je.get("symbol", p.symbol)
+            tstats = (price_stats or {}).get(sym)
+            trend = regime_mod.trend_strength(tstats) if tstats else None
             views.append({
                 "con_id": cid,
-                "symbol": je.get("symbol", p.symbol),
+                "symbol": sym,
                 "structure": "spread" if sp else "single",
                 "pnl_pct": pnl_pct,
                 "pct_from_peak": from_peak,
+                "trend": trend,  # {"score":-100..100, "label":...} per-underlying, or None
                 "dte": days_to_expiry(getattr(p, "expiry", "")),
                 "profit_target_pct": je.get("profit_target_pct") or self.config.rules.profit_target_pct,
                 "stop_pct": je.get("stop_pct") or self.config.rules.stop_pct,
@@ -256,8 +263,10 @@ class ExitManager:
             })
         return views
 
-    def _apply_decision(self, rules, decision, current_price, entry_debit, quantity, con_id, symbol):
-        """Apply a model decision to a RulesConfig with MONOTONIC guardrails.
+    def _apply_decision(self, rules, decision, current_price, entry_debit, quantity, con_id, symbol, regime=None):
+        """Apply a model decision to a RulesConfig with regime-aware guardrails.
+        Stops are ALWAYS monotonic (only tighten). Trails are monotonic-tighten in neutral/risk_off,
+        but in a CONFIRMED BULL the model may WIDEN/arm-later a trail so a strong winner can run.
         Returns (rules, forced_trigger). forced_trigger != None => exit this cycle."""
         from dataclasses import replace
         action = (decision or {}).get("action", "hold")
@@ -271,13 +280,17 @@ class ExitManager:
                 pnl_pct=pnl, message=(f"model {action}: {reason}" if reason else f"model {action}"))
         if action == "arm_trail":
             tc = rules.trailing
+            bull = regime_mod.is_bull(regime)
             act, gb = decision.get("trail_activation_gain_pct"), decision.get("trail_giveback_fraction")
             new_act, new_gb = tc.activation_gain_pct, tc.giveback_fraction
-            if act is not None:  # only arm earlier (lower activation), never later
-                new_act = min(float(act), tc.activation_gain_pct) if tc.enabled else float(act)
-            if gb is not None:   # only tighten giveback, clamp sane
+            # bull (or not-yet-armed): accept the model's params so a winner can RUN (arm later / wider
+            # giveback allowed). neutral/risk_off with an existing trail: monotonic-tighten only.
+            free = bull or not tc.enabled
+            if act is not None:
+                new_act = float(act) if free else min(float(act), tc.activation_gain_pct)
+            if gb is not None:
                 gb = max(0.1, min(0.9, float(gb)))
-                new_gb = min(gb, tc.giveback_fraction) if tc.enabled else gb
+                new_gb = gb if free else min(gb, tc.giveback_fraction)
             return replace(rules, trailing=replace(tc, enabled=True, activation_gain_pct=new_act, giveback_fraction=new_gb)), None
         if action == "tighten_stop":
             ns = decision.get("stop_pct")
@@ -287,8 +300,11 @@ class ExitManager:
                 return replace(rules, stop_pct=new_stop), None
         return rules, None
 
-    async def run_cycle(self, dry_run: bool) -> None:
-        """Run one evaluation cycle."""
+    async def run_cycle(self, dry_run: bool, regime=None, price_stats=None) -> None:
+        """Run one evaluation cycle. regime/price_stats (from the Trader's market context) let the
+        model manage by regime + per-underlying trend; both default None -> regime-neutral behavior."""
+        self._regime = regime
+        self._price_stats = price_stats
         cycle_start = datetime.utcnow()
         print(f"\n{'='*60}")
         print(f"[CYCLE] Starting evaluation cycle at {cycle_start.isoformat()}")
@@ -413,10 +429,12 @@ class ExitManager:
         model_decisions = {}
         if getattr(self.config, "manage_positions", False):
             try:
-                views = self._build_position_views(managed_positions, quotes)
-                model_decisions = assess_positions(self.config.llm_endpoint, self.config.llm_model, views)
+                views = self._build_position_views(managed_positions, quotes, self._price_stats)
+                model_decisions = assess_positions(self.config.llm_endpoint, self.config.llm_model,
+                                                   views, market_regime=self._regime)
                 if model_decisions:
-                    print(f"[POSMGMT] model decisions for con_ids {sorted(model_decisions)}")
+                    rg = (self._regime or {}).get("regime", "n/a")
+                    print(f"[POSMGMT] regime={rg} model decisions for con_ids {sorted(model_decisions)}")
             except Exception as e:
                 print(f"[POSMGMT] assessment skipped ({e}); using static rules")
                 model_decisions = {}
@@ -478,7 +496,8 @@ class ExitManager:
             decision = model_decisions.get(con_id)
             if decision and decision.get("action", "hold") != "hold":
                 rules, forced = self._apply_decision(
-                    rules, decision, current_price, entry_debit, quantity, con_id, symbol)
+                    rules, decision, current_price, entry_debit, quantity, con_id, symbol,
+                    regime=self._regime)
             if forced is not None:
                 trigger = forced
             else:
