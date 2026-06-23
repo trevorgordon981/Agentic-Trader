@@ -170,6 +170,10 @@ def load_config(
                    ('llm_model', ''), ('manage_positions', True),
                    ('approved_names', []), ('allow_model_names', False),
                    ('pot_cap_usd', None), ('confident_full_size', False), ('confident_conviction', 4),
+                   ('cap_bypass_min_conviction', 6),  # conviction >= this may exceed the soft 12% cap
+                                                      # (raised 2026-06-22 from the old effective 4)
+                   ('cash_buffer_pct', 0.05),         # always keep 5% of NetLiq liquid (account value)
+                   ('conviction_size_curve', None),   # PENDING CALIBRATION; None -> flat-0.12 default
                    ('blocked_names', []), ('blocked_sector_keywords', []),
                    ('max_trade_pct', 0.12), ('max_concurrent', 4), ('daily_halt_pct', 0.08),
                    ('baseline_path', './day_baseline.json'), ('audit_path', './audit.jsonl')]:

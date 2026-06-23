@@ -26,6 +26,19 @@ def main(
     cfg = load_config(config_path=config, arm=arm, loop=loop, interval=interval)
     dry_run = not arm
 
+    # conviction->size curve from config (YAML keys may be str or int); None -> dataclass default.
+    # PENDING CONVICTION CALIBRATION -- ships flat at the base cap.
+    _curve_raw = getattr(cfg, "conviction_size_curve", None)
+    conviction_curve = None
+    if _curve_raw:
+        try:
+            conviction_curve = {int(k): float(v) for k, v in dict(_curve_raw).items()}
+        except (TypeError, ValueError):
+            conviction_curve = None
+    # back-compat: an old config that only set confident_conviction lowers the bypass threshold.
+    _bypass = int(getattr(cfg, "cap_bypass_min_conviction",
+                          getattr(cfg, "confident_conviction", 6)))
+
     ib_conn = IBConnection(host=cfg.ib.host, port=cfg.ib.port, client_id=cfg.ib.client_id,
                            market_data_type=getattr(cfg.ib, "market_data_type", 3))
     exit_mgr = ExitManager(cfg)
@@ -40,7 +53,9 @@ def main(
             pot_cap_usd=getattr(cfg, "pot_cap_usd", None),
             allow_any_name=bool(getattr(cfg, "allow_model_names", False)),
             confident_full_size=bool(getattr(cfg, "confident_full_size", False)),
-            confident_conviction=int(getattr(cfg, "confident_conviction", 4)),
+            cap_bypass_min_conviction=_bypass,
+            cash_buffer_pct=float(getattr(cfg, "cash_buffer_pct", 0.05)),
+            **({"conviction_size_curve": conviction_curve} if conviction_curve else {}),
             blocked_names={n.upper() for n in getattr(cfg, "blocked_names", [])},
         ),
         approved_names=set(getattr(cfg, "approved_names", [])),
@@ -65,15 +80,13 @@ def main(
         if loop:
             while True:
                 try:
-                    # SELF-HEAL: a dropped IBKR link must not leave exits blind. Reconnect each cycle.
-                    if not (ib_conn.ib and ib_conn.ib.isConnected()):
-                        print("[WARN] IBKR connection lost -- reconnecting")
-                        ib_conn._connected = False
-                        try:
-                            if ib_conn.ib: ib_conn.ib.disconnect()
-                        except Exception:
-                            pass
-                        if await ib_conn.connect(retries=3, retry_delay=10):
+                    # SELF-HEAL: a dropped IBKR link must not leave exits blind. On Error 1100
+                    # the local socket stays open (isConnected() lies True) while the uplink is
+                    # dead -- so we use an ACTIVE liveness probe (ensure_connected) instead of
+                    # isConnected(), and force a real reconnect when it's unhealthy.
+                    if not await ib_conn.ensure_connected():
+                        print("[WARN] IBKR link unhealthy -- forcing reconnect")
+                        if await ib_conn.reconnect(retries=3, retry_delay=10):
                             await exit_mgr._reconcile_on_startup()
                             print("[INFO] reconnected to IBKR")
                         else:

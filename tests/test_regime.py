@@ -40,9 +40,14 @@ def test_size_multiplier():
 
 # ---------- regime-aware sizing in the risk gate ----------
 def _limits(**kw):
+    # cash_buffer_pct=0.0 here so these regime-sizing assertions isolate the regime multiplier from
+    # the 5% buffer (the buffer clamp gets its own coverage in test_risk.py). No curve set -> the
+    # gate falls back to max_trade_pct (0.30) per conviction.
     base = dict(max_trade_pct=0.30, max_concurrent=8, daily_halt_pct=0.20,
-                confident_full_size=True, confident_conviction=7, pot_cap_usd=None,
-                allow_any_name=True, blocked_names=set(), max_single_name_agg_pct=0.36)
+                confident_full_size=True, cap_bypass_min_conviction=7, pot_cap_usd=None,
+                cash_buffer_pct=0.0,
+                allow_any_name=True, blocked_names=set(), max_single_name_agg_pct=0.36,
+                max_trade_pct_hard=1.0)
     base.update(kw)
     return RiskLimits(**base)
 
@@ -64,9 +69,14 @@ def test_scaled_cap_floored_at_available_funds():
     g = _gate(t, available=400.0, regime_info={"regime": "bull"})  # 450 wanted, 400 cash
     assert g.per_trade_cap == pytest.approx(400.0)
 
-def test_confident_unaffected_by_regime():
-    t = ProposedTrade("SPY", 100.0, True, conviction=8, is_long=True)  # >= confident_conviction
-    assert _gate(t, regime_info={"regime": "bull"}).per_trade_cap == pytest.approx(1000.0)
+def test_confident_flows_through_curve_and_regime():
+    # NEW MODEL (2026-06-22): "confident" no longer grabs the whole pot -- it lifts past the SOFT cap
+    # via the conviction->size curve (here fallback = max_trade_pct 0.30), and the bull regime still
+    # scales a long idea. conviction 8 >= bypass 7. 0.30 * 1000 * 1.5 = 450, under the 100% hard cap.
+    t = ProposedTrade("SPY", 100.0, True, conviction=8, is_long=True)
+    assert _gate(t, regime_info={"regime": "bull"}).per_trade_cap == pytest.approx(450.0)
+    # without bull, just the flat 0.30 curve fraction
+    assert _gate(t).per_trade_cap == pytest.approx(300.0)
 
 
 # ---------- regime-aware trail widening in the position manager ----------

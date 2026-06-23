@@ -54,7 +54,9 @@ def plan_idea(idea: TradeIdea, *, net_liq: float, available_funds: float,
               positions: List[OpenPosition], baseline: float,
               approved_names: Set[str], limits: RiskLimits, regime=None) -> Plan:
     trade = ProposedTrade(idea.underlying, idea.est_debit_usd, idea.is_index, idea.conviction,
-                          is_long=(getattr(idea, "direction", "bullish") == "bullish"))
+                          is_long=(getattr(idea, "direction", "bullish") == "bullish"),
+                          profit_target_pct=getattr(idea, "profit_target_pct", 0.0) or 0.0,
+                          stop_pct=getattr(idea, "stop_pct", 0.0) or 0.0)
     gate = evaluate_trade(
         trade, net_liq=net_liq, available_funds=available_funds,
         open_positions=positions, pot_day_start=baseline,
@@ -75,6 +77,7 @@ class ResolvedOrder:
     contract: object = None         # qualified IB contract (long leg), for submission
     short_strike: float = 0.0       # debit spread sold leg; 0 = single-leg order
     short_contract: object = None
+    conviction: float = -1.0        # entry conviction (1-10) carried through for the journal; -1 = unknown
 
 
 def order_summary(r: ResolvedOrder) -> str:
@@ -247,6 +250,7 @@ class Trader:
             if resolved is None:
                 audit(self.audit_path, "resolve_failed", underlying=idea.underlying)
                 continue
+            resolved.conviction = getattr(idea, "conviction", -1.0)  # carry conviction into the journal
 
             msg = approval.format_proposal(idea, pot.net_liq, plan.gate.per_trade_cap,
                                            self.approve_timeout_s // 60, order_summary(resolved))
@@ -403,6 +407,7 @@ class Trader:
             "strike": r.strike,
             "quantity": r.qty,
             "debit": round(r.limit * 100 * r.qty, 2),
+            "conviction": getattr(r, "conviction", -1.0),
         }
         if r.short_contract is not None:
             rec["spread"] = {

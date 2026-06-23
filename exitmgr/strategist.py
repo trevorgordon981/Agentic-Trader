@@ -185,13 +185,24 @@ def parse_ideas(raw: str) -> List[TradeIdea]:
     return out
 
 
-def _post_json(endpoint, body, timeout, retries=4, backoff=15):
-    """POST to an OpenAI-compatible endpoint with retry on transient busy/connection errors.
-    The trade brain is local (M3, single-generation): a 503 means BUSY, not broken -- it frees in
-    ~70s, so we retry rather than silently drop a real-money cycle. We deliberately do NOT fall
-    back to a cloud model for trade decisions: no trade is better than a trade from an unvetted
-    model. If M3 is genuinely unavailable across all retries, we raise and the caller skips the
-    cycle (safe)."""
+# Escalating backoff for transient busy: m3_serve.py is single-threaded behind GEN_LOCK
+# (LOCK_WAIT_S=45s) and returns HTTP 503 when busy. The live trader loop (every 900s) and the
+# daily slate collide on the one model, so a thinking-on trader generation can hold the lock
+# longer than a single 45s wait -- the old flat 4x15s=45s window matched exactly ONE lock wait
+# and let 503s slip through. Escalating 8/16/24/32 = ~80s total added wait outlasts a finite
+# trader gen while staying WELL under the 900s trader interval (safe for the trader hot path,
+# which shares this helper).
+_BUSY_BACKOFFS = (8, 16, 24, 32)
+
+
+def _post_json(endpoint, body, timeout, retries=5, backoff=None):
+    """POST to an OpenAI-compatible endpoint with bounded retry on transient busy/connection errors.
+    The trade brain is local (M3, single-generation): a 503 means BUSY, not broken -- it frees once
+    the holder's generation finishes, so we retry rather than silently drop a real-money cycle. We
+    deliberately do NOT fall back to a cloud model for trade decisions: no trade is better than a
+    trade from an unvetted model. If M3 is genuinely unavailable across all retries, we raise and the
+    caller skips the cycle (safe). Total added wait is bounded (~80s) so it can never stall the
+    trader's 900s loop."""
     data = json.dumps(body).encode()
     last = None
     for attempt in range(retries):
@@ -204,13 +215,17 @@ def _post_json(endpoint, body, timeout, retries=4, backoff=15):
         except urllib.error.HTTPError as e:
             last = e
             if e.code in (502, 503, 504, 429) and attempt < retries - 1:
-                time.sleep(backoff)
+                wait = backoff if backoff is not None else _BUSY_BACKOFFS[min(attempt, len(_BUSY_BACKOFFS) - 1)]
+                print(f"[strategist] model busy ({e.code}), retry {attempt + 1}/{retries - 1} in {wait}s")
+                time.sleep(wait)
                 continue
             raise
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
             last = e
             if attempt < retries - 1:
-                time.sleep(backoff)
+                wait = backoff if backoff is not None else _BUSY_BACKOFFS[min(attempt, len(_BUSY_BACKOFFS) - 1)]
+                print(f"[strategist] connection error ({type(e).__name__}), retry {attempt + 1}/{retries - 1} in {wait}s")
+                time.sleep(wait)
                 continue
             raise
     if last:

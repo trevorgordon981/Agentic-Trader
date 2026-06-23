@@ -87,11 +87,29 @@ class OrderManager:
         order = (self.ib_conn.create_market_order("SELL", quantity) if market
                  else self.ib_conn.create_limit_order("SELL", quantity, limit_price))
 
-        # Place order
-        try:
+        # Place order. SELF-HEAL: a stale IBKR link (post Error-1100) makes placeOrder raise
+        # "Not connected to IB"; that must NOT silently skip an exit for 15 min. On a
+        # connection-type failure we force ONE reconnect via the connection wrapper and retry
+        # the placement once (single retry only -- never hammer the gateway).
+        async def _place():
             placed_order = await self.ib_conn.place_order(contract, order)
             # placeOrder returns a Trade; the IB-assigned id lives on trade.order.orderId
-            order_id = placed_order.order.orderId if placed_order and getattr(placed_order, 'order', None) is not None else 0
+            return placed_order.order.orderId if placed_order and getattr(placed_order, 'order', None) is not None else 0
+
+        try:
+            try:
+                order_id = await _place()
+            except Exception as e:
+                msg = str(e).lower()
+                if "not connected" in msg or "connect" in msg or isinstance(e, (ConnectionError, OSError)):
+                    print(f"[WARN] place_close_order: link appears down ({e}) -- reconnecting and retrying ONCE for con_id={con_id}")
+                    if await self.ib_conn.reconnect(retries=2, retry_delay=10):
+                        print(f"[INFO] reconnected; retrying close order for con_id={con_id}")
+                        order_id = await _place()
+                    else:
+                        raise
+                else:
+                    raise
 
             # Record in-flight close
             in_flight = InFlightClose(

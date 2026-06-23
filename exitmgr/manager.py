@@ -87,6 +87,160 @@ class ExitManager:
         except Exception as e:
             print(f"[WARN] exit alert post failed: {e}")
 
+    def _exits_log_path(self) -> str:
+        """Durable, append-only exits log (JSONL) next to the journal. Realized P&L was
+        previously NOWHERE on disk (only inside IBKR) -- this is the on-disk record that
+        conviction_calibration.py reads via --fills (keyed contract_id -> realized_pnl)."""
+        cfg_path = getattr(getattr(self.config, "exits", None), "path", None)
+        if cfg_path:
+            return cfg_path
+        return os.path.join(os.path.dirname(self.config.journal.path) or ".", "exits.log")
+
+    def _recover_conviction(self, je: dict, symbol: str) -> Optional[float]:
+        """Conviction carried from the original entry. Prefer the value the trader now
+        persists ON the journal entry; fall back to the audit.jsonl daily_rec_posted events
+        (matched by symbol + long strike), mirroring how conviction_calibration.py recovers it.
+        Returns None if not recoverable (so calibration can bucket it 'unknown')."""
+        c = je.get("conviction")
+        try:
+            if c is not None and float(c) >= 0:
+                return float(c)
+        except (TypeError, ValueError):
+            pass
+        # fall back to audit.jsonl
+        audit_path = getattr(self.config, "audit_path", "") or os.path.join(
+            os.path.dirname(self.config.journal.path) or ".", "audit.jsonl")
+        if not (symbol and os.path.exists(audit_path)):
+            return None
+        long_strike = je.get("strike")
+        best = None  # (conviction, had_strike_match)
+        try:
+            with open(audit_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or '"daily_rec_posted"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("event") != "daily_rec_posted" or d.get("underlying") != symbol:
+                        continue
+                    conv = d.get("conviction")
+                    if conv is None:
+                        continue
+                    order = d.get("order") or ""
+                    toks = order.replace("/", " ").replace("C", " ").replace("P", " ")
+                    strike_hit = False
+                    if long_strike is not None:
+                        for tok in toks.split():
+                            t = tok.strip("$x@()~,")
+                            try:
+                                v = float(t)
+                            except ValueError:
+                                continue
+                            if 1e7 <= v <= 9.9e7:   # skip yyyymmdd expiries
+                                continue
+                            if abs(v - float(long_strike)) < 1e-6:
+                                strike_hit = True
+                                break
+                    if strike_hit:
+                        return float(conv)
+                    if best is None:
+                        best = float(conv)  # symbol-only fallback (closest available)
+        except Exception:
+            return best
+        return best
+
+    def _log_exit(self, con_id: int, symbol: str, trigger, exit_price_per_share: Optional[float],
+                  quantity: int, reason: str) -> None:
+        """Append-only record of a realized exit to exits.log (JSONL). ADDITIVE -- never changes
+        exit behavior, only records the outcome. Schema is consumable by conviction_calibration.py
+        --fills (contract_id -> realized_pnl + conviction). Must NOT raise into the exit path."""
+        try:
+            je = self._journal_entries.get(con_id) or {}
+            entry_debit = je.get("debit")
+            try:
+                entry_debit = float(entry_debit) if entry_debit is not None else None
+            except (TypeError, ValueError):
+                entry_debit = None
+            qty = int(quantity) if quantity else int(je.get("quantity", 1) or 1)
+            sp = je.get("spread")
+            structure = "spread" if sp else "single"
+            proceeds = None
+            realized_pnl = None
+            realized_pct = None
+            if exit_price_per_share is not None:
+                try:
+                    proceeds = round(float(exit_price_per_share) * 100 * qty, 2)
+                except (TypeError, ValueError):
+                    proceeds = None
+            if proceeds is not None and entry_debit is not None:
+                realized_pnl = round(proceeds - entry_debit, 2)
+                realized_pct = round(realized_pnl / entry_debit * 100, 2) if entry_debit else None
+            entry_ts = je.get("ts")
+            holding_days = None
+            now = datetime.now().astimezone()
+            if entry_ts:
+                try:
+                    et = datetime.fromisoformat(str(entry_ts).replace("Z", "+00:00"))
+                    if et.tzinfo is None:
+                        from datetime import timezone as _tz
+                        et = et.replace(tzinfo=_tz.utc)
+                    holding_days = round((now - et).total_seconds() / 86400.0, 3)
+                except Exception:
+                    holding_days = None
+            rec = {
+                "ts": now.isoformat(),                 # close timestamp (close_ts for calibration)
+                "close_ts": now.isoformat(),
+                "contract_id": con_id,                 # matches journal contract_id / --fills key
+                "conId": con_id,
+                "symbol": symbol,
+                "right": je.get("right"),
+                "strike": je.get("strike"),
+                "structure": structure,
+                "quantity": qty,
+                "entry_debit": entry_debit,            # cost basis ($)
+                "exit_price_per_share": (round(float(exit_price_per_share), 4)
+                                         if exit_price_per_share is not None else None),
+                "proceeds": proceeds,                  # exit proceeds ($)
+                "realized_pnl": realized_pnl,          # realized P&L ($) -- calibration --fills key
+                "realizedPNL": realized_pnl,
+                "realized_pnl_pct": realized_pct,      # realized P&L (%)
+                "reason": reason,                      # profit_target / stop / time_stop / manual
+                "entry_ts": entry_ts,
+                "holding_days": holding_days,
+                "conviction": self._recover_conviction(je, symbol),
+            }
+            if sp:
+                rec["spread"] = {
+                    "short_con_id": sp.get("short_con_id"),
+                    "short_strike": sp.get("short_strike"),
+                    "width": sp.get("width"),
+                }
+            with open(self._exits_log_path(), "a") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
+            print(f"[EXIT-LOG] {symbol} con_id={con_id} reason={reason} "
+                  f"pnl=${realized_pnl if realized_pnl is not None else 'n/a'}")
+        except Exception as e:
+            print(f"[WARN] exits.log write failed for con_id={con_id}: {e}")
+
+    @staticmethod
+    def _exit_reason(trigger) -> str:
+        """Map an ExitTrigger.trigger_type to the calibration reason vocabulary."""
+        tt = (getattr(trigger, "trigger_type", "") or "").lower()
+        if "profit" in tt or "take_profit" in tt:
+            return "profit_target"
+        if "time" in tt:
+            return "time_stop"
+        if "trail" in tt:
+            return "stop"
+        if "stop" in tt or "cut" in tt:
+            return "stop"
+        if "manual" in tt:
+            return "manual"
+        return tt or "exit"
+
     def _check_kill_switch(self) -> bool:
         """Check if kill switch file exists. Returns True if kill switch is ACTIVE (stop)."""
         kill_path = Path(self.config.kill_switch.path)
@@ -385,6 +539,10 @@ class ExitManager:
                         _loo[cid] = {"order_id": res.order_id, "remaining": qty}
                         self._post_exit_alert(sym, _t.SimpleNamespace(trigger_type="manual early-exit",
                             pnl_pct=0.0, message="early exit via book-review one-tap (market, ahead of stop)"))
+                        # durable record (FIX #2): MARKET manual close -> fill price not known
+                        # synchronously, so proceeds/realized P&L are null here (reason=manual).
+                        self._log_exit(cid, sym, _t.SimpleNamespace(trigger_type="manual"),
+                                       exit_price_per_share=None, quantity=qty, reason="manual")
                         print(f"[MANUAL-EXIT] {sym} con_id={cid} MARKET close placed")
                         self._clear_manual_exit(cid)   # clear ONLY on success
                     else:
@@ -548,6 +706,12 @@ class ExitManager:
                         # Update live_open_orders for next iteration
                         live_open_orders[con_id] = {"order_id": result.order_id, "remaining": quantity}
                         self._post_exit_alert(symbol, trigger)
+                        # durable realized-exit record (FIX #2). current_price is the per-share
+                        # NET (long-minus-short for spreads) used to value the exit, so proceeds =
+                        # current_price*100*qty and realized P&L = proceeds - entry_debit.
+                        self._log_exit(con_id, symbol, trigger,
+                                       exit_price_per_share=current_price, quantity=quantity,
+                                       reason=self._exit_reason(trigger))
             else:
                 # Log evaluation (no trigger)
                 pnl_pct = (current_price * 100 * quantity - entry_debit) / entry_debit * 100 if entry_debit > 0 else 0

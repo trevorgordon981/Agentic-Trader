@@ -29,6 +29,18 @@ from exitmgr.market import fetch_universe_quotes
 
 CLIENT_ID = 93
 
+# 5% cash-buffer: keep this fraction of NetLiq (account VALUE) liquid on every sizing path. Set from
+# config (trading.cash_buffer_pct) in main(); the risk gate (exitmgr/risk.py) enforces the same on
+# the trader loop. 2026-06-22.
+CASH_BUFFER_PCT = 0.05
+
+
+def deployable_funds(pot):
+    """Buying power we may actually deploy = available_funds minus a 5% cash reserve on NetLiq.
+    Clamped at 0 so we never go negative. Whole-pot sizing therefore caps near 95%, never $0 cash."""
+    floor = max(0.0, CASH_BUFFER_PCT) * (pot.net_liq or 0.0)
+    return max(0.0, (pot.available_funds or 0.0) - floor)
+
 
 def _append_watchlist(config_path, tickers):
     """Append tickers to trading.approved_names in config.yaml (preserving the file). Returns the
@@ -127,12 +139,13 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
     """Resolve an idea to a concrete priced order, post it to #approvals with one-tap, and append it
     to `pending` so the watch loop manages approval/execution. Returns the Slack ts (or None).
     Shared by the daily slate and the same-day 'add a name -> suggest it now' path."""
-    cons_budget = min(pot.available_funds, default_pct * pot.net_liq)
+    deployable = deployable_funds(pot)  # available_funds minus the 5% cash reserve
+    cons_budget = min(deployable, default_pct * pot.net_liq)
     resolved, why = await _resolve(ib, idea, cons_budget, net_liq=pot.net_liq)
     over_default = False
     if not resolved:
-        # too pricey for the default slice -> offer it at full size so you can opt in
-        resolved, why = await _resolve(ib, idea, pot.available_funds, net_liq=pot.net_liq)
+        # too pricey for the default slice -> offer it at full (buffer-clamped) size so you can opt in
+        resolved, why = await _resolve(ib, idea, deployable, net_liq=pot.net_liq)
         over_default = resolved is not None
     # spread-aware GROSS-POSITION screen (mirrors the trader loop): skip orders IBKR would reject
     # with Error 201 (gross position value > 30x NetLiq). single ~1.1x strike*100; spread ~2.4x sum.
@@ -163,7 +176,7 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
                      f"default (1 contract is the smallest size). Tap :white_check_mark: only if you want this size.")
     else:
         size_line = (f"~${cost:,.0f} (*{pct_pot:.0f}% of pot*, your {default_pct:.0%} default). "
-                     f"Reply `full size` to use all ~${pot.available_funds:,.0f} available.")
+                     f"Reply `full size` to use ~${deployable:,.0f} (keeps a 5% cash buffer).")
     msg = (head + f"*Order:* `{order_summary(resolved)}`\n"
            f"{size_line} Max loss = the debit.\n"
            f"*Sell levels (auto):* take profit ~${tp_price:.2f} (+{tp_pct:.0f}%) | "
@@ -180,8 +193,10 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
 
 
 async def run(args):
+    global CASH_BUFFER_PCT
     cfg = yaml.safe_load(open(args.config))
     ibc, tr = cfg.get("ib", {}), cfg.get("trading", {})
+    CASH_BUFFER_PCT = float(tr.get("cash_buffer_pct", 0.05))  # keep this % of NetLiq liquid
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     channel = tr.get("slack_channel", "")
     approver_ids = set(tr.get("approver_ids", []))
@@ -378,8 +393,9 @@ async def run(args):
                     elif ovr.get("structure") == "spread":
                         ns = "put debit spread" if nd == "bearish" else "call debit spread"
                     snap = await get_pot_snapshot(ib)
-                    avail = (snap.available_funds if (full_size or over_default)
-                             else min(snap.available_funds, default_pct * snap.net_liq))
+                    _dep = deployable_funds(snap)  # full size still keeps the 5% cash buffer
+                    avail = (_dep if (full_size or over_default)
+                             else min(_dep, default_pct * snap.net_liq))
                     r2, why2 = await _resolve(ib, _replace(idea, direction=nd, structure=ns), avail, net_liq=snap.net_liq)
                     if r2 is not None:
                         r = r2
@@ -438,6 +454,7 @@ async def run(args):
                                       "strike": r.strike, "quantity": r.qty,
                                       "debit": round(r.limit * 100 * r.qty, 2),
                                       "profit_target_pct": eff_tp, "stop_pct": eff_sl,
+                                      "conviction": getattr(idea, "conviction", -1),
                                       **spread_j}, default=str) + "\n")
                 tag = " _(your levels)_" if (ov_tp or ov_sl) else ""
                 approval.post_proposal(token, channel,

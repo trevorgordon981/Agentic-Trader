@@ -39,14 +39,28 @@ class IBConnection:
         self.market_data_type = market_data_type
         self.ib: Optional[IB] = None
         self._connected = False
+        # SELF-HEAL: tracks the gateway<->IBKR UPLINK, which a local isConnected() can NOT see.
+        # On Error 1100 the uplink drops but our 127.0.0.1 TCP socket stays open, so
+        # isConnected() lies True. The errorEvent handler flips this so is_healthy() is honest.
+        self._uplink_ok = True
 
-    async def connect(self, retries: int = 0, retry_delay: float = 30.0) -> bool:
+    async def connect(self, retries: int = 0, retry_delay: float = 30.0, force: bool = False) -> bool:
         """Establish connection to IB Gateway/TWS.
 
         retries: extra attempts after the first if connect fails (0 = original single-shot
         behavior, used by the trader loop which self-heals each cycle). Once-daily jobs pass
         retries>0 to ride out a brief gateway auto-restart window. NOTE: a gateway sitting
         LOGGED OUT awaiting periodic 2FA will fail every attempt -- retry can't bypass 2FA."""
+        # force=True tears down a (possibly stale) link first so a reconnect is never
+        # short-circuited by the early-return below (the Error-1100 stale-socket case).
+        if force:
+            self._connected = False
+            try:
+                if self.ib:
+                    self.ib.disconnect()
+            except Exception:
+                pass
+            self.ib = None
         if self._connected:
             return True
 
@@ -61,6 +75,12 @@ class IBConnection:
                     timeout=10,
                 )
                 self._connected = True
+                self._uplink_ok = True
+                # (re)subscribe the uplink-health handler on every fresh IB() instance.
+                try:
+                    self.ib.errorEvent += self._on_error
+                except Exception as _e:
+                    print(f"[WARN] could not subscribe errorEvent: {_e}")
                 self.ib.reqMarketDataType(self.market_data_type)
                 print(f"[INFO] Connected to IB at {self.host}:{self.port} "
                       f"(client_id={self.client_id}, market_data_type={self.market_data_type})")
@@ -91,6 +111,48 @@ class IBConnection:
             finally:
                 self._connected = False
                 self.ib = None
+
+    def _on_error(self, reqId, errorCode, errorString, contract=None):
+        """ib_async errorEvent handler. Tracks the gateway<->IBKR UPLINK so is_healthy()
+        can tell a stale link from a live one (isConnected() can't). MUST NOT raise.
+        1100 = connectivity LOST; 1300 = socket dropped/reset; 2110 = connectivity restored
+        but data farm broken -> treat as not-ok. 1102 = connectivity RESTORED -> ok."""
+        try:
+            if errorCode in (1100, 1300, 2110):
+                self._uplink_ok = False
+                print(f"[WARN] IBKR uplink DOWN (code {errorCode}): {errorString}")
+            elif errorCode == 1102:
+                self._uplink_ok = True
+                print(f"[INFO] IBKR uplink RESTORED (code {errorCode}): {errorString}")
+        except Exception:
+            pass
+
+    def is_healthy(self) -> bool:
+        """Cheap, non-blocking liveness: live socket AND uplink reported up."""
+        return bool(self.ib and self.ib.isConnected() and self._uplink_ok)
+
+    async def ensure_connected(self, probe: bool = True, timeout: float = 5.0) -> bool:
+        """Active liveness check. Returns True only if the link is genuinely usable.
+        Beyond is_healthy() it (optionally) round-trips reqCurrentTimeAsync under a short
+        timeout -- a stale link that still reports isConnected() True will hang/raise here
+        and be treated as unhealthy."""
+        if not self.is_healthy():
+            return False
+        if not probe:
+            return True
+        try:
+            await asyncio.wait_for(self.ib.reqCurrentTimeAsync(), timeout=timeout)
+            return True
+        except Exception as e:
+            print(f"[WARN] liveness probe failed (treating link as DOWN): {e}")
+            self._uplink_ok = False
+            return False
+
+    async def reconnect(self, retries: int = 3, retry_delay: float = 10.0) -> bool:
+        """Force-reconnect: tear down the (possibly stale) link and re-establish, re-subscribing
+        the error handler. Returns True on success."""
+        print("[WARN] forcing IBKR reconnect ...")
+        return await self.connect(retries=retries, retry_delay=retry_delay, force=True)
 
     async def get_positions(self) -> Dict[int, PositionData]:
         """
