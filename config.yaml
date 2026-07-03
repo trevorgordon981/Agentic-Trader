@@ -1,0 +1,235 @@
+ib:
+  host: 127.0.0.1
+  port: 4001
+  client_id: 1
+  market_data_type: 1
+journal:
+  path: ./trades.log
+state:
+  path: ./exitmgr_state.json
+kill_switch:
+  path: ./KILL_SWITCH
+loop:
+  interval_seconds: 60
+scope:
+  mode: all
+caps:
+  max_orders_per_cycle: 5
+  max_orders_per_day: 20
+  max_notional_per_day: 50000.0
+  # POT-TIERED TAKE-PROFIT RUNNER CEILING (2026-07-03). Scale the TP ceiling (runner leash) +
+  # default target with account size: bank profits fast when the pot is small, let runners run
+  # longer as the account grows. Consumed at ENTRY by construction.tp_tier_for_pot via
+  # daily_recommend.py + exitmgr/trader.py -- picks the HIGHEST row whose min_pot <= net_liq.
+  # ONLY the take-profit side scales; the protective STOP is never touched by any tier. Values are
+  # FRACTIONS (0.60 == 60%). Monotonic, capped at a 60% ceiling. Below the lowest row uses the
+  # `< $2,500` floor row. Clear/empty this list => full NO-OP = today's flat +30% behavior.
+  # ACCEPTED INVERTED REWARD:RISK ON SMALL POTS (INTENTIONAL -- do NOT "fix" this): on pots under
+  # ~$5,000 the default take-profit (tp_pct 0.20-0.22) sits BELOW the -30% protective stop, i.e.
+  # reward < risk by design. Trevor's deliberate call: bank profits fast to climb out of down days
+  # while the stop still holds firm at -30%. This is NOT a bug and must NOT trigger a post-clamp R:R
+  # re-check or any widening of the small-pot tp rows / tightening of the stop. (Mirrored by code
+  # comments in exitmgr/construction.py clamp_tp_sl and exitmgr/risk.py's reward:risk gate.)
+  tp_tiers:
+    - {min_pot: 0,      tp_max_pct: 0.25, tp_pct: 0.20}   # < $2,500 : ceiling 25% / default 20%
+    - {min_pot: 2500,   tp_max_pct: 0.30, tp_pct: 0.22}   # >= $2,500 : 30% / 22%
+    - {min_pot: 5000,   tp_max_pct: 0.35, tp_pct: 0.25}   # >= $5,000 : 35% / 25%
+    - {min_pot: 7500,   tp_max_pct: 0.40, tp_pct: 0.28}   # >= $7,500 : 40% / 28%
+    - {min_pot: 10000,  tp_max_pct: 0.45, tp_pct: 0.32}   # >= $10,000 : 45% / 32%
+    - {min_pot: 25000,  tp_max_pct: 0.50, tp_pct: 0.38}   # >= $25,000 : 50% / 38%
+    - {min_pot: 50000,  tp_max_pct: 0.55, tp_pct: 0.45}   # >= $50,000 : 55% / 45%
+    - {min_pot: 100000, tp_max_pct: 0.60, tp_pct: 0.50}   # >= $100,000 : 60% / 50% (max ceiling)
+rules:
+  # 2026-07-01 constructor rework (journal audit n=9): +75-100% targets were touched 0/9
+  # times while +20-35% MFE was reached by 4/8 -> default TP +30% / stop -30%. Time stop
+  # moved DTE 3 -> 10: both direction-RIGHT losers died of short DTE, one force-dumped at
+  # DTE<=3 expired at full value 3 days later. Keep time_stop_days == construction.dte_exit_threshold.
+  profit_target_pct: 30.0     # full-exit target (runner cap). LEFT UNCHANGED from the 7/1
+                              #   audit: +75-100% targets were touched 0/9 -> no point raising it.
+  stop_pct: 30.0
+  time_stop_days: 10
+  exit_market_orders: true
+  # EXIT SLIPPAGE FLOOR (2026-07-03, config-driven; tuned by tune_exit_floor.py). A TRIGGERED
+  # bid-anchored SELL-to-close is never priced below mark*(1-this) -- a catastrophe guard against a
+  # broken/stub bid. 0.50 == the prior hardcoded order.py EXIT_SLIPPAGE_FLOOR (byte-identical
+  # default). tune_exit_floor.py PROPOSES a value from logged fill quality; apply here or via
+  # `tune_exit_floor.py --write`. (SEAM: to reach a LIVE OrderManager, manager.py must also pass
+  # exit_slippage_floor=cfg.rules.exit_slippage_floor -- flagged, not yet wired.)
+  exit_slippage_floor: 0.50
+  # SCALE-OUT + TRAILING (2026-07-02 #1-ROI audit fix, Finding 1). Turned ON per Trevor's
+  # greenlight, but every number below is an UNVALIDATED PRIOR -- eyeball before trading
+  # resumes (exits cannot be data-validated until the live MFE/MAE logging accrues).
+  # Mechanism: bank half the position at +20% (the band the book historically round-trips
+  # from), then trail the runner protecting realized gains, so a +25%+ peak that fades no
+  # longer round-trips to nothing.
+  scale_out:
+    enabled: true
+    first_target_pct: 20.0    # PRIOR: trim at +20% (below the +30% full target)
+    trim_fraction: 0.5        # PRIOR: take 50% off, let 50% run (needs qty>=2 to leave a runner)
+  trailing:
+    enabled: true             # PRIOR: was false -- now ON
+    activation_gain_pct: 20.0 # PRIOR: arm the trail at the scale-out level (+20%)
+    giveback_fraction: 0.4    # PRIOR: exit if runner gives back >40% of its PEAK gain-above-entry
+                              #   (keeps >=60% of the realized peak gain)
+  # GAIN-PROTECTING AUTO-TRAIL SAFETY FLOOR (2026-07-03 Part 2). A WIDE trailing stop that
+  # AUTO-ARMS on ANY winner once its PEAK gain clears activation_gain_pct -- even if the model
+  # never says arm_trail and even if `trailing.enabled` above is off. It only ADDS/WIDENS
+  # downside protection (never chokes a runner, never suppresses the take-profit ceiling, never
+  # touches the 30% stop) and rides the monotonic peak UP. Prevents an up-big winner round-tripping
+  # to breakeven when the model returns 'hold'. ENABLED by default per the 'protect gains by
+  # default' ask; set enabled:false for an exact no-op. UNVALIDATED PRIORS -- eyeball before re-arm.
+  auto_trail:
+    enabled: true
+    activation_gain_pct: 25.0 # auto-arm a protective trail once PEAK gain >= +25% (just below the
+                              #   +30% full target); guarantees the gain is protected thereafter
+    giveback_fraction: 0.5    # WIDE floor: exit only if a runner gives back >50% of its PEAK
+                              #   gain-above-entry (keeps >=50% of the realized peak gain)
+construction:
+  # 2026-07-01 trade-construction rulebook (evidence: journal audit 6/12-7/1). Tune HERE,
+  # not in code -- consumed by exitmgr/construction.py via daily_recommend + exitmgr/trader.
+  min_dte: 25                # DTE floor at entry; shorter model ideas get ADJUSTED up (journal-annotated)
+  prefer_dte_max: 45         # preferred entry window is 25-45 DTE
+  tp_pct: 0.30               # default take-profit = +30% of debit
+  tp_min_pct: 0.25           # model-provided TP clamped into [tp_min, tp_max]
+  tp_max_pct: 0.35
+  sl_pct: -0.30              # default stop = -30% of debit (model stops may be tighter, never looser)
+  max_premium_pct: 0.15      # premium per trade <= 15% of net-liq (downsizes qty first, then rejects)
+  max_deployed_pct: 0.40     # TOTAL deployed premium <= 40% of net-liq (was 82-103% at times)
+  max_decay_pct_per_day: 0.01            # (debit/DTE)/net-liq <= 1%/day per trade
+  max_portfolio_decay_pct_per_day: 0.04  # portfolio theta-decay total <= 4%/day
+  dte_exit_threshold: 10     # exit/roll evaluation at DTE<=10; green/thesis-intact -> managed LIMIT exit
+  fill_alarm_minutes: 15     # unfilled-order Slack alarm threshold during RTH
+  delta_min: 0.55            # long-leg target-delta band (rejects lottery far-OTM legs)
+  delta_max: 0.65
+  spread_width_max_pct: 0.08 # no-IV fallback: spread width <= 8% of spot
+  strike_near_spot_pct: 0.03 # no-IV fallback: long strike within 3% of spot
+  # EARNINGS BLACKOUT (2026-07-03 gate A5): a DEBIT held through an earnings print is an
+  # IV-crush loser by construction -- IV collapses post-print and the long premium bleeds
+  # even when direction is right. Block entering a debit whose holding horizon straddles a
+  # KNOWN next-earnings date (source: research.days_to_earnings via yfinance). FAIL-OPEN on
+  # unknown earnings (never hard-blocks; the slate flags it 'unchecked').
+  earnings_blackout_enabled: true  # block if a known earnings date <= expiry (+cushion)
+  earnings_blackout_days: 0        # extra cushion days beyond expiry also treated as blackout
+  # EARLY-ASSIGNMENT / EX-DIVIDEND RISK (2026-07-03 gate A6): a DEBIT SPREAD whose ITM short leg
+  # (classically a short CALL) heads into an ex-dividend date can be assigned EARLY -- a
+  # counterparty exercises the ITM short to capture the dividend, forfeiting the dividend to you
+  # and converting the spread. Source: research.days_to_ex_dividend via yfinance calendar.
+  # DISPOSITION = WARN by default (early assignment is manageable, not a guaranteed loss): the
+  # slate SURFACES a :warning: note but still lets the trade through. FAIL-OPEN on unknown ex-div
+  # (never hard-blocks; flagged 'unchecked'). Flip assignment_block_hard to hard-reject instead.
+  assignment_check_enabled: true   # surface ex-div early-assignment risk on ITM-short spreads
+  assignment_block_hard: false     # false => WARN only (default); true => hard-reject
+  assignment_cushion_days: 0       # extra cushion days beyond expiry also treated as at-risk
+trading:
+  slack_channel: C0XXXXXXXXX
+  summary_channel: C0XXXXXXXXX
+  alerts_channel: C0XXXXXXXXX
+  error_channel: C0XXXXXXXXX   # #error-logs -- unfilled-order fill alarms (2026-07-01)
+  approver_ids:
+  - U0XXXXXXXXX
+  llm_endpoint: http://127.0.0.1:8082/v1/chat/completions
+  llm_model: /path/to/model
+  manage_positions: true
+  approved_names: [SPY, QQQ, IWM, AAPL, MSFT, NVDA]  # placeholder -- real ~400-name universe scrubbed (strategy)
+  allow_model_names: true
+  blocked_names:
+  - EXAMPLE_TICKER   # placeholder -- original block-list scrubbed
+  blocked_sector_keywords:
+  - biotech
+  - drug manufacturers
+  - pharmaceutical
+  # CORRELATION / SECTOR CONCENTRATION CAP (2026-07-03). Caps aggregate premium-at-risk across a
+  # CORRELATED cluster so three separate semis (NVDA+AMD+MU) can't sail through the single-name-agg
+  # cap as three names while being one macro bet. max_sector_agg_pct = fraction-of-pot ceiling on
+  # any one cluster's summed non-index premium. Set BELOW max_single_name_agg (0.36) so it actually
+  # binds (>=0.36 would be dead, since the whole non-index book is already 0.36-capped); ~2x the
+  # 0.12 soft per-trade cap lets ~two soft-sized correlated names coexist but blocks a third
+  # concentrating the same bet. Only binds in non-`confident` mode, like the single-name-agg cap.
+  max_sector_agg_pct: 0.25
+  # sector_map: STATIC, hand-editable symbol -> cluster id. The pragmatic no-network source of truth
+  # (a live correlation/beta feed is a future upgrade). Unmapped symbols cluster only with THEIR OWN
+  # name (no clustering => behaves as before). Empty map => the sector cap is a full no-op. Edit
+  # freely -- add symbols/clusters as the book concentrates. Starter clusters below; extend as needed.
+  sector_map:
+    # --- semiconductors (the flagship correlated cluster) ---
+    NVDA: semis
+    AMD: semis
+    MU: semis
+    AVGO: semis
+    MRVL: semis
+    QCOM: semis
+    TXN: semis
+    ADI: semis
+    LRCX: semis
+    AMAT: semis
+    KLAC: semis
+    ASML: semis
+    INTC: semis
+    ARM: semis
+    SMCI: semis
+    STX: semis
+    WDC: semis
+    SNDK: semis
+    DRAM: semis
+    MRAM: semis
+    POET: semis
+    SOXX: semis
+    SMH: semis
+    SOXL: semis
+    # --- megacap tech (highly co-moving, QQQ-correlated) ---
+    AAPL: megacap_tech
+    MSFT: megacap_tech
+    GOOGL: megacap_tech
+    AMZN: megacap_tech
+    META: megacap_tech
+    NFLX: megacap_tech
+    # --- crypto / bitcoin proxies + miners ---
+    COIN: crypto
+    MARA: crypto
+    RIOT: crypto
+    CIFR: crypto
+    IREN: crypto
+    IBIT: crypto
+    ARKB: crypto
+    # --- AI power / datacenter buildout ---
+    VRT: ai_power
+    OKLO: ai_power
+    BE: ai_power
+    NBIS: ai_power
+    CRWV: ai_power
+  pot_cap_usd: null
+  confident_full_size: false
+  confident_conviction: 7        # legacy key (back-compat); superseded by cap_bypass_min_conviction
+  cap_bypass_min_conviction: 7   # conviction >= this may exceed the soft base cap toward the hard
+                                 # ceiling (kept at the live 7; raise/lower here, not in code)
+  cash_buffer_pct: 0.05          # ALWAYS keep 5% of NetLiq (account value) liquid -- clamps the
+                                 # final $ size to available_funds - 5%*NetLiq on every path
+  # PENDING CONVICTION CALIBRATION -- do not steepen until journal calibration justifies it.
+  # conviction (1-10) -> fraction-of-pot. Shipped FLAT at the live base cap (0.25) so installing the
+  # curve mechanism does NOT change sizing vs today; edit these numbers once calibrated.
+  conviction_size_curve:
+    1: 0.25
+    2: 0.25
+    3: 0.25
+    4: 0.25
+    5: 0.25
+    6: 0.25
+    7: 0.25
+    8: 0.25
+    9: 0.25
+    10: 0.25
+  # EMPIRICAL CONVICTION SIZE MULTIPLIERS (PROPOSE-ONLY; default EMPTY/absent => 1.0 => flat sizing
+  # UNCHANGED). Fit from REAL closed-trade outcomes by calibrate_conviction_sizing.py and GATED via
+  # gordon-gauntlet/calibration_gate.py (min-sample + discrimination) so thin data can NEVER up-size.
+  # conviction(1-10) -> multiplier on the per-trade SOFT size: >1 up-sizes a genuinely-outperforming
+  # bucket (bounded so it never exceeds the hard ceiling), <1 down-sizes an underperformer, 1.0 flat.
+  # Left EMPTY until Trevor reviews a proposal AND opts in -- to size real money you ALSO must wire it
+  # into run_trader.py's RiskLimits (mirror conviction_size_curve). Empty/absent => full no-op.
+  # conviction_size_multipliers: {}
+  max_trade_pct: 0.25
+  add_suggest_min_conviction: 7
+  entry_limit_buffer_pct: 0.05
+  max_concurrent: 8
+  daily_halt_pct: 0.2
+  baseline_path: ./day_baseline.json
+  audit_path: ./audit.jsonl

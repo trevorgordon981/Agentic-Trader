@@ -1,0 +1,35 @@
+# --- secrets (never commit) ---
+.env
+*.env
+*.ini
+*token*
+*secret*
+*.key
+*.pem
+id_ed25519*
+id_rsa*
+
+# --- runtime / PII (trade history, account state, logs) ---
+*.log
+*.jsonl
+*.json
+KILL_SWITCH
+.reconcile_alert_ts
+exitmgr_state.json
+day_baseline.json
+.gateway_health_state.json
+audit.jsonl
+trades.log
+exits.log
+
+# --- backups / caches ---
+*.bak-*
+*.bak.*
+*.bak
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# --- private (kept out of the public repo) ---
+CLAUDE.md

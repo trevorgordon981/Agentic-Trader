@@ -1,0 +1,3 @@
+TRADING INTENTIONALLY DOWN (created 2026-07-03 safety wave).
+Remove this file to re-enable armed live trading + KILL_SWITCH auto-lift.
+Gated by: run_trader_service.sh (refuses --arm), lift_killswitch.sh (refuses auto-rm).
