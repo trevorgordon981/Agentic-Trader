@@ -240,8 +240,12 @@ def _api(method: str, token: str, params: dict, http_post: bool = True) -> dict:
     return {"ok": False, "error": f"transient: {last_err}"}
 
 
-def post_proposal(token: str, channel: str, text: str) -> Optional[str]:
-    resp = _api("chat.postMessage", token, {"channel": channel, "text": text})
+def post_proposal(token: str, channel: str, text: str,
+                  client_msg_id: Optional[str] = None) -> Optional[str]:
+    payload = {"channel": channel, "text": text}
+    if client_msg_id:
+        payload["client_msg_id"] = str(client_msg_id)
+    resp = _api("chat.postMessage", token, payload)
     ts = resp.get("ts") if resp.get("ok") else None
     if ts:
         # Pre-seed the approve/deny taps so the user just clicks one — no typing, no hunting for

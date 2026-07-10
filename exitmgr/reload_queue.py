@@ -43,7 +43,8 @@ def make_ticket(*, symbol: str, thesis: str, right: str, width: Optional[float],
                 dte_target: Optional[int], structure: str, is_index: bool,
                 reload_conviction: Optional[float], realized_pnl: Optional[float],
                 original_debit: Optional[float], now_ts: Optional[float] = None,
-                ttl_cycles: int = 3, interval_seconds: int = 60) -> dict:
+                ttl_cycles: int = 3, interval_seconds: int = 60,
+                source_fill_key: Optional[str] = None) -> dict:
     """Build a reload ticket dict. expires_after_ts = now + ttl_cycles * loop-interval, so a ticket
     that is never drained (market closed / entries halted for a while) is dropped rather than fired
     days later. All fields are plain JSON so the queue file stays trivially serializable."""
@@ -60,6 +61,7 @@ def make_ticket(*, symbol: str, thesis: str, right: str, width: Optional[float],
         "reload_conviction": (float(reload_conviction) if reload_conviction is not None else None),
         "realized_pnl": (float(realized_pnl) if realized_pnl is not None else None),
         "original_debit": (float(original_debit) if original_debit is not None else None),
+        "source_fill_key": (str(source_fill_key) if source_fill_key else None),
         "created_ts": now,
         "expires_after_ts": now + ttl,
     }
@@ -74,6 +76,7 @@ class ReloadQueue:
         self.path = path
         self.tickets: List[dict] = []
         self.depth: dict = {}
+        self.seen_fill_keys: set = set()
         self._load()
 
     def _load(self) -> None:
@@ -83,20 +86,46 @@ class ReloadQueue:
                     data = json.load(f) or {}
                 self.tickets = list(data.get("tickets", []) or [])
                 self.depth = dict(data.get("depth", {}) or {})
+                self.seen_fill_keys = set(data.get("seen_fill_keys", []) or [])
         except Exception as e:  # noqa: BLE001 - a corrupt queue must never break trading; start empty
             print(f"[RELOAD] could not load reload queue {self.path}: {e} (starting empty)")
-            self.tickets, self.depth = [], {}
+            self.tickets, self.depth, self.seen_fill_keys = [], {}, set()
 
     def save(self) -> None:
         tmp = f"{self.path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump({"tickets": self.tickets, "depth": self.depth}, f, indent=2)
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"tickets": self.tickets, "depth": self.depth,
+                       "seen_fill_keys": sorted(self.seen_fill_keys)}, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.path)
+        try:
+            dfd = os.open(str(Path(self.path).parent),
+                          os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+
+    def add_once(self, ticket: dict) -> bool:
+        """Append once per durable fill key, even after the ticket has already been drained."""
+        fill_key = ticket.get("source_fill_key")
+        if fill_key and str(fill_key) in self.seen_fill_keys:
+            return False
+        self.tickets.append(dict(ticket))
+        if fill_key:
+            self.seen_fill_keys.add(str(fill_key))
+        self.save()
+        return True
 
     def add(self, ticket: dict) -> None:
-        """Append a ticket and persist. Called by the manager ONLY after a Filled take-profit close."""
-        self.tickets.append(dict(ticket))
-        self.save()
+        """Backward-compatible append; keyed tickets are automatically replay-safe."""
+        self.add_once(ticket)
 
     def drain(self, *, today: str, max_per_name: int, now_ts: Optional[float] = None
               ) -> Tuple[List[dict], dict]:

@@ -97,19 +97,53 @@ class TestReconciliation:
         assert safe is False
         assert any("not in in_flight" in a.lower() for a in alerts)
 
-    def test_reconcile_unexpected_position_abort(self):
-        """Position not in journal and not in in-flight (under journal scope) should abort."""
+    def test_reconcile_unexpected_position_no_order_is_warn_not_fatal(self):
+        """C1b (2026-07-09): an unexpected live position (not journaled / in-flight) with NO order
+        resting on it carries no double-order risk -> WARN, NOT a global abort. This is what lets a
+        single manual TWS position stop halting every automated stop account-wide."""
         state = State()
-
-        # Live position 456 not in journal and not in in-flight
+        # Live position 456 not in journal and not in in-flight, and no order on it
         live_positions = {456: {"qty": 1, "avg_cost": 5.0}}
         live_open_orders = {}
-        journal_entries = {}  # Empty - only managing journal positions
+        journal_entries = {}
+        detail = {}
+        safe, alerts = reconcile_state(state, live_positions, live_open_orders,
+                                       journal_entries, detail=detail)
+        assert safe is True                                   # no longer fatal
+        assert any("[WARN]" in a and "456" in a for a in alerts)
+        assert 456 not in detail["inconsistent"]              # so its exits are NOT blocked
 
-        safe, alerts = reconcile_state(state, live_positions, live_open_orders, journal_entries)
-
+    def test_reconcile_unexpected_position_with_order_still_aborts(self):
+        """C1b: the DANGEROUS case -- an untracked position that ALSO has a live order on it (real
+        double-order risk) -> still fatal, and the con_id is reported as inconsistent."""
+        state = State()
+        live_positions = {456: {"qty": 1, "avg_cost": 5.0}}
+        live_open_orders = {456: {"order_id": 777, "remaining": 1}}
+        journal_entries = {}
+        detail = {}
+        safe, alerts = reconcile_state(state, live_positions, live_open_orders,
+                                       journal_entries, detail=detail)
         assert safe is False
-        assert any("unexpected" in a.lower() for a in alerts)
+        assert 456 in detail["inconsistent"]
+
+    def test_reconcile_clean_position_not_blocked_alongside_inconsistent(self):
+        """C1a (2026-07-09): one inconsistent position must NOT drag a CLEAN in-flight close into the
+        blocked set. Only the specific bad con_id is reported inconsistent; the clean one is free to
+        have its stop placed."""
+        state = State()
+        # Clean in-flight close, order matches live -> consistent
+        state.add_in_flight(InFlightClose(con_id=123, order_id=100, remaining_qty=1, entry_debit=500.0))
+        # Untracked position 456 WITH an order -> the inconsistent one
+        live_positions = {123: {"qty": 1, "avg_cost": 5.0}, 456: {"qty": 1, "avg_cost": 5.0}}
+        live_open_orders = {123: {"order_id": 100, "remaining": 1},
+                            456: {"order_id": 777, "remaining": 1}}
+        journal_entries = {123: {"debit": 500.0}}
+        detail = {}
+        safe, alerts = reconcile_state(state, live_positions, live_open_orders,
+                                       journal_entries, detail=detail)
+        assert safe is False                                  # 456 makes the overall pass unsafe
+        assert 456 in detail["inconsistent"]                  # but only 456 is blocked
+        assert 123 not in detail["inconsistent"]              # the clean close is still placeable
 
     def test_reconcile_in_flight_order_id_mismatch_abort(self):
         """In-flight order_id differs from live order_id should abort."""

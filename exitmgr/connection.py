@@ -25,6 +25,10 @@ class OrderData:
     order_id: int
     remaining: int  # remaining quantity
     limit_price: Optional[float] = None
+    perm_id: int = 0
+    client_id: Optional[int] = None
+    order_ref: Optional[str] = None
+    status: Optional[str] = None
 
 
 class IBConnection:
@@ -197,7 +201,7 @@ class IBConnection:
 
         return result
 
-    async def get_open_orders(self) -> Dict[int, OrderData]:
+    async def get_open_orders(self, short_leg_con_ids=None) -> Dict[int, OrderData]:
         """
         Fetch all resting SELL-to-close orders, keyed by the con_id the idempotency/reconcile
         layer keys on. Returns dict mapping con_id -> OrderData.
@@ -220,6 +224,7 @@ class IBConnection:
             raise RuntimeError("Not connected to IB")
 
         trades = await self.ib.reqAllOpenOrdersAsync()
+        _short_legs = {int(c) for c in (short_leg_con_ids or [])}
 
         result: Dict[int, OrderData] = {}
         for t in trades or []:
@@ -228,14 +233,19 @@ class IBConnection:
             status = getattr(t, "orderStatus", None)
             if order is None or contract is None:
                 continue
-            # Only include SELL-to-close orders (the exit side we reconcile against)
-            if getattr(order, "action", "") != "SELL":
-                continue
 
             # Key by the LONG-leg conId for a spread combo (BAG); else the contract's own conId.
             con_id = self._order_key_con_id(contract)
             if con_id is None:
                 continue
+            _action = getattr(order, "action", "")
+            # Include SELL-to-close orders (the exit side we reconcile against). M1 (2026-07-09):
+            # ALSO include a BUY that COVERS a KNOWN short leg (buy-to-close on a naked/over-covered
+            # short) -- otherwise a resting cover is invisible to the idempotency/reconcile view and
+            # could be double-placed. Any OTHER BUY (a fresh long entry) is not a close -> excluded.
+            if _action != "SELL":
+                if not (_action == "BUY" and con_id in _short_legs):
+                    continue
 
             # remaining: prefer the live orderStatus, else totalQuantity - filled
             remaining = getattr(status, "remaining", None) if status is not None else None
@@ -251,6 +261,11 @@ class IBConnection:
                 order_id=getattr(order, "orderId", 0) or 0,
                 remaining=int(remaining),
                 limit_price=getattr(order, "lmtPrice", None),
+                perm_id=getattr(order, "permId", 0) or 0,
+                client_id=(getattr(order, "clientId", None)
+                           if isinstance(getattr(order, "clientId", None), int) else None),
+                order_ref=getattr(order, "orderRef", None) or None,
+                status=getattr(status, "status", None) if status is not None else None,
             )
 
         return result
@@ -360,6 +375,23 @@ class IBConnection:
         # ib_async: placeOrder is SYNCHRONOUS and returns a Trade immediately
         trade = self.ib.placeOrder(contract, order)
         return trade
+
+    def reserve_order_id(self) -> int:
+        """Reserve this client's next IB order id before transmission.
+
+        ib_async normally performs the same allocation inside ``placeOrder``.  Exposing it one
+        step earlier lets the exit manager fsync the exact client-scoped identity first.
+        """
+        if not self._connected or not self.ib:
+            raise RuntimeError("Not connected to IB")
+        client = getattr(self.ib, "client", None)
+        get_req_id = getattr(client, "getReqId", None)
+        if not callable(get_req_id):
+            raise RuntimeError("IB client cannot reserve an order id")
+        order_id = get_req_id()
+        if not isinstance(order_id, int) or isinstance(order_id, bool) or order_id <= 0:
+            raise RuntimeError("IB returned an invalid reserved order id")
+        return order_id
 
     def create_contract(self, con_id: int, symbol: str = "", right: str = "C") -> Contract:
         """Create a Contract object for order placement."""

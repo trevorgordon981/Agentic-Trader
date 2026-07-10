@@ -17,6 +17,7 @@ broker is touched -- we capture the `quantity` handed to place_close_order and i
 """
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -73,7 +74,16 @@ def _wire(mgr, *, qty, price, expiry="20261231"):
     mgr.ib_conn.ib.portfolio = lambda: []           # no server marking -> use the quote
     mgr._spot_price = AsyncMock(return_value=None)   # enrichment lookup on exit
 
-    place = AsyncMock(return_value=OrderResult(success=True, order_id=555, con_id=CON, trade=None))
+    # These cases assert realized P&L / scaled_out state, so the broker mock must confirm a real
+    # fill. Placement alone is intentionally no longer treated as a realized close.
+    trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=555),
+        orderStatus=SimpleNamespace(
+            status="Filled", avgFillPrice=price, filled=qty, remaining=0),
+        fills=[],
+    )
+    place = AsyncMock(return_value=OrderResult(
+        success=True, order_id=555, con_id=CON, trade=trade))
     mgr.order_manager.place_close_order = place
     return place
 

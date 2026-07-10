@@ -1,7 +1,8 @@
 """Unit tests for exitmgr.flex_ingest -- IBKR Flex Web Service history ingest (2026-07-03).
 
-All offline: the live statement is replaced by a saved real Flex XML fixture (tests/flex_sample.xml,
-46 real fills) and the HTTP layer is mocked. Covers XML parse, open/close + commission-sign
+All offline: the live statement is replaced by an optional local Flex XML fixture
+(tests/flex_sample.xml, intentionally excluded from public snapshots) and the HTTP layer is mocked.
+Covers XML parse, open/close + commission-sign
 normalization, per-contract pairing/retag, backfill supersede/reconcile, exec-id dedup vs
 reqExecutions rows, open-position snapshots, no-fabrication of reasoning, token redaction, the
 SendRequest/GetStatement fetch flow (incl. the 1019 'in progress' warn), and idempotency."""
@@ -18,6 +19,8 @@ _SAMPLE = os.path.join(_HERE, "flex_sample.xml")
 
 @pytest.fixture
 def sample_xml():
+    if not os.path.exists(_SAMPLE):
+        pytest.skip("private Flex XML fixture is not present in this checkout")
     with open(_SAMPLE) as f:
         return f.read()
 
@@ -54,7 +57,7 @@ def test_load_flex_creds_env_overrides(tmp_path, monkeypatch):
 def test_parse_statement_counts(sample_xml):
     parsed = fi.parse_statement(sample_xml)
     assert len(parsed["fills"]) == 46
-    assert parsed["meta"]["accountId"] == "U00000000"
+    assert parsed["meta"]["accountId"]  # exact account identifier is deliberately not public
     assert parsed["meta"]["period"] == "Last365CalendarDays"
 
 

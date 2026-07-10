@@ -11,13 +11,38 @@ from pathlib import Path
 
 @dataclass
 class InFlightClose:
-    """Record of a pending close order for a contract."""
+    """Durable record of a pending close order for a contract.
+
+    ``exit_context`` is deliberately persisted with the order.  A close can fill after the
+    placement cycle (or after this process restarts); without the entry snapshot and trigger
+    metadata the later fill cannot be turned into an honest realized-P&L record.  The default
+    keeps old state files and tests backward compatible.
+    """
     con_id: int
     order_id: int  # IB order id (0 if not yet placed)
     remaining_qty: int  # contracts still to be closed
     entry_debit: float  # total dollars paid at entry (for P&L calc)
     order_price: Optional[float] = None  # limit price if order placed
     placed_at: Optional[str] = None  # ISO timestamp
+    exit_context: Dict[str, object] = field(default_factory=dict)
+    # IB order ids are scoped to a client session and can be reused.  Persist the rest of the
+    # broker identity so restart reconciliation and realized-P&L dedupe never join an unrelated
+    # order that happens to carry the same numeric orderId.
+    perm_id: int = 0
+    # ``None`` means a pre-identity legacy record.  IB clientId=0 is legitimate (TWS/manual) and
+    # must remain distinguishable from unknown, otherwise orderId-only fallback can cross sessions.
+    client_id: Optional[int] = None
+    order_ref: Optional[str] = None
+    identity_version: int = 0
+    # ``intent`` is fsynced before transmission; ``submitted`` is bound to the Trade returned by
+    # IB.  This closes the crash window where a live order previously existed with no durable
+    # finalization context at all.
+    placement_state: str = "submitted"
+    fill_key: Optional[str] = None
+    # Durable checkpoints for non-ledger side effects.  Reload tickets have their own fill-key
+    # dedupe; alerts use a deterministic Slack client_msg_id.  These checkpoints keep a restart
+    # replay from repeating either action after the ledger commit.
+    side_effects: Dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -225,11 +250,28 @@ class StateManager:
             "trail_armed": self.state.trail_armed,
         }
 
-        # Write to temp file first, then rename (atomic on POSIX)
+        # Write + fsync the temp file, atomically replace, then fsync the directory.  A rename
+        # without those durability barriers can acknowledge exit_context and still lose it on a
+        # power loss, defeating restart-time fill finalization. State contains account/trade data,
+        # so keep both the temp and final file owner-only.
         temp_path = self.state_path.with_suffix(".tmp")
-        with open(temp_path, "w") as f:
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
-        temp_path.rename(self.state_path)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, self.state_path)
+        try:
+            dfd = os.open(self.state_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            # Directory fsync is unavailable on some non-POSIX test filesystems; the atomic file
+            # replacement still holds there.
+            pass
 
     def update_last_cycle(self) -> None:
         """Update last cycle timestamp and persist."""
@@ -243,6 +285,11 @@ def reconcile_state(
     live_open_orders: Dict[int, dict],  # con_id -> order data (order_id, remaining_qty)
     journal_entries: Dict[int, dict],  # con_id -> journal entry (debit)
     journal_qtys: Optional[Dict[int, int]] = None,  # con_id -> entered quantity (2026-07-03)
+    detail: Optional[dict] = None,  # OUT (2026-07-09): filled with the SPECIFIC con_ids that are
+                                    # `inconsistent` (block ONLY these exits) and `closed` (fully
+                                    # closed this pass, caller purges tracking). Ignored if None, so
+                                    # every existing `safe, alerts = reconcile_state(...)` caller is
+                                    # byte-for-byte unaffected.
 ) -> tuple[bool, List[str]]:
     """
     Reconcile persisted in-flight state against live broker positions and open orders.
@@ -265,6 +312,11 @@ def reconcile_state(
     alerts: List[str] = []
     safe = True
     journal_qtys = journal_qtys or {}
+    # C1a/C3 (2026-07-09): the SPECIFIC con_ids that are inconsistent (caller blocks ONLY these,
+    # so one manual TWS position no longer halts every automated stop) and the ones fully closed
+    # this pass (caller purges their per-contract tracking + journal entry).
+    inconsistent_con_ids: set = set()
+    closed_con_ids: set = set()
 
     def _pos_consistent_with_order(con_id: int, order_remaining) -> bool:
         """A live position qty that equals (journaled entry qty - order remaining) is the EXPECTED
@@ -284,18 +336,65 @@ def reconcile_state(
             return False
         return pq == r or pq == jq - r
 
+    def _client_id(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    def _same_order_identity(in_flight: InFlightClose, live_order: dict) -> bool:
+        """Match the strongest broker identity available, never orderId across clients blindly."""
+        iperm = int(getattr(in_flight, "perm_id", 0) or 0)
+        lperm = int(live_order.get("perm_id", 0) or 0)
+        if iperm and lperm:
+            return iperm == lperm
+        iref = getattr(in_flight, "order_ref", None)
+        lref = live_order.get("order_ref")
+        if iref and lref:
+            return str(iref) == str(lref)
+        ioid = int(getattr(in_flight, "order_id", 0) or 0)
+        loid = int(live_order.get("order_id", 0) or 0)
+        iclient = _client_id(getattr(in_flight, "client_id", None))
+        lclient = _client_id(live_order.get("client_id"))
+        strong_client = bool(getattr(in_flight, "identity_version", 0) >= 1
+                             or iclient not in (None, 0))
+        if strong_client:
+            return bool(ioid and loid and ioid == loid
+                        and lclient is not None and iclient == lclient)
+        # Backward compatibility for pre-identity state files.  New placements always have an
+        # orderRef/client id and therefore never take this weaker branch.
+        return bool(ioid and loid and ioid == loid)
+
     # Build sets
     in_flight_con_ids = set(int(k) for k in state.in_flight.keys())
     live_position_con_ids = set(live_positions.keys())
     live_order_con_ids = set(live_open_orders.keys())
     journal_con_ids = set(journal_entries.keys())
 
-    # Check 1: in_flight but no position and no order -> fully closed (fill event)
+    # Check 1: in_flight but no position and no order -> a terminal close CANDIDATE.  Context-rich
+    # records must remain durable until ExitManager confirms ``Filled`` and writes the realized
+    # record.  Removing them here used to discard the only order/entry/trigger linkage before the
+    # asynchronous fill poll ran (and made restart-time fills impossible to finalize).  Legacy
+    # context-free records retain the historical cleanup behavior because there is nothing the
+    # finalizer could reconstruct from them.
     for con_id in in_flight_con_ids:
         if con_id not in live_position_con_ids and con_id not in live_order_con_ids:
-            # Position fully closed, remove in_flight
-            alerts.append(f"[INFO] Position con_id={con_id} fully closed (fill event), removing in_flight.")
-            state.remove_in_flight(con_id)
+            in_flight = state.get_in_flight(con_id)
+            if in_flight is not None and in_flight.exit_context:
+                alerts.append(
+                    f"[INFO] Position con_id={con_id} and close order are no longer live; "
+                    f"retaining in_flight until the terminal fill is confirmed and finalized."
+                )
+            else:
+                alerts.append(
+                    f"[INFO] Position con_id={con_id} fully closed (legacy fill event), "
+                    f"removing context-free in_flight."
+                )
+                state.remove_in_flight(con_id)
+                closed_con_ids.add(con_id)
 
     # Check 2 & 3: in_flight with position but no order
     for con_id in in_flight_con_ids:
@@ -310,6 +409,16 @@ def reconcile_state(
                     f"live position qty={live_qty}. Cannot reconcile safely."
                 )
                 safe = False
+                inconsistent_con_ids.add(con_id)
+            elif in_flight and in_flight.exit_context:
+                # Do not discard the only basis/trigger/order snapshot before ExitManager asks
+                # IBKR's completed-order/execution stores. The order may have filled between the
+                # positions and open-orders snapshots. A confirmed terminal cancellation is
+                # released by the fill poll so the close can retry.
+                alerts.append(
+                    f"[INFO] con_id={con_id}: context-rich close order no longer live while "
+                    f"position remains; retaining in_flight pending terminal broker status."
+                )
             else:
                 # Order vanished (cancelled/expired) but position intact and quantities agree:
                 # clear the stale in_flight so exits are re-evaluated/re-protected next cycle
@@ -328,12 +437,29 @@ def reconcile_state(
             live_order_id = live_order.get("order_id", 0)
             live_remaining = live_order.get("remaining", 0)
 
-            if in_flight and in_flight.order_id != live_order_id and in_flight.order_id != 0:
+            if in_flight and not _same_order_identity(in_flight, live_order):
                 alerts.append(
-                    f"[ERROR] con_id={con_id}: in_flight order_id={in_flight.order_id}, "
-                    f"live order_id={live_order_id}. Order ID mismatch - cannot reconcile safely."
+                    f"[ERROR] con_id={con_id}: durable close identity mismatch with the live "
+                    f"order (stored order_id={in_flight.order_id}, live order_id={live_order_id}). "
+                    f"Cannot reconcile safely."
                 )
                 safe = False
+                inconsistent_con_ids.add(con_id)
+            elif in_flight:
+                # Bind a prepared intent (or enrich an older submitted record) to the live Trade's
+                # full identity.  This update is persisted by the caller after reconciliation.
+                in_flight.order_id = int(live_order_id or in_flight.order_id or 0)
+                in_flight.perm_id = int(live_order.get("perm_id", 0)
+                                        or getattr(in_flight, "perm_id", 0) or 0)
+                live_client = _client_id(live_order.get("client_id"))
+                if live_client is not None:
+                    in_flight.client_id = live_client
+                in_flight.order_ref = (live_order.get("order_ref")
+                                       or getattr(in_flight, "order_ref", None))
+                in_flight.placement_state = "submitted"
+                if (in_flight.perm_id or in_flight.order_ref
+                        or in_flight.client_id is not None):
+                    in_flight.identity_version = 1
 
             if in_flight and in_flight.remaining_qty != live_remaining:
                 # Partial fill or quantity mismatch
@@ -360,17 +486,29 @@ def reconcile_state(
                         f"live order remaining={live_remaining}. Cannot reconcile safely."
                     )
                     safe = False
+                    inconsistent_con_ids.add(con_id)
 
-    # Check 5: live position NOT in journal (under journal scope) and NOT in in_flight
-    # This is only a problem if scope is "journal"
+    # Check 5: live position NOT in journal and NOT in in_flight -- an unexpected position (e.g. a
+    # manual TWS buy). C1b (2026-07-09): this used to ABORT the WHOLE reconcile (safe=False), which
+    # blocked EVERY automated stop account-wide over one untracked position. A position we have never
+    # touched carries NO double-order risk UNLESS a live order is already resting on it. So: if there
+    # is a live order on this con_id (potential double-action), keep it FATAL + inconsistent; if there
+    # is NONE, downgrade to a WARN (do not set safe=False) so clean positions still get their stops.
     for con_id in live_position_con_ids:
         if con_id not in in_flight_con_ids and con_id not in journal_con_ids:
-            # Unexpected position not in journal and not being managed
-            alerts.append(
-                f"[ERROR] con_id={con_id}: live position exists but NOT in journal and NOT in in_flight. "
-                f"This is unexpected under journal scope. Aborting for safety."
-            )
-            safe = False
+            if con_id in live_order_con_ids:
+                alerts.append(
+                    f"[ERROR] con_id={con_id}: live position exists but NOT in journal and NOT in "
+                    f"in_flight, AND a live order rests on it. Double-order risk -- aborting for safety."
+                )
+                safe = False
+                inconsistent_con_ids.add(con_id)
+            else:
+                alerts.append(
+                    f"[WARN] con_id={con_id}: unexpected live position (not in journal / in_flight), "
+                    f"but no in-flight or live order on it -- no double-order risk. Not treating as fatal; "
+                    f"clean positions are still protected."
+                )
 
     # Check 6: live order NOT in in_flight
     for con_id in live_order_con_ids:
@@ -394,5 +532,9 @@ def reconcile_state(
             f"Cannot reconcile safely. Aborting for safety."
         )
         safe = False
+        inconsistent_con_ids.add(con_id)
 
+    if detail is not None:
+        detail["inconsistent"] = inconsistent_con_ids
+        detail["closed"] = closed_con_ids
     return safe, alerts

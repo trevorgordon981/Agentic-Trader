@@ -116,16 +116,18 @@ def test_entry_and_exit_commission_and_net(tmp_path):
                   extra={"fill_status": "Filled", "avg_fill_price": 1.80,
                          "exit_commission": 0.65})
     r = _read_exits(cfg)[0]
-    assert r["realized_pnl"] == 60.0                       # gross UNCHANGED (proceeds 180 - 120)
+    # C2b (2026-07-09): realized P&L now anchors to the REAL entry fill debit (121, basis_source
+    # "fill"), not the estimated debit (120). Proceeds 180 - 121 = 59 gross.
+    assert r["realized_pnl"] == 59.0
     assert r["entry_commission"] == 0.65
     assert r["exit_commission"] == 0.65
     assert r["commission_unknown"] is False
-    assert r["realized_pnl_net"] == 58.70                  # 60 - 0.65 - 0.65
+    assert r["realized_pnl_net"] == 57.70                  # 59 - 0.65 - 0.65
     assert r["basis_source"] == "fill" and r["entry_fill_debit"] == 121.0
     # ... and it flows into the fine-tuning dataset
     ds = _read_dataset(cfg)[0]
-    assert ds["close"]["realized_pnl"] == 60.0
-    assert ds["close"]["realized_pnl_net"] == 58.70
+    assert ds["close"]["realized_pnl"] == 59.0
+    assert ds["close"]["realized_pnl_net"] == 57.70
     assert ds["close"]["entry_commission"] == 0.65
     assert ds["close"]["exit_commission"] == 0.65
     assert ds["close"]["commission_unknown"] is False
@@ -220,9 +222,11 @@ def test_late_fill_join_from_fills_log(tmp_path):
     assert ds["entry"]["entry_slippage"] == 3.0            # 250 - 247
     assert ds["entry"]["basis_source"] == "fill"
     r = _read_exits(cfg)[0]
-    # gross = 200 proceeds - 247 basis = -47 ; net = -47 - 1.30 - 0.65
-    assert r["realized_pnl"] == -47.0
-    assert r["realized_pnl_net"] == -48.95
+    # C2b (2026-07-09): the fills.log join backfills entry_fill_debit=250 (basis "fill"), and P&L
+    # now anchors to THAT real basis instead of the estimated 247. gross = 200 - 250 = -50 ;
+    # net = -50 - 1.30 - 0.65 = -51.95.
+    assert r["realized_pnl"] == -50.0
+    assert r["realized_pnl_net"] == -51.95
 
 
 def test_non_fill_exit_has_null_net(tmp_path):

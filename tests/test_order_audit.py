@@ -8,11 +8,12 @@ Covers:
   P2.7 - a REJECTED placed_trade must NOT leave a blocking in-flight record
 """
 import asyncio
+import json
 
 from unittest.mock import AsyncMock, MagicMock
 
 from exitmgr.order import OrderManager
-from exitmgr.state import StateManager
+from exitmgr.state import InFlightClose, State, StateManager, reconcile_state
 
 
 def _order_manager(tmp_path, trade=None):
@@ -158,3 +159,73 @@ def test_accepted_order_still_records_in_flight(tmp_path):
         live_open_orders={}, right="C"))
     assert res.success
     assert sm.state.get_in_flight(333) is not None
+
+
+def test_immediate_partial_cancel_retains_context_for_finalization(tmp_path):
+    trade = _rejecting_trade("Cancelled")
+    trade.orderStatus.filled = 1
+    trade.orderStatus.avgFillPrice = 2.25
+    om, _, sm = _order_manager(tmp_path, trade=trade)
+    res = asyncio.run(om.place_close_order(
+        con_id=444, symbol="SPY", quantity=2, limit_price=2.50, entry_debit=500.0,
+        live_open_orders={}, right="C", exit_context={"close_qty": 2, "position_qty": 2}))
+    assert res.success
+    assert res.trade is trade
+    inf = sm.state.get_in_flight(444)
+    assert inf is not None and inf.exit_context["close_qty"] == 2
+
+
+def test_placement_intent_is_durable_before_broker_call(tmp_path):
+    om, ib_conn, sm = _order_manager(tmp_path)
+    ib_conn.reserve_order_id.return_value = 901
+    seen = {}
+
+    async def place_after_inspection(contract, order):
+        data = json.loads((tmp_path / "state.json").read_text())
+        seen.update(data["in_flight"]["555"])
+        trade = MagicMock()
+        trade.order.orderId = 901
+        trade.order.clientId = 42
+        trade.order.permId = 1234
+        trade.order.orderRef = order.orderRef
+        trade.orderStatus.status = "Submitted"
+        return trade
+
+    ib_conn.client_id = 42
+    ib_conn.place_order = AsyncMock(side_effect=place_after_inspection)
+    res = asyncio.run(om.place_close_order(
+        con_id=555, symbol="SPY", quantity=1, limit_price=2.50, entry_debit=250.0,
+        live_open_orders={}, right="C", exit_context={"when": "restart"}))
+    assert res.success
+    assert seen["placement_state"] == "intent"
+    assert seen["order_id"] == 901 and seen["client_id"] == 42
+    assert seen["order_ref"].startswith("exitmgr-555-")
+
+
+def test_failed_intent_save_never_calls_broker(tmp_path):
+    om, ib_conn, sm = _order_manager(tmp_path)
+    sm.save = MagicMock(side_effect=OSError("disk full"))
+    res = asyncio.run(om.place_close_order(
+        con_id=666, symbol="SPY", quantity=1, limit_price=2.50, entry_debit=250.0,
+        live_open_orders={}, right="C", exit_context={"x": 1}))
+    assert not res.success
+    ib_conn.place_order.assert_not_awaited()
+
+
+def test_prepared_intent_binds_matching_live_order_identity():
+    state = State()
+    state.add_in_flight(InFlightClose(
+        con_id=777, order_id=901, remaining_qty=2, entry_debit=500.0,
+        exit_context={"close_qty": 2}, client_id=42, order_ref="stable-ref",
+        placement_state="intent"))
+    safe, _ = reconcile_state(
+        state,
+        live_positions={777: {"qty": 2, "avg_cost": 2.5}},
+        live_open_orders={777: {"order_id": 901, "remaining": 2, "client_id": 42,
+                                "perm_id": 1234, "order_ref": "stable-ref"}},
+        journal_entries={777: {"debit": 500.0}},
+        journal_qtys={777: 2},
+    )
+    inf = state.get_in_flight(777)
+    assert safe and inf.placement_state == "submitted"
+    assert inf.perm_id == 1234

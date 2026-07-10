@@ -1,6 +1,9 @@
 """Order placement and tracking logic."""
 
 import asyncio
+import json
+import math
+import uuid
 from typing import Optional, Dict, List
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -48,6 +51,40 @@ class OrderResult:
     message: str = ""
     con_id: Optional[int] = None
     trade: object = None  # the ib Trade object (fill-status verification, 2026-07-01); may be None
+    perm_id: Optional[int] = None
+    client_id: Optional[int] = None
+    order_ref: Optional[str] = None
+
+
+def _safe_int(value) -> int:
+    """Return a real positive integer, never a MagicMock/bool/coercion surprise."""
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _safe_client_id(value):
+    """IB clientId 0 is valid; ``None`` is the only unknown sentinel."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return int(value)
+    return None
+
+
+def _json_safe(value):
+    """Normalize placement context before any order can be transmitted.
+
+    State persistence must not discover an unserializable datetime/object or NaN only after IB has
+    accepted the close.  Unknown leaf objects become strings; non-finite floats become ``None``.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
 
 
 def commission_from_trade(trade) -> Optional[float]:
@@ -138,9 +175,13 @@ class OrderManager:
         # Check in-flight state
         in_flight = self.state_manager.state.get_in_flight(con_id)
         if in_flight is not None:
-            if in_flight.order_id != 0:
-                # ANY active in-flight close blocks a new one (no double-close even after a partial fill)
-                return False, f"con_id={con_id} already has in-flight order (id={in_flight.order_id}, remaining={in_flight.remaining_qty})"
+            # A pre-transmission intent is deliberately blocking too.  It is released only after
+            # restart reconciliation proves that no matching broker order/fill exists; treating
+            # order_id=0 as free recreated the exact crash-window double-close this record prevents.
+            ident = (f"id={in_flight.order_id}" if in_flight.order_id
+                     else f"ref={in_flight.order_ref or 'pending-intent'}")
+            return False, (f"con_id={con_id} already has durable in-flight close "
+                           f"({ident}, remaining={in_flight.remaining_qty})")
 
         # Check live open orders
         if con_id in live_open_orders:
@@ -164,6 +205,7 @@ class OrderManager:
         right: Optional[str] = None,
         bid: Optional[float] = None,
         trigger_type: Optional[str] = None,
+        exit_context: Optional[dict] = None,
     ) -> OrderResult:
         """
         Place a SELL-TO-CLOSE order to close a position. LIMIT by default (passive, resting at
@@ -187,6 +229,11 @@ class OrderManager:
         the long leg alone would leave a naked short option.
         `right` ('C'/'P') is the option right of the LONG leg for a single-leg close; when None it
         is resolved from the live portfolio, else defaults to 'C' (see _resolve_close_right).
+        ``exit_context`` is a JSON-serializable snapshot of the entry, trigger, and close sizing.
+        It is committed atomically with the in-flight order so an asynchronous or restart-time
+        fill can be finalized with the actual fill price and correct cost basis.  Callers that do
+        not supply it retain the legacy state shape.
+
         Returns OrderResult indicating success/failure.
         """
         # Idempotency check (keyed by the long leg's con_id for spreads)
@@ -234,92 +281,139 @@ class OrderManager:
         order = self._build_close_order(quantity, limit_price, market,
                                         bid=_eff_bid, trigger_type=trigger_type)
 
-        # Place order. SELF-HEAL: a stale IBKR link (post Error-1100) makes placeOrder raise
-        # "Not connected to IB"; that must NOT silently skip an exit for 15 min. On a
-        # connection-type failure we force ONE reconnect via the connection wrapper and retry
-        # the placement once (single retry only -- never hammer the gateway).
-        async def _place():
-            placed_order = await self.ib_conn.place_order(contract, order)
-            # placeOrder returns a Trade; the IB-assigned id lives on trade.order.orderId
-            oid = placed_order.order.orderId if placed_order and getattr(placed_order, 'order', None) is not None else 0
-            return oid, placed_order
-
+        # Normalize and prove serializability BEFORE anything can reach IB.  This prevents a live
+        # close from escaping restart tracking because a context leaf was NaN/datetime/mock-shaped.
         try:
-            try:
-                order_id, placed_trade = await _place()
-            except Exception as e:
-                msg = str(e).lower()
-                if "not connected" in msg or "connect" in msg or isinstance(e, (ConnectionError, OSError)):
-                    print(f"[WARN] place_close_order: link appears down ({e}) -- reconnecting and retrying ONCE for con_id={con_id}")
-                    if await self.ib_conn.reconnect(retries=2, retry_delay=10):
-                        print(f"[INFO] reconnected; retrying close order for con_id={con_id}")
-                        order_id, placed_trade = await _place()
-                    else:
-                        raise
-                else:
-                    raise
-
-            # REJECTED-ORDER GUARD (P2.7, 2026-07-02): placeOrder returns a Trade immediately in a
-            # non-terminal state; an IBKR REJECT lands asynchronously as Cancelled/ApiCancelled/
-            # Inactive. If we optimistically record an InFlightClose and the order is then rejected,
-            # that stale in-flight blocks EVERY future close (idempotency) while nothing fills -> the
-            # position is stuck open. So poll the returned trade briefly for an immediate reject
-            # BEFORE recording in-flight; if rejected, record nothing, defensively clear any prior
-            # in-flight, log loudly, and return failure so the exit retries next cycle. (Mirrors
-            # trader.py's ACK poll.)
-            _dead = {"Cancelled", "ApiCancelled", "Inactive"}
-            _live = {"Filled", "Submitted", "PreSubmitted"}
-            _status = None
-            _ost = getattr(placed_trade, "orderStatus", None)
-            if _ost is not None:
-                for _ in range(24):  # up to ~12s for IBKR to ACK or REJECT
-                    _status = getattr(_ost, "status", None)
-                    # break on a resolved status; a non-str status means a test mock -> don't poll
-                    if not isinstance(_status, str) or _status in _live or _status in _dead:
-                        break
-                    await asyncio.sleep(0.5)
-            if isinstance(_status, str) and _status in _dead:
-                _reasons = []
-                try:
-                    _reasons = [le.message for le in placed_trade.log if getattr(le, "errorCode", 0)]
-                except Exception:
-                    pass
-                _why = _reasons[-1] if _reasons else _status
-                # defensively clear any in-flight we may already hold so a stale record can't keep
-                # blocking either (remove_in_flight is a no-op when absent)
-                self.state_manager.state.remove_in_flight(con_id)
-                self.state_manager.save()
-                print(f"[ORDER REJECTED] con_id={con_id}, order_id={order_id}, status={_status} -- "
-                      f"NOT recording in-flight so the exit retries next cycle. reason: {_why}")
-                return OrderResult(success=False, order_id=order_id,
-                                   message=f"order {_status}: {_why}", con_id=con_id, trade=placed_trade)
-
-            # Record in-flight close
-            in_flight = InFlightClose(
-                con_id=con_id,
-                order_id=order_id,
-                remaining_qty=quantity,
-                entry_debit=entry_debit,
-                order_price=limit_price,
-                placed_at=datetime.now(timezone.utc).isoformat(),
-            )
-            self.state_manager.state.add_in_flight(in_flight)
-
-            # Update daily stats (notional = limit_price * 100 * quantity)
-            notional = limit_price * 100 * quantity
-            today = _trading_day()  # US/Eastern trading day (matches circuit-breaker key), not UTC
-            self.state_manager.state.update_daily_stats(today, order_count=1, notional=notional)
-
-            # Persist immediately (crash-safe)
-            self.state_manager.save()
-
-            print(f"[ORDER PLACED] con_id={con_id}, order_id={order_id}, qty={quantity}, price={limit_price}, notional=${notional:.2f}")
-            return OrderResult(success=True, order_id=order_id, message="Order placed successfully",
-                               con_id=con_id, trade=placed_trade)
-
+            normalized_context = _json_safe(dict(exit_context or {}))
+            json.dumps(normalized_context, allow_nan=False)
         except Exception as e:
-            print(f"[ERROR] Failed to place order for con_id={con_id}: {e}")
-            return OrderResult(success=False, message=str(e), con_id=con_id)
+            print(f"[ERROR] Refusing close for con_id={con_id}: exit context is not serializable: {e}")
+            return OrderResult(success=False, message=f"invalid exit context: {e}", con_id=con_id)
+
+        # Reserve the client-scoped order id, attach a globally unique orderRef, and fsync the
+        # placement intent BEFORE transmission.  If an old/mock connection cannot reserve an id,
+        # orderRef still gives restart reconciliation a stable identity.
+        order_id = 0
+        try:
+            reserve = getattr(self.ib_conn, "reserve_order_id", None)
+            candidate = reserve() if callable(reserve) else 0
+            order_id = _safe_int(candidate)
+        except Exception as e:
+            print(f"[WARN] could not pre-reserve IB order id for con_id={con_id}: {e}; using orderRef")
+        order_ref = f"exitmgr-{con_id}-{uuid.uuid4().hex[:20]}"
+        try:
+            order.orderRef = order_ref
+            if order_id:
+                order.orderId = order_id
+        except Exception as e:
+            print(f"[ERROR] Refusing close for con_id={con_id}: cannot bind durable order identity: {e}")
+            return OrderResult(success=False, message=f"cannot bind order identity: {e}", con_id=con_id)
+        client_id = _safe_client_id(getattr(self.ib_conn, "client_id", None))
+        in_flight = InFlightClose(
+            con_id=con_id,
+            order_id=order_id,
+            remaining_qty=quantity,
+            entry_debit=entry_debit,
+            order_price=limit_price,
+            placed_at=datetime.now(timezone.utc).isoformat(),
+            exit_context=normalized_context,
+            client_id=client_id,
+            order_ref=order_ref,
+            identity_version=1,
+            placement_state="intent",
+        )
+        self.state_manager.state.add_in_flight(in_flight)
+        try:
+            self.state_manager.save()
+        except Exception as e:
+            self.state_manager.state.remove_in_flight(con_id)
+            print(f"[ERROR] Refusing close for con_id={con_id}: placement intent was not durable: {e}")
+            return OrderResult(success=False, message=f"placement intent save failed: {e}", con_id=con_id)
+
+        # Never blindly retry an ambiguous placeOrder exception: the first call may have reached
+        # IB, and a retry can double-close.  Keep the prepared identity; the broker reconciliation
+        # path binds it to an open/completed order or releases it only after exhaustive reads.
+        try:
+            placed_trade = await self.ib_conn.place_order(contract, order)
+        except Exception as e:
+            print(f"[ERROR] Close transmission outcome is ambiguous for con_id={con_id}: {e}; "
+                  "durable intent retained for broker reconciliation (NOT retrying blindly)")
+            return OrderResult(success=False, order_id=order_id, message=str(e), con_id=con_id,
+                               client_id=client_id, order_ref=order_ref)
+
+        trade_order = getattr(placed_trade, "order", None)
+        order_id = (_safe_int(getattr(trade_order, "orderId", 0)) or order_id)
+        perm_id = _safe_int(getattr(trade_order, "permId", 0))
+        returned_client_id = _safe_client_id(getattr(trade_order, "clientId", None))
+        client_id = returned_client_id if returned_client_id is not None else client_id
+        returned_ref = getattr(trade_order, "orderRef", None)
+        order_ref = returned_ref if isinstance(returned_ref, str) and returned_ref else order_ref
+        in_flight.order_id = order_id
+        in_flight.perm_id = perm_id
+        in_flight.client_id = client_id
+        in_flight.order_ref = order_ref
+        in_flight.placement_state = "submitted"
+        try:
+            self.state_manager.save()
+        except Exception as e:
+            # The pre-transmission intent is already durable.  Continue with the returned Trade;
+            # restart lookup can recover it by the reserved id/orderRef even if this enrichment
+            # did not reach disk.
+            print(f"[WARN] Could not persist submitted identity for con_id={con_id}: {e}; "
+                  "pre-transmission intent remains durable")
+
+        # Briefly poll for an immediate ACK/reject.  A terminal PARTIAL fill is a realized trade,
+        # not a zero-fill rejection: retain it and return success so the caller finalizes its P&L.
+        _dead = {"Cancelled", "ApiCancelled", "Inactive"}
+        _live = {"Filled", "Submitted", "PreSubmitted"}
+        _status = None
+        _ost = getattr(placed_trade, "orderStatus", None)
+        if _ost is not None:
+            for _ in range(24):  # up to ~12s for IBKR to ACK or REJECT
+                _status = getattr(_ost, "status", None)
+                if not isinstance(_status, str) or _status in _live or _status in _dead:
+                    break
+                await asyncio.sleep(0.5)
+        _filled_raw = getattr(_ost, "filled", 0) if _ost is not None else 0
+        if isinstance(_filled_raw, (int, float)) and not isinstance(_filled_raw, bool):
+            _filled = float(_filled_raw)
+            if not math.isfinite(_filled) or _filled < 0:
+                _filled = 0.0
+        else:
+            _filled = 0.0
+        if isinstance(_status, str) and _status in _dead and _filled <= 0:
+            _reasons = []
+            try:
+                _reasons = [le.message for le in placed_trade.log if getattr(le, "errorCode", 0)]
+            except Exception:
+                pass
+            _why = _reasons[-1] if _reasons else _status
+            self.state_manager.state.remove_in_flight(con_id)
+            self.state_manager.save()
+            print(f"[ORDER REJECTED] con_id={con_id}, order_id={order_id}, status={_status}, "
+                  f"filled=0 -- retry allowed next cycle. reason: {_why}")
+            return OrderResult(success=False, order_id=order_id,
+                               message=f"order {_status}: {_why}", con_id=con_id,
+                               trade=placed_trade, perm_id=perm_id, client_id=client_id,
+                               order_ref=order_ref)
+
+        # Count only accepted or partially-filled placements, not zero-fill rejects.
+        notional = limit_price * 100 * quantity
+        today = _trading_day()
+        self.state_manager.state.update_daily_stats(today, order_count=1, notional=notional)
+        try:
+            self.state_manager.save()
+        except Exception as e:
+            # The close and its pre-transmission identity are already durable.  Do not turn an
+            # accepted broker order into a caller-visible failure that could invite a retry.
+            print(f"[WARN] Accepted close for con_id={con_id} but daily-stat persistence failed: {e}")
+        msg = (f"Order {_status} after partial fill" if _status in _dead and _filled > 0
+               else "Order placed successfully")
+        print(f"[ORDER PLACED] con_id={con_id}, order_id={order_id}, perm_id={perm_id or 'pending'}, "
+              f"qty={quantity}, price={limit_price}, status={_status or 'unknown'}")
+        return OrderResult(success=True, order_id=order_id, message=msg, con_id=con_id,
+                           trade=placed_trade, perm_id=perm_id, client_id=client_id,
+                           order_ref=order_ref)
 
     def _resolve_close_right(self, con_id: int, right: Optional[str]) -> str:
         """Resolve the option `right` ('C'/'P') for a single-leg close (P2.4).

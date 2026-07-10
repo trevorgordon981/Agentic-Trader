@@ -5,6 +5,7 @@ import os
 import json
 import signal
 import sys
+import uuid
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional, Dict, List, Set
@@ -59,6 +60,11 @@ class ExitManager:
         # placement (exits) is gated on it each cycle, and the Trader reads it to suppress ENTRIES
         # when broker/journal state is inconsistent. Defaults True (open) until the first reconcile.
         self._reconcile_ok = True
+        # C1a (2026-07-09): the SPECIFIC con_ids the last reconcile found inconsistent. Exits are
+        # blocked ONLY for these (per-con_id), so one manual TWS position no longer withholds every
+        # automated stop. An empty set = all clean; None = reconcile could not run at all (fetch
+        # failure) -> block ALL exits that cycle (fail-safe).
+        self._reconcile_bad_con_ids: Optional[Set[int]] = set()
 
         # Track peak prices for trailing stop (in-memory cache)
         self._peak_prices: Dict[int, float] = {}
@@ -142,13 +148,13 @@ class ExitManager:
             except Exception as e:
                 print(f"[WARN] tool-close terminal logging failed: {e} (continuing)")
 
-    def _post_exit_alert(self, symbol: str, trigger) -> None:
+    def _post_exit_alert(self, symbol: str, trigger, client_msg_id: Optional[str] = None) -> bool:
         """Real-time ping to #trading-alerts the moment a position is sold by the exit manager."""
         import os
         channel = getattr(self.config, "alerts_channel", "") or ""
         token = os.environ.get("SLACK_BOT_TOKEN", "")
         if not (channel and token):
-            return
+            return True
         names = {"profit_target": "take-profit :dart:", "stop": "STOP :octagonal_sign:",
                  "time_stop": "time stop :hourglass:", "trailing_stop": "trailing stop"}
         why = names.get(getattr(trigger, "trigger_type", ""), getattr(trigger, "trigger_type", "exit"))
@@ -156,11 +162,13 @@ class ExitManager:
         emoji = ":green_circle:" if pnl >= 0 else ":red_circle:"
         try:
             from exitmgr import approval
-            approval.post_proposal(token, channel,
+            ts = approval.post_proposal(token, channel,
                 f":rotating_light: *EXIT — {symbol}* sold ({why}) {emoji} *P&L {pnl:+.1f}%*\n"
-                f"_{getattr(trigger, 'message', '')}_")
+                f"_{getattr(trigger, 'message', '')}_", client_msg_id=client_msg_id)
+            return bool(ts)
         except Exception as e:
             print(f"[WARN] exit alert post failed: {e}")
+            return False
 
     def _exits_log_path(self) -> str:
         """Durable, append-only exits log (JSONL) next to the journal. Realized P&L was
@@ -212,7 +220,7 @@ class ExitManager:
         except Exception:
             return "."
 
-    def _log_trade_dataset(self, exit_rec: dict, je: dict, con_id: int) -> None:
+    def _log_trade_dataset(self, exit_rec: dict, je: dict, con_id: int) -> bool:
         """Append ONE complete, fine-tuning-ready record for a closed trade to trade_dataset.jsonl.
         ADDITIVE + RECORD-ONLY: assembled from the already-computed exit_rec, the entry journal
         entry (je), and the persisted mark path / MFE / MAE. Double-wrapped so it can NEVER raise
@@ -357,6 +365,14 @@ class ExitManager:
                 # ---------- CLOSE (+ fill quality / slippage / exit greeks / rule, v2) ----------
                 "close": {
                     "ts": exit_rec.get("close_ts"),
+                    # Durable idempotency key for asynchronous/restart-time finalization.  The
+                    # exits.log row is canonical; this lets a restart repair a missing dataset
+                    # mirror without appending a second closed-trade row.
+                    "order_id": exit_rec.get("order_id"),
+                    "perm_id": exit_rec.get("perm_id"),
+                    "client_id": exit_rec.get("client_id"),
+                    "order_ref": exit_rec.get("order_ref"),
+                    "close_identity": exit_rec.get("close_identity"),
                     "reason": exit_rec.get("reason"),
                     "rule_fired": exit_rec.get("rule_fired"),          # the raw trigger_type that fired
                     "exit_reasoning": exit_rec.get("exit_reasoning"),  # trigger message / model-cut text
@@ -417,10 +433,14 @@ class ExitManager:
             }
             with open(self._dataset_path(), "a") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             print(f"[TRADE-DS] {exit_rec.get('symbol')} con_id={con_id} "
                   f"mfe={mfe} mae={mae} outcome={outcome} round_trip={round_trip} marks={len(mark_path)}")
+            return True
         except Exception as e:
             print(f"[WARN] trade_dataset write failed for con_id={con_id}: {e}")
+            return False
 
     def _recover_conviction(self, je: dict, symbol: str) -> Optional[float]:
         """Conviction carried from the original entry. Prefer the value the trader now
@@ -546,9 +566,66 @@ class ExitManager:
             print(f"[WARN] fills.log entry-join failed for con_id={con_id}: {e}")
             return {}
 
+    def _existing_exit_for_order(self, order_id, close_identity=None, con_id=None) -> Optional[dict]:
+        """Return the canonical realized exit for the composite broker identity, if appended.
+
+        A fill finalizer can be replayed after any crash boundary.  Checking the durable JSONL
+        before appending makes that replay idempotent; malformed/truncated lines are ignored.
+        ``order_id`` alone is accepted only for legacy records that predate client/perm identity.
+        """
+        if not close_identity and order_id in (None, 0, "0"):
+            return None
+        try:
+            with open(self._exits_log_path()) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    identity_match = (bool(close_identity)
+                                      and rec.get("close_identity") == close_identity)
+                    legacy_match = (not rec.get("close_identity")
+                                    and str(rec.get("order_id")) == str(order_id)
+                                    and (con_id is None
+                                         or str(rec.get("contract_id")) == str(con_id)))
+                    if (identity_match or legacy_match) and rec.get("fill_status") == "Filled":
+                        return rec
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[WARN] exit dedupe scan failed for order_id={order_id}: {e}")
+        return None
+
+    def _dataset_has_exit_order(self, order_id, close_identity=None, con_id=None) -> bool:
+        if not close_identity and order_id in (None, 0, "0"):
+            return False
+        try:
+            with open(self._dataset_path()) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    close = rec.get("close") or {}
+                    identity_match = (bool(close_identity)
+                                      and close.get("close_identity") == close_identity)
+                    legacy_match = (not close.get("close_identity")
+                                    and str(close.get("order_id")) == str(order_id)
+                                    and (con_id is None
+                                         or str(rec.get("con_id", rec.get("contract_id")))
+                                         == str(con_id)))
+                    if (rec.get("kind") == "trade" and (identity_match or legacy_match)
+                            and close.get("fill_status") == "Filled"):
+                        return True
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[WARN] dataset dedupe scan failed for order_id={order_id}: {e}")
+        return False
+
     def _log_exit(self, con_id: int, symbol: str, trigger, exit_price_per_share: Optional[float],
                   quantity: int, reason: str, extra: Optional[dict] = None,
-                  entry_debit: Optional[float] = None, je: Optional[dict] = None) -> None:
+                  entry_debit: Optional[float] = None, je: Optional[dict] = None) -> bool:
         """Append-only record of a realized exit to exits.log (JSONL). ADDITIVE -- never changes
         exit behavior, only records the outcome. Schema is consumable by conviction_calibration.py
         --fills (contract_id -> realized_pnl + conviction). Must NOT raise into the exit path.
@@ -569,8 +646,27 @@ class ExitManager:
             # entry_commission) that landed AFTER this entry journaled (nothing joined it before).
             je = dict(je or {})
             je.update(self._join_entry_fill(con_id, je))
+            # The append + state cleanup is replayable across process death.  If exits.log already
+            # has this Filled order, do not append it again; repair the dataset mirror if a crash
+            # happened between the two durable appends.
+            _order_id = (extra or {}).get("order_id")
+            _close_identity = (extra or {}).get("close_identity")
+            _existing = self._existing_exit_for_order(
+                _order_id, close_identity=_close_identity, con_id=con_id)
+            if _existing is not None:
+                if self._dataset_has_exit_order(
+                        _order_id, close_identity=_close_identity, con_id=con_id):
+                    return True
+                return self._log_trade_dataset(_existing, je, con_id)
             if entry_debit is None:
-                entry_debit = je.get("debit")
+                # C2b (2026-07-09): when the caller passes no explicit (scale-out pro-rated) basis,
+                # prefer the REAL entry fill debit (basis_source=="fill" or entry_fill_debit present)
+                # over the estimated debit so realized P&L anchors to what was actually paid. The
+                # managed-exit path already passes a fill-based pro-rated basis, so this branch only
+                # covers manual/expiry/tool full-close callers.
+                _efd = je.get("entry_fill_debit")
+                _bs = je.get("basis_source")
+                entry_debit = _efd if (_efd is not None and (_bs == "fill" or _efd is not None)) else je.get("debit")
             try:
                 entry_debit = float(entry_debit) if entry_debit is not None else None
             except (TypeError, ValueError):
@@ -690,14 +786,31 @@ class ExitManager:
             rec["basis_source"] = je.get("basis_source")
             with open(self._exits_log_path(), "a") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             print(f"[EXIT-LOG] {symbol} con_id={con_id} reason={reason} "
                   f"pnl=${realized_pnl if realized_pnl is not None else 'n/a'}")
             # ADDITIVE (2026-07-02): also emit the rich, fine-tuning-ready closed-trade record
             # (entry snapshot + mark path + MFE/MAE + close + labels) to the separate dataset.
             # AFTER the exits.log write + its own try/except so it can never affect exits.log.
-            self._log_trade_dataset(rec, je, con_id)
+            _dataset_ok = self._log_trade_dataset(rec, je, con_id)
+            # C3 (2026-07-09): on a CONFIRMED FULL close, purge per-contract tracking + drop the
+            # journal entry (AFTER the dataset row is written, so nothing needed for the record is
+            # lost). Guarded so a still-RESTING exit (fill_status present and != "Filled") is NEVER
+            # cleared -- that position is still live and must keep its peak/journal. A partial trim
+            # (extra["partial"]) keeps the runner and is never cleared. Full closes qualify when the
+            # fill CONFIRMED Filled, or on an independently confirmed tool/expiry terminal close.
+            # ``manual`` is intentionally NOT terminal by reason alone: a submitted manual market
+            # order remains pending until IBKR confirms Filled.
+            _partial = bool((extra or {}).get("partial"))
+            _fs_final = rec.get("fill_status")
+            _terminal_reason = str(reason) in ("expired", "closed_by_tool", "liquidated")
+            if _dataset_ok and (not _partial) and (_fs_final == "Filled" or _terminal_reason):
+                self._clear_closed_position(con_id)
+            return _dataset_ok
         except Exception as e:
             print(f"[WARN] exits.log write failed for con_id={con_id}: {e}")
+            return False
 
     def _log_unfilled_exit(self, con_id: int, symbol: str, trigger, *, fill_status,
                            close_qty, trigger_mark, bid, limit_price, order_id,
@@ -780,8 +893,21 @@ class ExitManager:
                         continue
                     if r.get("kind") != "trade":
                         continue
-                    if (r.get("close") or {}).get("partial"):
+                    close = r.get("close") or {}
+                    if close.get("partial"):
                         continue  # a scale-out trim is NOT a full/terminal close
+                    if r.get("unfilled"):
+                        continue  # a resting/rejected attempt is explicitly NOT a close
+                    fill_status = close.get("fill_status")
+                    terminal_event = close.get("exit_event") or close.get("reason")
+                    confirmed = (
+                        fill_status == "Filled"
+                        or terminal_event in {"expired", "closed_by_tool", "liquidated"}
+                        # Backward compatibility for older realized rows that predate fill_status.
+                        or (fill_status is None and close.get("realized_pnl") is not None)
+                    )
+                    if not confirmed:
+                        continue
                     cid = r.get("con_id")
                     if cid is not None:
                         try:
@@ -1003,10 +1129,15 @@ class ExitManager:
         return tt or "exit"
 
     def _check_kill_switch(self) -> bool:
-        """Check if kill switch file exists. Returns True if kill switch is ACTIVE (stop)."""
+        """Report the ENTRY kill switch state.
+
+        The switch is intentionally informational in ExitManager: it blocks new risk in Trader,
+        never risk-reducing closes here.
+        """
         kill_path = Path(self.config.kill_switch.path)
         if kill_path.exists():
-            print(f"[KILL SWITCH] Kill switch file detected at {self.config.kill_switch.path} - halting order placement")
+            print(f"[KILL SWITCH] {self.config.kill_switch.path} active: halting entries only; "
+                  "protective/manual exits remain armed")
             return True
         return False
 
@@ -1021,7 +1152,9 @@ class ExitManager:
             return set()
 
     def _manual_exit_fail(self, sym, cid, reason) -> None:
-        # NO silent failure: record the error + ping Slack, then drop the request (avoid retry-spam).
+        # NO silent failure: record + alert, but KEEP the request durable.  A manual exit is an
+        # outcome request (be flat), not a one-shot submission request; only a confirmed Filled
+        # terminal state may remove it from manual_exits.json.
         try:
             with open(os.path.join(os.path.dirname(self.config.journal.path) or ".", "manual_exit_errors.log"), "a") as f:
                 f.write(f"{datetime.utcnow().isoformat()} {sym} con_id={cid} FAILED: {reason}\n")
@@ -1031,17 +1164,31 @@ class ExitManager:
             ch = getattr(self.config, "alerts_channel", "") or ""; tok = os.environ.get("SLACK_BOT_TOKEN", "")
             if ch and tok:
                 from exitmgr import approval
-                approval.post_proposal(tok, ch, f":warning: *Could not auto-sell {sym}* (one-tap early-exit): {reason}. Sell it manually if you want out.")
+                approval.post_proposal(tok, ch, f":warning: *Could not auto-sell {sym}* (one-tap early-exit): {reason}. The request remains pending and will retry until Filled.")
         except Exception:
             pass
-        print(f"[MANUAL-EXIT] {sym} con_id={cid} FAILED: {reason}")
-        self._clear_manual_exit(cid)
+        print(f"[MANUAL-EXIT] {sym} con_id={cid} FAILED/PENDING: {reason}")
 
     def _clear_manual_exit(self, con_id) -> None:
         try:
             cur = self._read_manual_exits(); cur.discard(int(con_id))
-            with open(self._manual_exit_path(), "w") as f:
+            path = Path(self._manual_exit_path())
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump(sorted(cur), f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            try:
+                dfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
         except Exception:
             pass
 
@@ -1111,6 +1258,61 @@ class ExitManager:
             open(tsf, "w").write(str(time.time()))
         except Exception as _e:
             print(f"[WARN] reconcile-block Slack alert failed: {_e}")
+
+    # Protective (risk-REDUCING) exit trigger types. C1c (2026-07-09): the daily order/notional caps
+    # bound risk-ADDING activity; a protective close must NEVER be withheld because the day cap is
+    # hit. A scale_out is an optional profit-trim (not protective), so it stays subject to the caps.
+    _PROTECTIVE_TRIGGERS = frozenset({
+        "stop", "trailing_stop", "time_stop", "profit_target", "take_profit", "model_cut"})
+
+    def _is_protective_exit(self, trigger) -> bool:
+        return getattr(trigger, "trigger_type", None) in self._PROTECTIVE_TRIGGERS
+
+    def _clear_closed_position(self, con_id) -> None:
+        """C3 (2026-07-09): on a CONFIRMED full close, purge ALL per-contract tracking
+        (peak/mfe/mae + their timestamps/mark path, scaled_out, trail_armed) AND drop the journal
+        entry, so a later RE-ENTRY of the SAME conId starts clean. Without this, a stale peak
+        survived (prune keeps live UNION journal) and the fresh position inherited it -> auto-trail
+        armed and fired immediately. Idempotent; persists the state; never raises into the caller."""
+        try:
+            k = str(con_id)
+            st = self.state_manager.state
+            for d in (st.peak_prices, st.mfe_pct, st.mae_pct, st.mfe_ts, st.mae_ts,
+                      st.mark_path, st.scaled_out, st.trail_armed):
+                d.pop(k, None)
+            try:
+                self._journal_entries.pop(int(con_id), None)
+            except (TypeError, ValueError):
+                pass
+            self._journal_entries.pop(con_id, None)
+            self.state_manager.save()
+        except Exception as e:
+            print(f"[WARN] clear-closed-position failed for con_id={con_id}: {e}")
+
+    def _post_stops_withheld_alert(self, items) -> None:
+        """C1d (2026-07-09): UNTHROTTLED Slack alert whenever a PROTECTIVE exit (stop/TP/time-stop)
+        was actually withheld this cycle because that con_id is reconcile-inconsistent. Unlike the
+        30-min-throttled reconcile-BLOCK alert, this fires every cycle a stop is truly being held
+        back -- a withheld protective close is an active-risk event, not a quiet status. Slack-only;
+        never raises into the cycle."""
+        if not items:
+            return
+        import urllib.request, json as _json
+        channel = getattr(self.config, "alerts_channel", "") or ""
+        token = os.environ.get("SLACK_BOT_TOKEN", "")
+        if not (channel and token):
+            return
+        lines = "\n".join(f"• *{sym}* con_id={cid} — {why} WITHHELD (con_id reconcile-inconsistent)"
+                          for sym, cid, why in items[:10])
+        body = (":octagonal_sign: *Protective exits WITHHELD this cycle* (position(s) reconcile-inconsistent):\n"
+                + lines + "\n_Resolve the flagged position(s) (journal or close) to release their stops._")
+        try:
+            req = urllib.request.Request("https://slack.com/api/chat.postMessage",
+                data=_json.dumps({"channel": channel, "text": body}).encode(),
+                headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=8)
+        except Exception as _e:
+            print(f"[WARN] stops-withheld Slack alert failed: {_e}")
 
     async def _alert_unfilled_orders(self) -> None:
         """FILL-INTEGRITY alarm (2026-07-01 audit: EXECUTION was the biggest loss pool --
@@ -1193,56 +1395,512 @@ class ExitManager:
         except Exception as e:
             print(f"[WARN] unfilled-order Slack alarm failed: {e}")
 
-    async def _poll_in_flight_fills(self, live_open_orders: Dict[int, dict]) -> None:
-        """Reconcile in-flight close records against live order state EACH CYCLE (2026-07-03 wiring).
+    @staticmethod
+    def _trade_order_id(trade):
+        try:
+            return int(getattr(getattr(trade, "order", None), "orderId", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
 
-        order.update_in_flight_from_fill had ZERO callers, so a close that filled between cycles
-        (whose fill callback the manager never processed) left a stale InFlightClose that
-        permanently blocked re-closing that con_id via the idempotency gate. Each cycle:
-          * order still resting  -> if the live `remaining` dropped below what we recorded, apply
-            the delta via update_in_flight_from_fill (partial fill);
-          * order GONE from the live book -> confirm a terminal Filled on the Trade blotter (all
-            clientIds via ib.trades()) before clearing the record fully (so a cancel isn't mistaken
-            for a fill).
-        Record-only bookkeeping; never raises into the cycle."""
+    @staticmethod
+    def _positive_int(value) -> int:
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, int):
+            return value if value > 0 else 0
+        if isinstance(value, str) and value.isdigit():
+            parsed = int(value)
+            return parsed if parsed > 0 else 0
+        return 0
+
+    @staticmethod
+    def _ib_client_id(value):
+        """Return an IB client id including legitimate zero; ``None`` means unknown/legacy."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    def _trade_key_con_id(self, trade) -> int:
+        contract = getattr(trade, "contract", None)
+        if contract is None:
+            return 0
+        try:
+            return int(self.ib_conn._order_key_con_id(contract) or 0)
+        except Exception:
+            return self._positive_int(getattr(contract, "conId", 0))
+
+    def _trade_matches_in_flight(self, trade, inf) -> bool:
+        """Match a Trade to one durable close using the strongest available IB identity."""
+        tcid = self._trade_key_con_id(trade)
+        if tcid and tcid != int(inf.con_id):
+            return False
+        order = getattr(trade, "order", None)
+        tperm = self._positive_int(getattr(order, "permId", 0))
+        iperm = self._positive_int(getattr(inf, "perm_id", 0))
+        if tperm and iperm:
+            return tperm == iperm
+        tref = getattr(order, "orderRef", None)
+        iref = getattr(inf, "order_ref", None)
+        if tref and iref:
+            return str(tref) == str(iref)
+        toid = self._positive_int(getattr(order, "orderId", 0))
+        ioid = self._positive_int(getattr(inf, "order_id", 0))
+        tclient = self._ib_client_id(getattr(order, "clientId", None))
+        iclient = self._ib_client_id(getattr(inf, "client_id", None))
+        strong_client = bool(getattr(inf, "identity_version", 0) >= 1
+                             or iclient is not None)
+        if strong_client:
+            return bool(toid and ioid and toid == ioid
+                        and tclient is not None and tclient == iclient)
+        # Legacy records did not persist clientId/permId/orderRef.  Preserve their only possible
+        # join while ensuring all new records take a stronger branch above.
+        return bool(toid and ioid and toid == ioid and iclient is None)
+
+    def _execution_matches_in_flight(self, fill, inf) -> bool:
+        ex = getattr(fill, "execution", None)
+        contract = getattr(fill, "contract", None)
+        ecid = self._positive_int(getattr(contract, "conId", 0))
+        if ecid and ecid != int(inf.con_id):
+            return False
+        eperm = self._positive_int(getattr(ex, "permId", 0))
+        iperm = self._positive_int(getattr(inf, "perm_id", 0))
+        if eperm and iperm:
+            return eperm == iperm
+        eoid = self._positive_int(getattr(ex, "orderId", 0))
+        ioid = self._positive_int(getattr(inf, "order_id", 0))
+        eclient = self._ib_client_id(getattr(ex, "clientId", None))
+        iclient = self._ib_client_id(getattr(inf, "client_id", None))
+        strong_client = bool(getattr(inf, "identity_version", 0) >= 1
+                             or iclient is not None)
+        if strong_client:
+            return bool(eoid and ioid and eoid == ioid
+                        and eclient is not None and eclient == iclient)
+        return bool(eoid and ioid and eoid == ioid and iclient is None)
+
+    async def _terminal_trades_for_in_flight(self, infs: dict) -> Dict[int, object]:
+        """Find terminal trades in both the current-session and restart-safe broker stores.
+
+        ``ib.trades()`` loses history when the process reconnects.  Completed orders are therefore
+        queried as the second source; for a single-leg close, executions are a final fallback.  No
+        source is allowed to manufacture a fill: only an explicit ``Filled`` status, or executions
+        whose aggregate quantity covers the requested close, is returned.
+        """
+        import types as _types
+
+        targets = []
+        for key, inf in infs.items():
+            try:
+                targets.append((int(key), inf))
+            except (TypeError, ValueError):
+                continue
+        found: Dict[int, object] = {}
+        self._terminal_lookup_complete = False
+
+        def _status(tr):
+            return getattr(getattr(tr, "orderStatus", None), "status", None)
+
+        def _rank(tr) -> int:
+            status = _status(tr)
+            if status == "Filled":
+                return 3
+            if status in {"Cancelled", "ApiCancelled", "Inactive"}:
+                return 2
+            return 1
+
+        def _is_terminal(tr) -> bool:
+            return _status(tr) == "Filled" or _status(tr) in {
+                "Cancelled", "ApiCancelled", "Inactive"}
+
+        def _collect(items) -> None:
+            try:
+                seq = list(items or [])
+            except Exception:
+                return
+            for tr in seq:
+                for cid, inf in targets:
+                    if self._trade_matches_in_flight(tr, inf):
+                        # A stale current-session Submitted trade must never mask the broker's
+                        # completed Filled record after a restart. Prefer terminal/fill evidence.
+                        if cid not in found or _rank(tr) >= _rank(found[cid]):
+                            found[cid] = tr
+
+        ib = getattr(self.ib_conn, "ib", None)
+        if ib is None or not targets:
+            return found
+        try:
+            _collect(ib.trades())
+        except Exception as e:
+            print(f"[WARN] in-flight fill poll: current trade blotter unavailable ({e})")
+
+        missing = {cid for cid, _ in targets if cid not in found or not _is_terminal(found[cid])}
+        completed_ok = False
+        if missing and hasattr(ib, "reqCompletedOrdersAsync"):
+            try:
+                _collect(await ib.reqCompletedOrdersAsync(apiOnly=False))
+                completed_ok = True
+            except TypeError:
+                try:
+                    _collect(await ib.reqCompletedOrdersAsync(False))
+                    completed_ok = True
+                except Exception as e:
+                    print(f"[WARN] completed-order lookup failed ({e})")
+            except Exception as e:
+                print(f"[WARN] completed-order lookup failed ({e})")
+
+        # Last-resort reconstruction for SINGLE-leg closes.  Combo executions are per-leg and
+        # cannot be safely collapsed into a net fill price here, so those wait for a completed Trade.
+        # Executions alone prove a terminal fill only when their aggregate covers the FULL planned
+        # close. A partial execution may still belong to a working order and is never fabricated as
+        # a cancellation.
+        missing = {cid for cid, _ in targets if cid not in found or not _is_terminal(found[cid])}
+        executions_ok = False
+        if missing and hasattr(ib, "reqExecutionsAsync"):
+            try:
+                fills = list(await ib.reqExecutionsAsync() or [])
+                executions_ok = True
+                for cid, inf in targets:
+                    if cid not in missing:
+                        continue
+                    ctx = dict(getattr(inf, "exit_context", {}) or {})
+                    if (ctx.get("journal_entry") or {}).get("spread"):
+                        continue
+                    rows = [fl for fl in fills if self._execution_matches_in_flight(fl, inf)]
+                    # reqExecutions can repeat rows; execId is the broker's unique execution key.
+                    unique = []
+                    seen_exec_ids = set()
+                    for fl in rows:
+                        exec_id = getattr(getattr(fl, "execution", None), "execId", None)
+                        key = str(exec_id) if exec_id else id(fl)
+                        if key in seen_exec_ids:
+                            continue
+                        seen_exec_ids.add(key)
+                        unique.append(fl)
+                    rows = unique
+                    qty = 0.0
+                    value = 0.0
+                    for fl in rows:
+                        ex = getattr(fl, "execution", None)
+                        try:
+                            q = float(getattr(ex, "shares", 0) or 0)
+                            p = float(getattr(ex, "price", 0))
+                        except (TypeError, ValueError):
+                            continue
+                        qty += q
+                        value += q * p
+                    needed = int(ctx.get("close_qty") or getattr(inf, "remaining_qty", 0) or 0)
+                    if qty >= needed > 0:
+                        found[cid] = _types.SimpleNamespace(
+                            contract=_types.SimpleNamespace(conId=cid, secType="OPT"),
+                            order=_types.SimpleNamespace(
+                                orderId=getattr(inf, "order_id", 0),
+                                permId=getattr(inf, "perm_id", 0),
+                                clientId=getattr(inf, "client_id", 0),
+                                orderRef=getattr(inf, "order_ref", None)),
+                            orderStatus=_types.SimpleNamespace(
+                                status="Filled", avgFillPrice=value / qty,
+                                filled=qty, remaining=max(0.0, needed - qty)),
+                            fills=rows,
+                        )
+            except Exception as e:
+                print(f"[WARN] execution fill lookup failed ({e})")
+        # For an orphaned pre-transmission intent, absence is actionable only when BOTH broker
+        # history reads succeeded.  The poller also requires that no live order matched.
+        self._terminal_lookup_complete = bool(completed_ok and executions_ok)
+        return found
+
+    @staticmethod
+    def _trade_fill_timestamp(trade) -> str:
+        try:
+            times = [getattr(getattr(fl, "execution", None), "time", None)
+                     for fl in (getattr(trade, "fills", None) or [])]
+            times = [t for t in times if t is not None]
+            if times:
+                return max(times).isoformat()
+        except Exception:
+            pass
+        return datetime.now().astimezone().isoformat()
+
+    @staticmethod
+    def _trade_reported_filled(trade) -> float:
+        try:
+            value = float(getattr(getattr(trade, "orderStatus", None), "filled", 0) or 0)
+            return value if value == value and value > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fill_identity(self, con_id: int, inf, trade) -> str:
+        """Freeze one durable, collision-safe key for this close/fill.
+
+        Once chosen it never upgrades (for example orderRef -> later permId), because changing the
+        key after the exits-log commit would defeat replay dedupe.
+        """
+        existing = getattr(inf, "fill_key", None)
+        if existing:
+            return str(existing)
+        order = getattr(trade, "order", None)
+        perm_id = (self._positive_int(getattr(order, "permId", 0))
+                   or self._positive_int(getattr(inf, "perm_id", 0)))
+        order_id = (self._positive_int(getattr(order, "orderId", 0))
+                    or self._positive_int(getattr(inf, "order_id", 0)))
+        trade_client_id = self._ib_client_id(getattr(order, "clientId", None))
+        stored_client_id = self._ib_client_id(getattr(inf, "client_id", None))
+        client_id = (trade_client_id if trade_client_id is not None else stored_client_id)
+        trade_ref = getattr(order, "orderRef", None)
+        stored_ref = getattr(inf, "order_ref", None)
+        order_ref = (trade_ref if isinstance(trade_ref, str) and trade_ref
+                     else stored_ref if isinstance(stored_ref, str) and stored_ref else None)
+        inf.perm_id = perm_id
+        inf.order_id = order_id
+        inf.client_id = client_id
+        inf.order_ref = order_ref
+        if perm_id:
+            key = f"perm:{perm_id}:con:{int(con_id)}"
+        elif order_ref:
+            key = f"ref:{order_ref}:con:{int(con_id)}"
+        elif client_id is not None and order_id:
+            key = f"api:{client_id}:order:{order_id}:con:{int(con_id)}"
+        else:
+            key = f"legacy:order:{order_id}:con:{int(con_id)}"
+        inf.fill_key = key
+        if perm_id or order_ref or client_id is not None:
+            inf.identity_version = 1
+        return key
+
+    def _finalize_in_flight_exit(self, con_id: int, inf, trade) -> bool:
+        """Finalize one confirmed fill exactly once, then release its durable state.
+
+        A frozen composite fill key is the commit key.  The ledger, reload handoff, manual cleanup,
+        and alert each have a durable replay checkpoint; the in-flight record is removed last.
+        """
+        try:
+            order_status = getattr(trade, "orderStatus", None)
+            status = getattr(order_status, "status", None)
+            terminal_cancel = status in {"Cancelled", "ApiCancelled", "Inactive"}
+            if status != "Filled" and not terminal_cancel:
+                return False
+
+            ctx = dict(getattr(inf, "exit_context", {}) or {})
+            if not ctx:
+                # A legacy record has no basis/trigger snapshot to book honestly. Preserve the
+                # historical full-fill cleanup, but never treat a cancellation as a fill.
+                if status == "Filled":
+                    self.state_manager.state.remove_in_flight(con_id)
+                    self.state_manager.save()
+                    return True
+                return False
+
+            planned_qty = int(ctx.get("close_qty") or inf.remaining_qty or 0)
+            if planned_qty <= 0:
+                print(f"[WARN] Terminal order_id={inf.order_id} has no durable close quantity; retaining")
+                return False
+            if status == "Filled":
+                qty = planned_qty
+            else:
+                qty = min(planned_qty, int(self._trade_reported_filled(trade)))
+                if qty <= 0:
+                    return False
+
+            fill_px = getattr(order_status, "avgFillPrice", None)
+            try:
+                fill_px = float(fill_px)
+                if fill_px != fill_px or fill_px < 0:
+                    raise ValueError("invalid fill price")
+            except (TypeError, ValueError):
+                print(f"[WARN] Filled order_id={inf.order_id} has no valid avgFillPrice; "
+                      "retaining in-flight for a later broker read")
+                return False
+
+            import types as _types
+            trig = _types.SimpleNamespace(
+                trigger_type=ctx.get("trigger_type") or ctx.get("reason") or "exit",
+                pnl_pct=float(ctx.get("trigger_pnl_pct") or 0.0),
+                message=ctx.get("trigger_message") or "asynchronous exit fill",
+                reload=bool(ctx.get("reload", False)),
+                reload_conviction=ctx.get("reload_conviction"),
+            )
+            try:
+                planned_basis = float(ctx.get("entry_debit", inf.entry_debit))
+            except (TypeError, ValueError):
+                planned_basis = float(inf.entry_debit)
+            basis = planned_basis * qty / planned_qty
+            try:
+                if basis > 0:
+                    trig.pnl_pct = (fill_px * 100 * qty - basis) / basis * 100
+            except (TypeError, ValueError):
+                pass
+            je = dict(ctx.get("journal_entry") or self._journal_entries.get(con_id) or {})
+            extra = dict(ctx.get("extra") or {})
+            position_qty = int(ctx.get("position_qty") or planned_qty)
+            full_position_closed = qty >= position_qty
+            partial = bool(extra.get("partial")) or not full_position_closed
+            fill_key = self._fill_identity(con_id, inf, trade)
+            # Freeze the key before the first append.  A later broker read may expose permId, but
+            # replay must keep using the identity under which this fill was initially committed.
+            self.state_manager.save()
+            extra.update({
+                "order_id": inf.order_id,
+                "perm_id": getattr(inf, "perm_id", 0),
+                "client_id": getattr(inf, "client_id", 0),
+                "order_ref": getattr(inf, "order_ref", None),
+                "close_identity": fill_key,
+                "fill_status": "Filled",
+                "terminal_order_status": status,
+                "avg_fill_price": fill_px,
+                "fill_ts": self._trade_fill_timestamp(trade),
+                "exit_commission": commission_from_trade(trade),
+                "partial": partial,
+                "close_qty": qty,
+                "remaining_qty": max(0, position_qty - qty),
+            })
+            ok = self._log_exit(
+                con_id, ctx.get("symbol") or je.get("symbol") or "",
+                trig, exit_price_per_share=fill_px, quantity=qty,
+                reason=ctx.get("reason") or self._exit_reason(trig),
+                extra=extra, entry_debit=basis, je=je,
+            )
+            if not ok:
+                return False
+
+            effects = inf.side_effects
+            if not effects.get("ledger"):
+                effects["ledger"] = True
+                self.state_manager.save()
+
+            if ctx.get("trigger_type") == "scale_out" and not effects.get("scale_out"):
+                self.state_manager.state.scaled_out[str(con_id)] = True
+                effects["scale_out"] = True
+                self.state_manager.save()
+            if not effects.get("reload"):
+                reload_ok = self._maybe_write_reload_ticket(
+                    con_id, ctx.get("symbol") or je.get("symbol") or "", trig,
+                    position_qty, planned_basis, fill_px,
+                    ("Filled" if full_position_closed and status == "Filled" else None),
+                    fill_key=fill_key, je=je)
+                if not reload_ok:
+                    return False
+                effects["reload"] = True
+                self.state_manager.save()
+            if (ctx.get("manual_request") and full_position_closed
+                    and not effects.get("manual_clear")):
+                self._clear_manual_exit(con_id)
+                effects["manual_clear"] = True
+                self.state_manager.save()
+            if full_position_closed and not effects.get("position_clear"):
+                self._clear_closed_position(con_id)
+                effects["position_clear"] = True
+                self.state_manager.save()
+            if not effects.get("alert"):
+                slack_key = str(uuid.uuid5(uuid.NAMESPACE_URL, fill_key))
+                if not self._post_exit_alert(
+                        ctx.get("symbol") or je.get("symbol") or "", trig,
+                        client_msg_id=slack_key):
+                    return False
+                effects["alert"] = True
+                self.state_manager.save()
+            self.state_manager.state.remove_in_flight(con_id)
+            self.state_manager.save()
+            print(f"[EXIT-FINALIZED] con_id={con_id} order_id={inf.order_id} "
+                  f"{status}, filled_qty={qty} @ {fill_px:.4f} (durable, deduped)")
+            return True
+        except Exception as e:
+            print(f"[WARN] in-flight finalization failed for con_id={con_id}: {e}; retaining state")
+            return False
+
+    async def _poll_in_flight_fills(self, live_open_orders: Dict[int, dict],
+                                    live_positions: Optional[Dict[int, object]] = None) -> Set[int]:
+        """Persist partial progress and finalize confirmed async/restart fills.
+
+        Resting/cancelled orders are never mistaken for fills.  A full fill is removed only after
+        its actual average price and P&L are durably committed exactly once.
+        """
+        changed: Set[int] = set()
         try:
             infs = dict(self.state_manager.state.in_flight)
             if not infs:
-                return
-            trades_by_oid = None  # lazily built only if an order vanished
+                return changed
+            terminal = await self._terminal_trades_for_in_flight(infs)
+            dirty = False
             for cid_str, inf in infs.items():
-                if not inf.order_id or inf.remaining_qty <= 0:
-                    continue
                 try:
                     cid = int(cid_str)
                 except (TypeError, ValueError):
                     continue
                 live = live_open_orders.get(cid)
                 if live is not None:
-                    live_remaining = live.get("remaining")
-                    if isinstance(live_remaining, (int, float)) and live_remaining == live_remaining:
-                        delta = inf.remaining_qty - int(live_remaining)
-                        if delta > 0:
-                            await self.order_manager.update_in_flight_from_fill(cid, delta)
+                    rem = live.get("remaining")
+                    if isinstance(rem, (int, float)) and rem == rem and int(rem) >= 0:
+                        rem = int(rem)
+                        if rem != inf.remaining_qty:
+                            inf.remaining_qty = rem
+                            dirty = True
+                trade = terminal.get(cid)
+                if trade is None:
+                    # A crash/exception can leave the fsynced pre-transmission intent without any
+                    # broker-side order. Release it only after completed-order AND execution reads
+                    # both succeeded, no live close exists, the original position quantity is
+                    # unchanged, and a short grace period has elapsed. Any uncertainty retains the
+                    # block (fail closed against a double-close).
+                    if (getattr(inf, "placement_state", "submitted") == "intent"
+                            and live is None and getattr(self, "_terminal_lookup_complete", False)
+                            and live_positions is not None and cid in live_positions):
+                        pos = live_positions[cid]
+                        live_qty = (getattr(pos, "quantity", None)
+                                    if not isinstance(pos, dict) else pos.get("qty"))
+                        try:
+                            unchanged = int(live_qty) == int(
+                                (inf.exit_context or {}).get("position_qty")
+                                or inf.remaining_qty)
+                            placed = datetime.fromisoformat(
+                                str(inf.placed_at).replace("Z", "+00:00"))
+                            if placed.tzinfo is None:
+                                placed = placed.replace(tzinfo=timezone.utc)
+                            old_enough = ((datetime.now(timezone.utc) - placed.astimezone(timezone.utc))
+                                          .total_seconds() >= 30)
+                        except Exception:
+                            unchanged = old_enough = False
+                        if unchanged and old_enough:
+                            print(f"[RECONCILE] Releasing untransmitted close intent for con_id={cid}; "
+                                  "all broker history reads are clean and position is unchanged")
+                            self.state_manager.state.remove_in_flight(cid)
+                            dirty = True
+                            changed.add(cid)
                     continue
-                # Order no longer in the live book: only treat as a full fill if the Trade shows
-                # a terminal Filled (a Cancelled/Inactive is NOT a fill and is handled by reconcile).
-                if trades_by_oid is None:
-                    trades_by_oid = {}
-                    try:
-                        for t in (self.ib_conn.ib.trades() or []):
-                            _oid = getattr(getattr(t, "order", None), "orderId", None)
-                            if _oid:
-                                trades_by_oid[_oid] = t
-                    except Exception as _te:
-                        print(f"[WARN] in-flight fill poll: could not read trade blotter ({_te})")
-                        trades_by_oid = {}
-                t = trades_by_oid.get(inf.order_id)
-                st = getattr(getattr(t, "orderStatus", None), "status", None) if t is not None else None
-                if st == "Filled":
-                    await self.order_manager.update_in_flight_from_fill(cid, inf.remaining_qty)
+                status = getattr(getattr(trade, "orderStatus", None), "status", None)
+                if status == "Filled" or status in {"Cancelled", "ApiCancelled", "Inactive"}:
+                    if self._finalize_in_flight_exit(cid, inf, trade):
+                        changed.add(cid)
+                        continue
+                    # A context-rich terminal cancellation with ZERO fills is safe to release:
+                    # the broker says this exact order is dead, so retaining it would suppress the
+                    # next protective/manual retry forever. Partial terminal fills are finalized
+                    # above; invalid/missing fill prices remain retained for a later broker read.
+                    if (status in {"Cancelled", "ApiCancelled", "Inactive"}
+                            and self._trade_reported_filled(trade) <= 0
+                            and getattr(inf, "exit_context", None)):
+                        ctx = dict(inf.exit_context or {})
+                        import types as _types
+                        trig = _types.SimpleNamespace(
+                            trigger_type=ctx.get("trigger_type") or ctx.get("reason") or "exit")
+                        extra = dict(ctx.get("extra") or {})
+                        self._log_unfilled_exit(
+                            cid, ctx.get("symbol") or "", trig, fill_status=status,
+                            close_qty=int(ctx.get("close_qty") or inf.remaining_qty or 0),
+                            trigger_mark=extra.get("trigger_mark"), bid=extra.get("bid"),
+                            limit_price=extra.get("limit_price", inf.order_price),
+                            order_id=inf.order_id, reason=ctx.get("reason"),
+                            placed_at=inf.placed_at)
+                        self.state_manager.state.remove_in_flight(cid)
+                        dirty = True
+                        changed.add(cid)
+            if dirty:
+                self.state_manager.save()
         except Exception as e:
             print(f"[WARN] in-flight fill poll errored (continuing): {e}")
+        return changed
 
     async def _reconcile_on_startup(self) -> bool:
         """
@@ -1254,7 +1912,8 @@ class ExitManager:
         # Get live positions and open orders
         try:
             live_positions_raw = await self.ib_conn.get_positions()
-            live_open_orders_raw = await self.ib_conn.get_open_orders()
+            live_open_orders_raw = await self.ib_conn.get_open_orders(
+                short_leg_con_ids=set(getattr(self, "_spread_short_legs", {}).keys()))
         except Exception as e:
             print(f"[ERROR] Could not fetch live data for reconciliation: {e}")
             return False
@@ -1265,7 +1924,11 @@ class ExitManager:
             for pd in live_positions_raw.values()
         }
         live_open_orders = {
-            od.con_id: {"order_id": od.order_id, "remaining": od.remaining}
+            od.con_id: {"order_id": od.order_id, "remaining": od.remaining,
+                        "perm_id": getattr(od, "perm_id", 0),
+                        "client_id": getattr(od, "client_id", None),
+                        "order_ref": getattr(od, "order_ref", None),
+                        "status": getattr(od, "status", None)}
             for od in live_open_orders_raw.values()
         }
 
@@ -1292,13 +1955,23 @@ class ExitManager:
 
         # Reconcile
         from exitmgr.state import reconcile_state
+        _detail: dict = {}
         safe, alerts = reconcile_state(
             self.state_manager.state,
             live_positions,
             live_open_orders,
             journal_debits,
             journal_qtys=journal_qtys,
+            detail=_detail,
         )
+        # C1a: record the SPECIFIC inconsistent con_ids so the cycle blocks ONLY those exits (a
+        # single manual TWS position no longer withholds every automated stop). Empty set on a
+        # clean reconcile -> nothing blocked.
+        self._reconcile_bad_con_ids = set(_detail.get("inconsistent") or set())
+        # C3: purge per-contract tracking + journal for anything fully closed this pass (reconcile
+        # check-1). Keeps a re-entered conId from inheriting a stale peak.
+        for _cc in (_detail.get("closed") or set()):
+            self._clear_closed_position(_cc)
 
         # Log all alerts
         for alert in alerts:
@@ -1480,7 +2153,7 @@ class ExitManager:
                                              giveback_fraction=new_gb)), True
 
     def _maybe_write_reload_ticket(self, con_id, symbol, trigger, quantity, entry_debit,
-                                   fill_px, fill_status) -> None:
+                                   fill_px, fill_status, *, fill_key=None, je=None) -> bool:
         """FILL-GATED reload hand-off (2026-07-03). Write a persisted reload ticket IFF the feature
         is enabled, this is a model take_profit that signalled reload=true, and the close CONFIRMED
         Filled. NEVER writes on a resting/rejected close -- that is the double-exposure guard: a
@@ -1488,17 +2161,20 @@ class ExitManager:
         a bug here can never raise into or alter the exit path."""
         try:
             if not bool(getattr(self.config, "reload_enabled", False)):
-                return
+                return True
             if getattr(trigger, "trigger_type", None) != "take_profit":
-                return
+                return True
             if not bool(getattr(trigger, "reload", False)):
-                return
+                return True
             # DOUBLE-EXPOSURE GUARD: only a CONFIRMED Filled close is a real vacated slot. A None
             # fill_status (unobservable / mocked) or any non-Filled status writes NOTHING.
             if fill_status != "Filled":
-                return
+                return True
             from exitmgr import reload_queue as _rq
-            je = self._journal_entries.get(con_id) or {}
+            # The realized-exit commit can clear the live journal before this handoff.  Prefer the
+            # frozen entry snapshot from exit_context so reload construction never loses thesis,
+            # right, width, or DTE on a restart replay.
+            je = dict(je or self._journal_entries.get(con_id) or {})
             sp = je.get("spread") or {}
             _px = fill_px if fill_px is not None else getattr(trigger, "current_price", None)
             realized = None
@@ -1521,12 +2197,16 @@ class ExitManager:
                 original_debit=je.get("debit") or entry_debit,
                 ttl_cycles=int(getattr(self.config, "reload_ttl_cycles", 3) or 3),
                 interval_seconds=int(getattr(self.config.loop, "interval_seconds", 60) or 60),
+                source_fill_key=fill_key,
             )
-            _rq.ReloadQueue(_rq.queue_path(self.config.journal.path)).add(ticket)
-            print(f"[RELOAD] wrote fill-gated reload ticket for {symbol} "
-                  f"(reload_conviction={ticket.get('reload_conviction')}, realized={realized})")
+            created = _rq.ReloadQueue(_rq.queue_path(self.config.journal.path)).add_once(ticket)
+            print(f"[RELOAD] {'wrote' if created else 'deduped'} fill-gated reload ticket for "
+                  f"{symbol} (reload_conviction={ticket.get('reload_conviction')}, "
+                  f"realized={realized})")
+            return True
         except Exception as e:
             print(f"[WARN] reload-ticket write skipped for con_id={con_id} ({symbol}): {e} (continuing)")
+            return False
 
     async def _capture_external_fills_safe(self) -> None:
         """Best-effort per-cycle capture of MANUAL/external IBKR fills into trade_dataset.jsonl
@@ -1583,10 +2263,10 @@ class ExitManager:
         if manual_exit_ids:
             print(f"[CYCLE] manual early-exit requests: {sorted(manual_exit_ids)}")
 
-        # Check kill switch first
+        # ENTRY kill switch status is informational here.  Exits are risk-reducing and must remain
+        # live while new entries are halted.
         if self._check_kill_switch():
-            print("[CYCLE] Kill switch active - skipping order placement this cycle")
-            # Still do evaluation and logging but don't place orders
+            print("[CYCLE] Entry kill switch active - continuing exit management")
 
         # Check caps
         caps_ok, cap_reason = self._check_caps(dry_run)
@@ -1604,9 +2284,13 @@ class ExitManager:
         except Exception as _re:
             print(f"[CYCLE] per-cycle reconcile errored ({_re}); treating as UNSAFE (no new orders)")
             reconcile_ok = False
+            # C1a: a reconcile that could not run at all yields NO per-con_id detail -> block ALL
+            # exits this cycle (fail-safe), not just a specific set.
+            self._reconcile_bad_con_ids = None
         self._reconcile_ok = reconcile_ok
         if not reconcile_ok:
-            print("[CYCLE] reconciliation UNSAFE - evaluation still runs but NO exit orders will be placed")
+            print("[CYCLE] reconciliation UNSAFE - clean positions still get stops; only "
+                  "reconcile-inconsistent con_ids are withheld (entries suppressed globally)")
 
         # Get live positions
         try:
@@ -1643,6 +2327,52 @@ class ExitManager:
         except Exception as e:
             print(f"[WARN] tracking prune errored (continuing): {e}")
 
+        # FINALIZE BEFORE FILTER/EARLY-RETURN.  In-flight positions are intentionally excluded from
+        # ``managed_positions``; polling later meant a book containing only a filled/pending close
+        # returned "No positions to evaluate" forever and never finalized it.  Read all-client
+        # orders here, finalize confirmed fills (including completed orders after restart), then
+        # build the management set from the updated durable state.
+        try:
+            live_open_orders_raw = await self.ib_conn.get_open_orders(
+                short_leg_con_ids=set(getattr(self, "_spread_short_legs", {}).keys()))
+            live_open_orders = {
+                od.con_id: {"order_id": od.order_id, "remaining": od.remaining,
+                            "perm_id": getattr(od, "perm_id", 0),
+                            "client_id": getattr(od, "client_id", None),
+                            "order_ref": getattr(od, "order_ref", None),
+                            "status": getattr(od, "status", None)}
+                for od in live_open_orders_raw.values()
+            }
+        except Exception as e:
+            print(f"[ERROR] Could not fetch open orders: {e}")
+            live_open_orders = {}
+        terminal_changes = await self._poll_in_flight_fills(
+            live_open_orders, live_positions=live_positions)
+        if terminal_changes:
+            # The snapshots above predate the fills we just finalized.  Continuing with them can
+            # size a second SELL from the old quantity (or sell a now-flat contract).  Refresh both
+            # sides of the broker book and fail closed if either read is unavailable.
+            try:
+                live_positions = await self.ib_conn.get_positions()
+                live_open_orders_raw = await self.ib_conn.get_open_orders(
+                    short_leg_con_ids=set(getattr(self, "_spread_short_legs", {}).keys()))
+                live_open_orders = {
+                    od.con_id: {"order_id": od.order_id, "remaining": od.remaining,
+                                "perm_id": getattr(od, "perm_id", 0),
+                                "client_id": getattr(od, "client_id", None),
+                                "order_ref": getattr(od, "order_ref", None),
+                                "status": getattr(od, "status", None)}
+                    for od in live_open_orders_raw.values()
+                }
+                print(f"[CYCLE] Refreshed broker snapshots after terminal changes for "
+                      f"con_ids={sorted(terminal_changes)}")
+            except Exception as e:
+                print(f"[ERROR] Could not refresh positions/orders after terminal fill: {e}; "
+                      "skipping further close placement this cycle")
+                return
+        # The poll may have completed a queued one-tap exit and atomically removed its request.
+        manual_exit_ids = self._read_manual_exits()
+
         # Determine scope
         scope_con_ids = self._get_scope_con_ids(live_positions)
         print(f"[CYCLE] Managing {len(scope_con_ids)} positions (scope={self.config.scope.mode})")
@@ -1656,8 +2386,9 @@ class ExitManager:
 
             # Check if already in-flight (being closed)
             in_flight = self.state_manager.state.get_in_flight(con_id)
-            if in_flight is not None and in_flight.order_id != 0:
-                print(f"[CYCLE] con_id={con_id} already in-flight (order_id={in_flight.order_id}, remaining={in_flight.remaining_qty}), skipping")
+            if in_flight is not None:
+                print(f"[CYCLE] con_id={con_id} already has durable close state "
+                      f"(order_id={in_flight.order_id}, remaining={in_flight.remaining_qty}), skipping")
                 continue
 
             managed_positions.append(pos_data)
@@ -1668,13 +2399,21 @@ class ExitManager:
             return
         # MANUAL EARLY-EXITS (force MARKET close, no quote needed): process here, BEFORE the
         # quote-gated eval loop, so an unpriceable option leg can still be sold on a one-tap request.
-        if manual_exit_ids and not dry_run and not self._check_kill_switch():
+        manual_processed_ids: Set[int] = set()
+        if manual_exit_ids and not dry_run:
             try:
-                _loo_raw = await self.ib_conn.get_open_orders()
-                _loo = {od.con_id: {"order_id": od.order_id, "remaining": od.remaining} for od in _loo_raw.values()}
+                _loo_raw = await self.ib_conn.get_open_orders(
+                short_leg_con_ids=set(getattr(self, "_spread_short_legs", {}).keys()))
+                _loo = {
+                    od.con_id: {"order_id": od.order_id, "remaining": od.remaining,
+                                "perm_id": getattr(od, "perm_id", 0),
+                                "client_id": getattr(od, "client_id", None),
+                                "order_ref": getattr(od, "order_ref", None),
+                                "status": getattr(od, "status", None)}
+                    for od in _loo_raw.values()
+                }
             except Exception:
                 _loo = {}
-            import types as _t
             for _p in managed_positions:
                 cid = _p.con_id
                 if cid not in manual_exit_ids:
@@ -1682,27 +2421,68 @@ class ExitManager:
                 je = self._journal_entries.get(cid) or {}
                 sym = je.get("symbol", _p.symbol)
                 qty = min(_p.quantity, je.get("quantity", _p.quantity))
-                edebit = je.get("debit", _p.avg_cost * 100 * _p.quantity)
+                full_basis = je.get("entry_fill_debit") or je.get(
+                    "debit", _p.avg_cost * 100 * _p.quantity)
+                # A prior terminal partial fill leaves the manual request pending.  On retry the
+                # live quantity is only the remainder, so allocate only that fraction of the
+                # original journal basis; reusing the full debit double-counted cost and corrupted
+                # realized P&L across the two fills.
+                try:
+                    journal_qty = int(je.get("quantity") or _p.quantity)
+                    edebit = float(full_basis) * int(qty) / journal_qty if journal_qty else float(full_basis)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    edebit = full_basis
+                _manual_ctx = {
+                    "symbol": sym,
+                    "reason": "manual",
+                    "trigger_type": "manual",
+                    "trigger_message": "early exit via book-review one-tap (market)",
+                    "trigger_pnl_pct": 0.0,
+                    "close_qty": qty,
+                    "position_qty": qty,
+                    "entry_debit": edebit,
+                    "journal_entry": dict(je),
+                    "manual_request": True,
+                    "extra": {
+                        "partial": False,
+                        "close_qty": qty,
+                        "remaining_qty": 0,
+                        "rule_fired": "manual",
+                        "exit_reasoning": "early exit via book-review one-tap (market)",
+                        "mfe_pct": self.state_manager.state.mfe_pct.get(str(cid)),
+                    },
+                }
                 try:
                     res = await self.order_manager.place_close_order(
                         con_id=cid, symbol=sym, quantity=qty, limit_price=0.0, entry_debit=edebit,
-                        live_open_orders=_loo, spread=je.get("spread"), market=True)
+                        live_open_orders=_loo, spread=je.get("spread"), market=True,
+                        right=je.get("right"), trigger_type="manual",
+                        exit_context=_manual_ctx)
                     if res.success:
+                        # Whether it filled immediately or is still working, this contract has
+                        # already consumed its one close action for the cycle.  Exclude it from the
+                        # later static/model evaluation even if finalization removes in_flight.
+                        manual_processed_ids.add(cid)
                         _loo[cid] = {"order_id": res.order_id, "remaining": qty}
-                        self._post_exit_alert(sym, _t.SimpleNamespace(trigger_type="manual early-exit",
-                            pnl_pct=0.0, message="early exit via book-review one-tap (market, ahead of stop)"))
-                        # durable record (FIX #2): MARKET manual close -> fill price not known
-                        # synchronously, so proceeds/realized P&L are null here (reason=manual).
-                        self._log_exit(cid, sym, _t.SimpleNamespace(trigger_type="manual"),
-                                       exit_price_per_share=None, quantity=qty, reason="manual",
-                                       extra={"order_id": res.order_id,
-                                              "mfe_pct": self.state_manager.state.mfe_pct.get(str(cid))})
-                        print(f"[MANUAL-EXIT] {sym} con_id={cid} MARKET close placed")
-                        self._clear_manual_exit(cid)   # clear ONLY on success
+                        # Placement is not the outcome.  Keep manual_exits.json pending and let the
+                        # durable in-flight finalizer clear it only after IBKR says Filled.
+                        _inf = self.state_manager.state.get_in_flight(cid)
+                        _done = bool(_inf is not None and res.trade is not None
+                                     and self._finalize_in_flight_exit(cid, _inf, res.trade))
+                        print(f"[MANUAL-EXIT] {sym} con_id={cid} MARKET close "
+                              f"{'Filled/finalized' if _done else 'placed; request remains pending'}")
                     else:
                         self._manual_exit_fail(sym, cid, res.message)
                 except Exception as _e:
                     self._manual_exit_fail(sym, cid, repr(_e))
+
+        if manual_processed_ids:
+            managed_positions = [p for p in managed_positions
+                                 if p.con_id not in manual_processed_ids]
+            if not managed_positions:
+                print("[CYCLE] All managed positions were handled by manual exits this cycle")
+                self.state_manager.update_last_cycle()
+                return
 
         # Get quotes for managed positions (+ short legs of journaled spreads, for net pricing)
         con_ids_to_fetch = [p.con_id for p in managed_positions]
@@ -1723,22 +2503,6 @@ class ExitManager:
         triggers: List[ExitTrigger] = []
         orders_placed_this_cycle = 0
         orders_notional_this_cycle = 0.0
-
-        # Get live open orders for idempotency check
-        try:
-            live_open_orders_raw = await self.ib_conn.get_open_orders()
-            live_open_orders = {
-                od.con_id: {"order_id": od.order_id, "remaining": od.remaining}
-                for od in live_open_orders_raw.values()
-            }
-        except Exception as e:
-            print(f"[ERROR] Could not fetch open orders: {e}")
-            live_open_orders = {}
-
-        # IN-FLIGHT FILL RECONCILE (2026-07-03): keep InFlightClose records honest against the live
-        # order book each cycle (wires the previously-uncalled update_in_flight_from_fill) so a
-        # filled/partly-filled close can't leave a stale in-flight that wedges the idempotency gate.
-        await self._poll_in_flight_fills(live_open_orders)
 
         # Model-driven position management: one LLM call per cycle assesses every open
         # position and returns per-con_id decisions (arm/tighten trail, tighten stop,
@@ -1796,6 +2560,9 @@ class ExitManager:
             print(f"[WARN] portfolio marking unavailable ({_e}); using streaming quotes")
             _mark = {}
 
+        # C1d (2026-07-09): protective exits withheld THIS cycle because their con_id is
+        # reconcile-inconsistent -> one UNTHROTTLED Slack alert after the loop.
+        withheld_stops: List[tuple] = []
         for pos_data in managed_positions:
             con_id = pos_data.con_id
             quote = quotes.get(con_id)
@@ -1825,6 +2592,21 @@ class ExitManager:
             # Get entry debit from journal (or estimate from avg_cost if not in journal)
             if con_id in self._journal_entries:
                 journal_debit = self._journal_entries[con_id].get("debit", 0.0)
+                # C2b (2026-07-09): anchor the rules engine (and, via the pro-rated basis passed to
+                # _log_exit below, realized P&L) to the REAL entry fill debit when we have it -- the
+                # journal already records entry_fill_debit / basis_source but nothing consumed it, so
+                # every % threshold (profit target / stop / trail) ran off the ESTIMATED debit. Prefer
+                # the fill basis when basis_source=="fill" or an entry_fill_debit is present; fall back
+                # to the estimate otherwise. Numeric-guarded so a bad value never displaces the estimate.
+                _jefd = self._journal_entries[con_id].get("entry_fill_debit")
+                _jbs = self._journal_entries[con_id].get("basis_source")
+                if _jefd is not None and (_jbs == "fill" or _jefd is not None):
+                    try:
+                        _jefd_f = float(_jefd)
+                        if _jefd_f == _jefd_f and _jefd_f > 0:
+                            journal_debit = _jefd_f
+                    except (TypeError, ValueError):
+                        pass
                 symbol = self._journal_entries[con_id].get("symbol", pos_data.symbol)
                 quantity_in_journal = self._journal_entries[con_id].get("quantity", pos_data.quantity)
                 # Use minimum of position qty and journal qty (in case of partial close)
@@ -2011,17 +2793,34 @@ class ExitManager:
                       + (f" [SCALE-OUT trim {close_qty}/{quantity}, keep {quantity - close_qty} runner]"
                          if is_partial else ""))
 
-                # Place order if armed, within caps, kill switch not active, AND reconcile is safe
-                # (2026-07-03: don't place a new close while broker/journal state is inconsistent).
-                if not dry_run and not self._check_kill_switch() and caps_ok and reconcile_ok:
-                    # Check per-cycle order cap
-                    if orders_placed_this_cycle >= self.config.caps.max_orders_per_cycle:
+                # Place order if armed and this con_id is not reconcile-inconsistent.
+                # C1a (2026-07-09): gate PER-CON_ID, not globally -- a clean position still gets its
+                #   stop even when ANOTHER position is inconsistent. _bad is None => reconcile could
+                #   not run at all => block everything (fail-safe).
+                # C1c (2026-07-09): a PROTECTIVE exit (stop/TP/time-stop) is exempt from the daily
+                #   order/notional caps -- caps bound risk-ADDING activity, never a protective close.
+                _bad = self._reconcile_bad_con_ids
+                _reconcile_blocked = (_bad is None) or (con_id in _bad)
+                _protective = self._is_protective_exit(trigger)
+                # C1d: a PROTECTIVE close held back by reconcile-inconsistency is an active-risk
+                # event -> collect for an UNTHROTTLED post-cycle alert.  The entry kill switch is
+                # deliberately irrelevant to exits.
+                if _protective and _reconcile_blocked and not dry_run:
+                    withheld_stops.append((symbol, con_id, trigger.trigger_type))
+                if (not dry_run and (caps_ok or _protective) and not _reconcile_blocked):
+                    # ALL order/notional caps apply only to optional exits (currently scale_out).
+                    # A stop, target, trailing stop, model cut, or time exit is risk-reducing and
+                    # bypasses daily AND per-cycle ceilings.  Do not ``break`` on an optional trim's
+                    # cap: a later position in the loop may need a protective exit.
+                    if (not _protective
+                            and orders_placed_this_cycle >= self.config.caps.max_orders_per_cycle):
                         print(f"[CYCLE] Per-cycle order cap reached: {orders_placed_this_cycle} >= {self.config.caps.max_orders_per_cycle}")
-                        break
+                        continue
 
                     # Check per-cycle notional cap (approximate) -- on the CLOSED qty, not full
                     order_notional = current_price * 100 * close_qty
-                    if orders_notional_this_cycle + order_notional > self.config.caps.max_notional_per_day:
+                    if (not _protective and orders_notional_this_cycle + order_notional
+                            > self.config.caps.max_notional_per_day):
                         print(f"[CYCLE] Would exceed daily notional cap, skipping order for con_id={con_id}")
                         continue
 
@@ -2052,17 +2851,56 @@ class ExitManager:
                     _close_bid = (_raw_bid
                                   if (_raw_bid is not None and _raw_bid == _raw_bid and _raw_bid > 0)
                                   else None)
+                    # Persist everything required to turn a LATER fill into a complete realized
+                    # record.  This snapshot is committed with InFlightClose by OrderManager.
+                    # The basis is pro-rated to the contracts this order closes.
+                    closed_basis = (entry_debit if close_qty == quantity
+                                    else (entry_debit * close_qty / quantity
+                                          if quantity else entry_debit))
+                    _q = quotes.get(con_id) or {}
+                    _exit_ctx = {
+                        "symbol": symbol,
+                        "reason": self._exit_reason(trigger),
+                        "trigger_type": getattr(trigger, "trigger_type", None),
+                        "trigger_message": getattr(trigger, "message", None),
+                        "trigger_pnl_pct": getattr(trigger, "pnl_pct", None),
+                        "reload": bool(getattr(trigger, "reload", False)),
+                        "reload_conviction": getattr(trigger, "reload_conviction", None),
+                        "close_qty": close_qty,
+                        "position_qty": quantity,
+                        "entry_debit": closed_basis,
+                        "journal_entry": dict(je),
+                        "manual_request": False,
+                        "extra": {
+                            "partial": is_partial,
+                            "close_qty": close_qty,
+                            "remaining_qty": quantity - close_qty,
+                            "underlying_price": ((_enrich or {}).get("underlying")
+                                                 if isinstance(_enrich, dict) else None),
+                            "iv": _q.get("iv"), "delta": _q.get("delta"),
+                            "gamma": _q.get("gamma"), "theta": _q.get("theta"),
+                            "vega": _q.get("vega"),
+                            "trigger_mark": current_price,
+                            "bid": _close_bid,
+                            "limit_price": current_price,
+                            "rule_fired": getattr(trigger, "trigger_type", None),
+                            "exit_reasoning": getattr(trigger, "message", None),
+                            "mfe_pct": self.state_manager.state.mfe_pct.get(str(con_id)),
+                        },
+                    }
                     result = await self.order_manager.place_close_order(
                         con_id=con_id,
                         symbol=symbol,
                         quantity=close_qty,
                         limit_price=current_price,  # Limit at mid (net mid for spreads)
-                        entry_debit=entry_debit,
+                        entry_debit=closed_basis,
                         live_open_orders=live_open_orders,
                         spread=spread,
                         market=market_flag,
+                        right=je.get("right"),
                         bid=_close_bid,
                         trigger_type=trigger.trigger_type,
+                        exit_context=_exit_ctx,
                     )
 
                     if result.success:
@@ -2070,97 +2908,59 @@ class ExitManager:
                         orders_notional_this_cycle += order_notional
                         # Update live_open_orders for next iteration
                         live_open_orders[con_id] = {"order_id": result.order_id, "remaining": close_qty}
-                        self._post_exit_alert(symbol, trigger)
-                        # FILL VERIFICATION (2026-07-01): wait briefly for the actual fill so the
-                        # exit record carries fill status + price + timestamp, not just intent.
-                        fill_status, fill_px, fill_ts = None, None, None
-                        exit_commission = None
+                        # OrderManager normally persisted this atomically before returning.  Keep a
+                        # defensive backstop for mocked/legacy implementations: no successful
+                        # placement may exist without durable finalization context.
+                        _inf = self.state_manager.state.get_in_flight(con_id)
+                        if _inf is None:
+                            from exitmgr.state import InFlightClose
+                            _result_client = self._ib_client_id(
+                                getattr(result, "client_id", None))
+                            _result_perm = int(getattr(result, "perm_id", 0) or 0)
+                            _result_ref = getattr(result, "order_ref", None)
+                            _inf = InFlightClose(
+                                con_id=con_id, order_id=int(result.order_id or 0),
+                                remaining_qty=close_qty, entry_debit=closed_basis,
+                                order_price=current_price,
+                                placed_at=datetime.now(timezone.utc).isoformat(),
+                                exit_context=_exit_ctx,
+                                perm_id=_result_perm,
+                                client_id=_result_client,
+                                order_ref=_result_ref,
+                                identity_version=(1 if (_result_perm or _result_ref
+                                                        or _result_client is not None) else 0),
+                                placement_state="submitted")
+                            self.state_manager.state.add_in_flight(_inf)
+                            self.state_manager.save()
+
+                        # Give an immediate fill a short chance to resolve, but placement is never
+                        # logged as a realized exit.  A resting order remains in-flight and the same
+                        # finalizer runs on a later cycle/restart with the broker's actual fill.
                         _tr = getattr(result, "trade", None)
                         if _tr is not None:
                             try:
                                 for _ in range(12):  # up to ~6s
-                                    await asyncio.sleep(0.5)
-                                    if _tr.orderStatus.status == "Filled":
+                                    _status_now = getattr(getattr(_tr, "orderStatus", None),
+                                                          "status", None)
+                                    if _status_now in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
                                         break
-                                fill_status = _tr.orderStatus.status
-                                _afp = getattr(_tr.orderStatus, "avgFillPrice", None)
-                                if fill_status == "Filled" and _afp and _afp == _afp:
-                                    fill_px = float(_afp)
-                                    fill_ts = datetime.now().astimezone().isoformat()
-                                # actual IBKR exit fee (both legs of a combo); None until the
-                                # commissionReport callback lands -> commission_unknown, net null.
-                                if fill_status == "Filled":
-                                    exit_commission = commission_from_trade(_tr)
+                                    await asyncio.sleep(0.5)
                             except Exception as _fe:
                                 print(f"[WARN] fill capture failed for con_id={con_id}: {_fe}")
-                        # TAKE-PROFIT-AND-RELOAD (2026-07-03): fill-gated hand-off. ONLY when the
-                        # feature is enabled, this trigger is a model take_profit carrying reload=true,
-                        # and the CLOSE actually CONFIRMED Filled, write a persisted reload ticket for
-                        # the trader to later drain into a normal human-approved same-name suggestion.
-                        # A resting / rejected close writes NOTHING (double-exposure guard). Fully
-                        # wrapped -- a reload-write bug can NEVER raise into or alter the exit path.
-                        self._maybe_write_reload_ticket(con_id, symbol, trigger, quantity,
-                                                        entry_debit, fill_px, fill_status)
-                        # SCALE-OUT MARK-ON-FILL (2026-07-03 fix): only mark the runner `scaled_out`
-                        # once the trim ACTUALLY FILLS -- not merely at placement. Marking at
-                        # placement meant a trim order that later rested unfilled / was rejected
-                        # still flipped scaled_out True, permanently suppressing the scale-out on a
-                        # runner that was never actually trimmed. Withhold ONLY on a KNOWN non-fill
-                        # (Submitted/PreSubmitted/Cancelled/...); a confirmed Filled sets it, and a
-                        # None fill_status (no trade object -- mocked/legacy path) preserves the old
-                        # set-at-placement behavior so nothing regresses where fill can't be observed.
-                        if trigger.trigger_type == "scale_out":
-                            if fill_status is None or fill_status == "Filled":
-                                self.state_manager.state.scaled_out[str(con_id)] = True
-                                self.state_manager.save()
-                                print(f"[SCALE-OUT] con_id={con_id} ({symbol}) trimmed {close_qty}/{quantity}; "
-                                      f"runner={quantity - close_qty} kept, scaled_out persisted "
-                                      f"(fill_status={fill_status})")
-                            else:
-                                print(f"[SCALE-OUT] con_id={con_id} ({symbol}) trim order not yet filled "
-                                      f"(status={fill_status}); scaled_out deferred until it fills")
-                        # Enrichment (2026-07-01): underlying spot + long-leg IV/delta (already on
-                        # the streamed quote -- no extra request) + persisted MFE ride on the record.
-                        _spot = await self._spot_price(symbol)
-                        _q = quotes.get(con_id) or {}
-                        # SCALE-OUT basis: the exit record must value ONLY the contracts closed this
-                        # order (close_qty), against a basis PRO-RATED to them. entry_debit above is
-                        # the basis for the `quantity` we manage; scale it to the closed slice so a
-                        # partial trim logs correct realized P&L (not the whole position's cost) and
-                        # a runner's eventual full close logs against its (already pro-rated) basis.
-                        closed_basis = (entry_debit if close_qty == quantity
-                                        else (entry_debit * close_qty / quantity if quantity else entry_debit))
-                        # durable realized-exit record (FIX #2). Prefer the REAL fill price when we
-                        # saw the fill; else current_price (the per-share NET mark used to value the
-                        # exit) -- proceeds = px*100*close_qty and realized P&L = proceeds - closed_basis.
-                        self._log_exit(con_id, symbol, trigger,
-                                       exit_price_per_share=(fill_px if fill_px is not None else current_price),
-                                       quantity=close_qty,
-                                       reason=self._exit_reason(trigger),
-                                       entry_debit=closed_basis,
-                                       extra={"order_id": result.order_id,
-                                              # SCALE-OUT: mark this record a PARTIAL so the dataset
-                                              # never treats a trim as a full close (a runner remains).
-                                              "partial": is_partial,
-                                              "close_qty": close_qty,
-                                              "remaining_qty": (quantity - close_qty),
-                                              "fill_status": fill_status,
-                                              "avg_fill_price": fill_px,
-                                              "fill_ts": fill_ts,
-                                              "exit_commission": exit_commission,
-                                              "underlying_price": _spot,
-                                              "iv": _q.get("iv"),
-                                              "delta": _q.get("delta"),
-                                              # v2 EXIT enrichment: greeks at exit, the NET mark that
-                                              # TRIGGERED the exit (for fill-quality/slippage), which
-                                              # rule fired, and the exit reasoning (model-cut text etc.)
-                                              "gamma": _q.get("gamma"),
-                                              "theta": _q.get("theta"),
-                                              "vega": _q.get("vega"),
-                                              "trigger_mark": current_price,
-                                              "rule_fired": getattr(trigger, "trigger_type", None),
-                                              "exit_reasoning": getattr(trigger, "message", None),
-                                              "mfe_pct": self.state_manager.state.mfe_pct.get(str(con_id))})
+                        _filled_now = bool(_tr is not None
+                                           and self._finalize_in_flight_exit(con_id, _inf, _tr))
+                        if not _filled_now:
+                            _st = getattr(getattr(_tr, "orderStatus", None), "status", None)
+                            if isinstance(_st, str):
+                                self._log_unfilled_exit(
+                                    con_id, symbol, trigger, fill_status=_st,
+                                    close_qty=close_qty, trigger_mark=current_price,
+                                    bid=_close_bid, limit_price=current_price,
+                                    order_id=result.order_id,
+                                    reason=self._exit_reason(trigger),
+                                    placed_at=getattr(_inf, "placed_at", None))
+                            print(f"[EXIT-PENDING] {symbol} con_id={con_id} order_id={result.order_id} "
+                                  f"status={_st or 'unknown'}; durable context retained")
                     elif result.trade is not None:
                         # NON-FILL LOGGING (2026-07-03): a TERMINAL reject/cancel at placement.
                         # order.py returns success=False WITH the trade object ONLY on a real
@@ -2191,6 +2991,15 @@ class ExitManager:
                 pnl_pct = (current_price * 100 * quantity - entry_debit) / entry_debit * 100 if entry_debit > 0 else 0
                 print(f"[EVAL] con_id={con_id} ({symbol}): no trigger (price={current_price:.4f}, pnl={pnl_pct:.2f}%)")
 
+        # C1d: fire the UNTHROTTLED stops-withheld alert if any protective exit was held back this
+        # cycle by reconcile-inconsistency (a truly active-risk condition, unlike the throttled block).
+        if withheld_stops:
+            print(f"[CYCLE] PROTECTIVE EXITS WITHHELD (reconcile-inconsistent con_ids): "
+                  f"{[(s, c) for s, c, _ in withheld_stops]}")
+            try:
+                self._post_stops_withheld_alert(withheld_stops)
+            except Exception as _wa:
+                print(f"[WARN] stops-withheld alert errored (continuing): {_wa}")
         print(f"[CYCLE] Evaluation complete. Triggers: {len(triggers)}, Orders placed: {orders_placed_this_cycle}")
         print(f"[CYCLE] Cycle finished at {datetime.utcnow().isoformat()}")
         print(f"{'='*60}\n")
