@@ -667,7 +667,14 @@ async def run(args):
             today = str(datetime.now(timezone.utc).date())
             quotes = await fetch_universe_quotes(ib, names)
             data = await research.gather(ib, names, single_names=[n for n in names if n not in ("SPY", "QQQ", "IWM")])
-            brief = research.build_brief(today=today, quotes=quotes, universe=names, allow_any_name=True, **data)
+            try:
+                _slate_book = await _open_positions_for_risk()
+            except Exception as _book_error:
+                print(f"[WARN] slate book fetch failed (brief shows no positions): {_book_error}")
+                _slate_book = None
+            brief = research.build_brief(
+                today=today, quotes=quotes, universe=names,
+                allow_any_name=True, book=_slate_book, **data)
             _slate_price_stats = data.get("price_stats")  # the technical card fed to the model this slate
 
             # Morning discovery: scout NEW watchlist candidates worth researching (not trades to place).

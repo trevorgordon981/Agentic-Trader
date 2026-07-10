@@ -113,19 +113,26 @@ class ReloadQueue:
             pass
 
     def add_once(self, ticket: dict) -> bool:
-        """Append once per durable fill key, even after the ticket has already been drained."""
+        """Append once per durable confirmed-fill key, even after drain/restart."""
         fill_key = ticket.get("source_fill_key")
-        if fill_key and str(fill_key) in self.seen_fill_keys:
+        if not fill_key:
+            print("[RELOAD] ticket refused: source_fill_key missing")
+            return False
+        fill_key = str(fill_key)
+        if fill_key in self.seen_fill_keys:
             return False
         self.tickets.append(dict(ticket))
-        if fill_key:
-            self.seen_fill_keys.add(str(fill_key))
+        self.seen_fill_keys.add(fill_key)
         self.save()
         return True
 
     def add(self, ticket: dict) -> None:
-        """Backward-compatible append; keyed tickets are automatically replay-safe."""
-        self.add_once(ticket)
+        """Backward-compatible append; production keyed tickets are replay-safe."""
+        if ticket.get("source_fill_key"):
+            self.add_once(ticket)
+            return
+        self.tickets.append(dict(ticket))
+        self.save()
 
     def drain(self, *, today: str, max_per_name: int, now_ts: Optional[float] = None
               ) -> Tuple[List[dict], dict]:
