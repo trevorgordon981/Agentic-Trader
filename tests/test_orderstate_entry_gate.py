@@ -49,8 +49,15 @@ def _trader(tmp_path, *, resolve_sym="SPY", **kw):
                approver_ids={"OWNER"}, baseline_path=str(tmp_path / "b.json"),
                audit_path=str(tmp_path / "a.jsonl"), journal_path=str(tmp_path / "trades.log"),
                approve_timeout_s=60, **kw)
-    t._resolve_order = AsyncMock(
-        return_value=ResolvedOrder(resolve_sym, "C", "20260620", 50.0, 1, 0.90, object()))
+    resolved = ResolvedOrder(
+        resolve_sym, "C", "20260620", 50.0, 1, 0.90, MagicMock(conId=123),
+        entry_bid=0.85, entry_ask=0.95,
+        quote_observed_at=__import__("time").monotonic(),
+        decision_id="decision-" + "a" * 32)
+    t._resolve_order = AsyncMock(return_value=resolved)
+    t._refresh_approved_entry = AsyncMock(
+        side_effect=lambda idea, original, baseline: (
+            original, PotSnapshot(1010.0, 9000.0, 1010.0), ()))
     t._submit_order = AsyncMock(return_value=("Filled", []))
     # no journal file -> _open_positions uses the (tiny) gross fallback for notional
     return t, ibc, em

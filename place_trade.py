@@ -12,18 +12,45 @@ Usage (from ~/exitmgr-app):
 """
 import argparse
 import asyncio
+import json
 import os
-from datetime import date, datetime
+from pathlib import Path
+import time
+from datetime import date, datetime, timedelta
 
 import yaml
 
 from exitmgr.account import get_pot_snapshot
 from exitmgr.connection import IBConnection
 from exitmgr.ibkr import Stock, Option, Order
-from exitmgr.trader import ResolvedOrder, order_summary, audit
-from exitmgr import approval
+from exitmgr.trader import ResolvedOrder, order_summary, audit, _trading_day
+from exitmgr import approval, construction, entry_safety, research, risk
+from exitmgr.config import construction_from_dict
 
 CLIENT_ID = 90
+
+
+async def _open_positions_for_risk(conn, journal_path):
+    positions = await conn.get_positions()
+    debits = {}
+    p = Path(journal_path)
+    if p.exists():
+        for line in p.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+                if rec.get("event"):
+                    continue
+                debits[int(rec["contract_id"])] = float(rec["debit"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+    out = []
+    for pos in positions.values():
+        symbol = str(getattr(pos, "symbol", "")).upper()
+        cid = getattr(pos, "con_id", None)
+        gross = abs(float(getattr(pos, "avg_cost", 0.0))) * 100 * abs(int(getattr(pos, "quantity", 0)))
+        notional = debits.get(int(cid), gross) if cid is not None else gross
+        out.append(risk.OpenPosition(symbol, notional, symbol in risk.INDEX_UNDERLYINGS))
+    return positions, out
 
 
 def _yf_option_price(symbol, expiry_yyyymmdd, strike, right):
@@ -45,13 +72,24 @@ def _yf_option_price(symbol, expiry_yyyymmdd, strike, right):
 
 
 async def run(args):
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config) as _cfg_file:
+        cfg = yaml.safe_load(_cfg_file)
+    if not isinstance(cfg, dict):
+        print("[BLOCKED] invalid config")
+        return 2
     ibc = cfg.get("ib", {})
     tr = cfg.get("trading", {})
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     channel = tr.get("slack_channel", "")
     approver_ids = set(tr.get("approver_ids", []))
     audit_path = tr.get("audit_path", "./audit.jsonl")
+    journal_path = cfg.get("journal", {}).get("path", "./trades.log")
+    marker_gate = entry_safety.entry_markers_clear(
+        config_path=args.config,
+        kill_switch_path=(cfg.get("kill_switch") or {}).get("path"))
+    if not marker_gate.allowed:
+        print("[BLOCKED] " + "; ".join(marker_gate.reasons))
+        return 2
 
     conn = IBConnection(host=ibc.get("host", "127.0.0.1"), port=ibc.get("port", 4001),
                         client_id=CLIENT_ID, market_data_type=ibc.get("market_data_type", 3))
@@ -71,12 +109,15 @@ async def run(args):
         opt = (await ib.qualifyContractsAsync(Option(args.symbol, expiry, strike, args.right, p.exchange or "SMART")))[0]
 
         mid = 0.0
+        initial_bid = initial_ask = 0.0
         if args.limit and args.limit > 0:
             mid = args.limit  # you gave the per-contract premium directly
         else:
             # try IBKR first; it fails (Error 10091) without an options market-data subscription
             try:
                 tk = (await ib.reqTickersAsync(opt))[0]
+                initial_bid = float(tk.bid) if tk.bid and tk.bid == tk.bid and tk.bid > 0 else 0.0
+                initial_ask = float(tk.ask) if tk.ask and tk.ask == tk.ask and tk.ask > 0 else 0.0
                 m = (tk.bid + tk.ask) / 2 if (tk.bid and tk.ask and tk.bid > 0 and tk.ask > 0) else (tk.last or tk.close or 0)
                 if m and m == m and m > 0:
                     mid = m
@@ -90,39 +131,202 @@ async def run(args):
             return 1
 
         pot = await get_pot_snapshot(ib)
+        account_gate = entry_safety.account_snapshot_valid(pot)
+        if not account_gate.allowed or pot.available_funds <= 0:
+            print("[BLOCKED] " + "; ".join(account_gate.reasons or ("no available funds",)))
+            return 2
         qty = args.qty or max(1, int(pot.available_funds // (mid * 100)))
         if mid * 100 * qty > pot.available_funds:
             qty = max(1, qty - 1)
-        r = ResolvedOrder(args.symbol, args.right, expiry, float(strike), qty, round(mid, 2), opt)
+        decision_id = entry_safety.new_decision_id()
+        r = ResolvedOrder(args.symbol, args.right, expiry, float(strike), qty, round(mid, 2), opt,
+                          entry_bid=initial_bid, entry_ask=initial_ask,
+                          quote_observed_at=time.monotonic(), decision_id=decision_id)
 
         line = order_summary(r)
         cost = r.limit * 100 * r.qty
         msg = (f":pushpin: *Manual trade you requested* — *{args.symbol}*\n"
                f"*Order:* `{line}`\n"
                f"~${cost:,.0f} of your ${pot.available_funds:,.0f} ({cost/pot.available_funds*100:.0f}% of pot). Max loss = the debit.\n"
-               f":point_down: *Tap :white_check_mark: to BUY or :x: to cancel* (already on this message).")
+               f":point_down: *Tap :white_check_mark: to BUY or :x: to cancel* (already on this message).\n"
+               f"_Decision ID: `{decision_id}` — approval expires in 5 minutes._")
         ts = approval.post_proposal(token, channel, msg)
         if not ts:
             print("[ERROR] failed to post to Slack"); return 1
-        audit(audit_path, "manual_proposal", underlying=args.symbol, order=line)
-        print(f"[INFO] posted to #trading-approvals: {line} — waiting for your tap (15 min)...")
+        audit(audit_path, "manual_proposal", underlying=args.symbol, order=line,
+              decision_id=decision_id)
+        print(f"[INFO] posted to #trading-approvals: {line} — waiting for your tap (5 min)...")
 
-        decision = approval.await_approval(token, channel, ts, approver_ids, timeout_s=900)
-        audit(audit_path, "manual_approval", underlying=args.symbol, order=line, decision=decision)
+        posted_at = time.monotonic()
+        decision = await asyncio.to_thread(
+            approval.await_approval, token, channel, ts, approver_ids,
+            entry_safety.DEFAULT_APPROVAL_TTL_SECONDS)
+        audit(audit_path, "manual_approval", underlying=args.symbol, order=line,
+              decision=decision, decision_id=decision_id)
         if decision != "approve":
             print(f"[INFO] not approved (decision={decision}) — nothing placed."); return 0
 
-        order = Order(action="BUY", orderType="LMT", totalQuantity=r.qty, lmtPrice=r.limit, tif="DAY")
-        ib.placeOrder(opt, order)
-        audit(audit_path, "manual_executed", underlying=args.symbol, order=line)
+        age_gate = entry_safety.approval_expired(posted_at)
+        if not age_gate.allowed:
+            print("[BLOCKED] " + "; ".join(age_gate.reasons))
+            return 2
+
+        cons = construction_from_dict(cfg.get("construction"))
+        limits = entry_safety.risk_limits_from_config(tr)
+        baseline_path = Path(args.config).resolve().parent / tr.get("baseline_path", "./day_baseline.json")
+
+        async def _fresh_gate(prior):
+            reasons = list(entry_safety.entry_markers_clear(
+                config_path=args.config,
+                kill_switch_path=(cfg.get("kill_switch") or {}).get("path")).reasons)
+            fresh = None
+            fresh_pot = None
+            try:
+                fresh_pot = await get_pot_snapshot(ib)
+                reasons.extend(entry_safety.account_snapshot_valid(fresh_pot).reasons)
+                fresh_opt = (await ib.qualifyContractsAsync(
+                    Option(args.symbol, expiry, strike, args.right, p.exchange or "SMART")))[0]
+                fresh_ticker = (await ib.reqTickersAsync(fresh_opt))[0]
+                bid = float(fresh_ticker.bid)
+                ask = float(fresh_ticker.ask)
+                mid_now = round((bid + ask) / 2, 2)
+                fresh = ResolvedOrder(
+                    args.symbol, args.right, expiry, float(strike), prior.qty, mid_now, fresh_opt,
+                    entry_bid=bid, entry_ask=ask, quote_observed_at=time.monotonic(),
+                    decision_id=decision_id,
+                    dte=max(0, (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days))
+                reasons.extend(entry_safety.nbbo_valid(fresh).reasons)
+                raw_positions, risk_positions = await _open_positions_for_risk(conn, journal_path)
+                baseline = entry_safety.day_start_value(baseline_path, _trading_day())
+                if isinstance(baseline, entry_safety.SafetyResult):
+                    reasons.extend(baseline.reasons)
+                    baseline_value = 0.0
+                else:
+                    baseline_value = baseline
+                cost_now = entry_safety.executable_price(fresh) * 100 * fresh.qty
+                gate = risk.evaluate_trade(
+                    risk.ProposedTrade(
+                        underlying=args.symbol, notional=cost_now,
+                        is_index=args.symbol.upper() in risk.INDEX_UNDERLYINGS,
+                        conviction=1, is_long=args.right == "C"),
+                    net_liq=fresh_pot.net_liq,
+                    available_funds=fresh_pot.available_funds,
+                    open_positions=risk_positions,
+                    pot_day_start=baseline_value,
+                    approved_names={str(n).upper() for n in tr.get("approved_names", [])},
+                    limits=limits)
+                if not gate.approved:
+                    reasons.extend(gate.reasons)
+                budget_ok, budget_reasons = construction.check_budget(
+                    cost_now, fresh.dte, fresh_pot.net_liq,
+                    construction.open_book(raw_positions, journal_path), cons)
+                if not budget_ok:
+                    reasons.extend(budget_reasons)
+                earnings_days = await asyncio.to_thread(research.days_to_earnings, args.symbol)
+                if earnings_days is None:
+                    reasons.append("earnings date unavailable at approval time")
+                else:
+                    entry_date = date.today()
+                    earnings_date = entry_date + timedelta(days=earnings_days)
+                    earnings_ok, earnings_reason = construction.earnings_ok(
+                        entry_date, expiry, earnings_date, cons)
+                    if not earnings_ok:
+                        reasons.append(earnings_reason)
+                # Make the selected contract's NBBO the final network read, then rerun pure
+                # dollar gates against its executable ask.
+                final_ticker = (await ib.reqTickersAsync(fresh.contract))[0]
+                fresh.entry_bid = float(final_ticker.bid)
+                fresh.entry_ask = float(final_ticker.ask)
+                fresh.limit = round((fresh.entry_bid + fresh.entry_ask) / 2, 2)
+                fresh.quote_observed_at = time.monotonic()
+                reasons.extend(entry_safety.nbbo_valid(fresh).reasons)
+                final_cost = entry_safety.executable_price(fresh) * 100 * fresh.qty
+                final_gate = risk.evaluate_trade(
+                    risk.ProposedTrade(
+                        underlying=args.symbol, notional=final_cost,
+                        is_index=args.symbol.upper() in risk.INDEX_UNDERLYINGS,
+                        conviction=1, is_long=args.right == "C"),
+                    net_liq=fresh_pot.net_liq,
+                    available_funds=fresh_pot.available_funds,
+                    open_positions=risk_positions,
+                    pot_day_start=baseline_value,
+                    approved_names={str(n).upper() for n in tr.get("approved_names", [])},
+                    limits=limits)
+                if not final_gate.approved:
+                    reasons.extend(final_gate.reasons)
+                final_budget_ok, final_budget_reasons = construction.check_budget(
+                    final_cost, fresh.dte, fresh_pot.net_liq,
+                    construction.open_book(raw_positions, journal_path), cons)
+                if not final_budget_ok:
+                    reasons.extend(final_budget_reasons)
+            except Exception as exc:
+                reasons.append(f"fresh account/contract/NBBO/risk/earnings gate failed: {exc}")
+            return fresh, fresh_pot, tuple(dict.fromkeys(str(x) for x in reasons if x))
+
+        fresh, fresh_pot, final_reasons = await _fresh_gate(r)
+        if final_reasons or fresh is None:
+            print("[BLOCKED] " + "; ".join(final_reasons or ("fresh order unavailable",)))
+            audit(audit_path, "manual_final_gate_blocked", decision_id=decision_id,
+                  underlying=args.symbol, reasons=final_reasons)
+            return 2
+        changes = entry_safety.material_changes(r, fresh)
+        if changes:
+            remsg = (f":repeat: *Reapproval required — {args.symbol}*\n"
+                     f"Refreshed order: `{order_summary(fresh)}`\n"
+                     f"Executable BUY limit: *${entry_safety.executable_price(fresh):.2f}*\n"
+                     f"Changed: {'; '.join(changes)}\n"
+                     f":point_down: Approve again within 5 minutes.\n"
+                     f"_Decision ID: `{decision_id}`, revision 1_")
+            rts = approval.post_proposal(token, channel, remsg)
+            if not rts:
+                return 2
+            reposted_at = time.monotonic()
+            rdecision = await asyncio.to_thread(
+                approval.await_approval, token, channel, rts, approver_ids,
+                entry_safety.DEFAULT_APPROVAL_TTL_SECONDS)
+            if rdecision != "approve" or not entry_safety.approval_expired(reposted_at).allowed:
+                return 0
+            fresh2, fresh_pot, second_reasons = await _fresh_gate(fresh)
+            if second_reasons or fresh2 is None or entry_safety.material_changes(fresh, fresh2):
+                print("[BLOCKED] terms changed again or final gate failed after reapproval")
+                return 2
+            fresh = fresh2
+
+        marker_now = entry_safety.entry_markers_clear(
+            config_path=args.config,
+            kill_switch_path=(cfg.get("kill_switch") or {}).get("path"))
+        if not marker_now.allowed:
+            print("[BLOCKED] " + "; ".join(marker_now.reasons))
+            return 2
+        quote_now = entry_safety.nbbo_valid(fresh)
+        if not quote_now.allowed:
+            print("[BLOCKED] " + "; ".join(quote_now.reasons))
+            return 2
+        order = Order(action="BUY", orderType="LMT", totalQuantity=fresh.qty,
+                      lmtPrice=entry_safety.executable_price(fresh), tif="DAY")
+        order.orderRef = entry_safety.decision_order_ref(decision_id)
+        from exitmgr.order_lock import order_mutation_lock
+        with order_mutation_lock():
+            trade = ib.placeOrder(fresh.contract, order)
+        r = fresh
+        line = order_summary(r)
+        cost = entry_safety.executable_price(r) * 100 * r.qty
+        audit(audit_path, "manual_executed", underlying=args.symbol, order=line,
+              decision_id=decision_id, order_ref=order.orderRef)
         # journal so the exit manager picks it up
-        import json as _j, time as _t
-        _jpath = cfg.get("journal", {}).get("path", "./trades.log")
+        import json as _j
+        _jpath = journal_path
         with open(_jpath, "a") as f:
-            f.write(_j.dumps({"ts": datetime.utcnow().isoformat(), "contract_id": opt.conId,
+            f.write(_j.dumps({"ts": datetime.utcnow().isoformat(),
+                              "decision_id": decision_id,
+                              "contract_id": r.contract.conId,
                               "symbol": args.symbol, "right": args.right, "expiry": expiry,
                               "strike": float(strike), "quantity": r.qty,
-                              "debit": round(cost, 2)}, default=str) + "\n")
+                              "debit": round(cost, 2),
+                              "order_id": getattr(order, "orderId", None),
+                              "order_ref": order.orderRef,
+                              "entry_bid": r.entry_bid, "entry_ask": r.entry_ask,
+                              "quote_observed_at": r.quote_observed_at}, default=str) + "\n")
         # DECISION CAPTURE (v2, record-only): a manual trade carries no model reasoning, but
         # record a minimal decision (source="manual", con_id known) so the closed-trade record
         # can still join a decision block and label it manual. Never raises.
@@ -131,8 +335,10 @@ async def run(args):
             _tc.capture_decision(
                 _tc.dataset_dir(_jpath), source="manual", symbol=args.symbol,
                 right=args.right, strike=float(strike), expiry=expiry, structure="single",
-                con_id=opt.conId,
-                extra={"order": line, "note": "manual place_trade.py — no model context"})
+                con_id=r.contract.conId,
+                extra={"order": line, "decision_id": decision_id,
+                       "order_ref": order.orderRef,
+                       "note": "manual place_trade.py — no model context"})
         except Exception as _dce:
             print(f"[WARN] manual capture_decision failed (continuing): {_dce}")
         print(f"[PLACED] {line}")

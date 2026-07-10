@@ -133,7 +133,15 @@ def _trader(tmp_path, *, kill_switch_path=None, exit_mgr=None):
                approver_ids={"OWNER"}, baseline_path=str(tmp_path / "b.json"),
                audit_path=str(tmp_path / "a.jsonl"), approve_timeout_s=60,
                kill_switch_path=kill_switch_path)
-    t._resolve_order = AsyncMock(return_value=ResolvedOrder("SPY", "C", "20260620", 50.0, 1, 1.20, object()))
+    resolved = ResolvedOrder(
+        "SPY", "C", "20260620", 50.0, 1, 1.20, MagicMock(conId=123),
+        entry_bid=1.15, entry_ask=1.25,
+        quote_observed_at=__import__("time").monotonic(),
+        decision_id="decision-" + "a" * 32)
+    t._resolve_order = AsyncMock(return_value=resolved)
+    t._refresh_approved_entry = AsyncMock(
+        side_effect=lambda idea, original, baseline: (
+            original, PotSnapshot(1010.0, 9000.0, 1010.0), ()))
     t._submit_order = AsyncMock(return_value=("Filled", []))
     return t
 
@@ -201,11 +209,16 @@ async def test_entry_submits_marketable_limit(tmp_path):
                audit_path=str(tmp_path / "a.jsonl"), journal_path=str(tmp_path / "trades.log"),
                entry_limit_buffer_pct=0.05)
     c = MagicMock(); c.conId = 111
-    r = ResolvedOrder("SPY", "C", "20260620", 610.0, 1, 2.00, c)
+    r = ResolvedOrder(
+        "SPY", "C", "20260620", 610.0, 1, 2.00, c,
+        entry_bid=1.95, entry_ask=2.10,
+        quote_observed_at=__import__("time").monotonic(),
+        decision_id="decision-" + "c" * 32)
     await t._submit_order(r)
     placed_order = ibc.ib.placeOrder.call_args[0][1]
     assert placed_order.orderType == "LMT"
-    assert placed_order.lmtPrice == pytest.approx(2.10)   # 2.00 * (1 + 0.05)
+    assert placed_order.lmtPrice == pytest.approx(2.10)   # exact fresh executable ask
+    assert placed_order.orderRef == "alfred-entry:" + "c" * 32
 
 
 # ============================================================ manager helpers

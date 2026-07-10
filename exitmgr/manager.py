@@ -297,6 +297,7 @@ class ExitManager:
             rec = {
                 "schema": "trade_dataset.v2",
                 "kind": "trade",                     # trade | no_trade | rejected (v2 row taxonomy)
+                "decision_id": je.get("decision_id"),
                 "con_id": con_id,
                 "symbol": exit_rec.get("symbol"),
                 # ---------- DECISION -> the reasoning that produced the trade ----------
@@ -304,6 +305,7 @@ class ExitManager:
                 # ---------- ENTRY SNAPSHOT (+ full greeks / IV / liquidity, v2) ----------
                 "entry": {
                     "ts": je.get("ts"),
+                    "decision_id": je.get("decision_id"),
                     "symbol": je.get("symbol"),
                     "right": je.get("right"),
                     "strike": je.get("strike"),
@@ -700,6 +702,7 @@ class ExitManager:
             rec = {
                 "ts": now.isoformat(),                 # close timestamp (close_ts for calibration)
                 "close_ts": now.isoformat(),
+                "decision_id": je.get("decision_id"),
                 "contract_id": con_id,                 # matches journal contract_id / --fills key
                 "conId": con_id,
                 "symbol": symbol,

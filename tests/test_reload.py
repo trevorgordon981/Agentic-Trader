@@ -124,7 +124,9 @@ def _tp_trigger(reload=True, conv=8):
 def test_ticket_written_on_filled(tmp_path):
     m = _mgr(tmp_path, reload_enabled=True)
     _seed_journal_entry(m)
-    m._maybe_write_reload_ticket(5, "NVDA", _tp_trigger(), 1, 800.0, fill_px=12.0, fill_status="Filled")
+    m._maybe_write_reload_ticket(
+        5, "NVDA", _tp_trigger(), 1, 800.0, fill_px=12.0,
+        fill_status="Filled", fill_key="perm:ticket-written")
     q = reload_queue.ReloadQueue(reload_queue.queue_path(m.config.journal.path))
     assert len(q.tickets) == 1
     t = q.tickets[0]
@@ -132,26 +134,45 @@ def test_ticket_written_on_filled(tmp_path):
     assert t["dte_target"] == 30 and t["realized_pnl"] == pytest.approx(12.0 * 100 - 800.0)
 
 
+def test_reload_queue_add_once_dedupes_fill_identity(tmp_path):
+    path = tmp_path / "reload.json"
+    ticket = reload_queue.make_ticket(
+        symbol="NVDA", thesis="x", right="C", width=None, dte_target=30,
+        structure="single", is_index=False, reload_conviction=8,
+        realized_pnl=100, original_debit=500, source_fill_key="perm:123")
+    q = reload_queue.ReloadQueue(str(path))
+    assert q.add_once(ticket)
+    assert not q.add_once(ticket)
+    persisted = reload_queue.ReloadQueue(str(path)).tickets
+    assert len(persisted) == 1
+    assert persisted[0]["source_fill_key"] == "perm:123"
+
+
 @pytest.mark.parametrize("status", ["Submitted", "PreSubmitted", "Cancelled", None])
 def test_no_ticket_on_non_filled_close(tmp_path, status):
     m = _mgr(tmp_path, reload_enabled=True)
     _seed_journal_entry(m)
-    m._maybe_write_reload_ticket(5, "NVDA", _tp_trigger(), 1, 800.0, fill_px=None, fill_status=status)
+    m._maybe_write_reload_ticket(
+        5, "NVDA", _tp_trigger(), 1, 800.0, fill_px=None,
+        fill_status=status, fill_key=f"status:{status}")
     assert not os.path.exists(reload_queue.queue_path(m.config.journal.path))  # double-exposure guard
 
 
 def test_no_ticket_when_feature_off(tmp_path):
     m = _mgr(tmp_path, reload_enabled=False)
     _seed_journal_entry(m)
-    m._maybe_write_reload_ticket(5, "NVDA", _tp_trigger(), 1, 800.0, fill_px=12.0, fill_status="Filled")
+    m._maybe_write_reload_ticket(
+        5, "NVDA", _tp_trigger(), 1, 800.0, fill_px=12.0,
+        fill_status="Filled", fill_key="perm:disabled")
     assert not os.path.exists(reload_queue.queue_path(m.config.journal.path))
 
 
 def test_no_ticket_without_reload_flag(tmp_path):
     m = _mgr(tmp_path, reload_enabled=True)
     _seed_journal_entry(m)
-    m._maybe_write_reload_ticket(5, "NVDA", _tp_trigger(reload=False), 1, 800.0,
-                                 fill_px=12.0, fill_status="Filled")
+    m._maybe_write_reload_ticket(
+        5, "NVDA", _tp_trigger(reload=False), 1, 800.0,
+        fill_px=12.0, fill_status="Filled", fill_key="perm:no-reload")
     assert not os.path.exists(reload_queue.queue_path(m.config.journal.path))
 
 
@@ -231,8 +252,14 @@ def _trader(tmp_path, **kw):
                approver_ids={"OWNER"}, baseline_path=str(tmp_path / "b.json"),
                audit_path=str(tmp_path / "a.jsonl"), journal_path=str(tmp_path / "trades.log"),
                approve_timeout_s=60, **kw)
-    t._resolve_order = AsyncMock(
-        return_value=ResolvedOrder("NVDA", "C", "20260620", 50.0, 1, 0.90, object()))
+    resolved = ResolvedOrder(
+        "NVDA", "C", "20260620", 50.0, 1, 0.90, MagicMock(conId=123),
+        entry_bid=0.85, entry_ask=0.95, quote_observed_at=time.monotonic(),
+        decision_id="decision-" + "a" * 32)
+    t._resolve_order = AsyncMock(return_value=resolved)
+    t._refresh_approved_entry = AsyncMock(
+        side_effect=lambda idea, original, baseline: (
+            original, PotSnapshot(1010.0, 9000.0, 1010.0), ()))
     t._submit_order = AsyncMock(return_value=("Filled", []))
     return t, ibc, em
 

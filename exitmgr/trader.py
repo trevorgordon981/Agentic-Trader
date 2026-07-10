@@ -12,6 +12,7 @@ Hard invariants:
 """
 import asyncio
 import json
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ from exitmgr.risk import (
 )
 from exitmgr.strategist import propose, TradeIdea
 from exitmgr import approval, construction, research, regime, slate_lock, trade_capture, reload_queue
+from exitmgr import entry_safety
 from dataclasses import replace as _replace_dc
 from exitmgr.config import ConstructionConfig
 
@@ -147,16 +149,18 @@ class ResolvedOrder:
     net_theta: float = 0.0
     net_gamma: float = 0.0
     net_vega: float = 0.0
+    quote_observed_at: float = 0.0  # monotonic timestamp of the reqTickersAsync result
+    decision_id: str = ""          # immutable proposal -> order -> fill -> close lineage
 
 
 def order_summary(r: ResolvedOrder) -> str:
     if r.short_contract is not None:
         width = abs(r.short_strike - r.strike)
         return (f"BUY {r.qty}x {r.underlying} {r.expiry} {r.strike:g}/{r.short_strike:g}{r.right} "
-                f"debit spread @ ~${r.limit:.2f} (market order)  "
+                f"debit spread @ ~${r.limit:.2f} (marketable limit after fresh NBBO)  "
                 f"(max loss ~${r.limit * 100 * r.qty:,.0f}, max value ${width * 100 * r.qty:,.0f})")
     return (f"BUY {r.qty}x {r.underlying} {r.expiry} {r.strike:g}{r.right} "
-            f"@ ~${r.limit:.2f} (market order)  (~${r.limit * 100 * r.qty:,.0f})")
+            f"@ ~${r.limit:.2f} (marketable limit after fresh NBBO)  (~${r.limit * 100 * r.qty:,.0f})")
 
 
 def pick_spread_short(candidates, long_strike: float, long_mid: float, right: str,
@@ -214,6 +218,9 @@ class Trader:
                  construction_cfg: Optional[ConstructionConfig] = None,
                  caps_tp_tiers: Optional[List[dict]] = None,
                  kill_switch_path: Optional[str] = None,
+                 config_path: str = "config.yaml",
+                 trading_down_path: Optional[str] = None,
+                 broker_order_lock=None,
                  max_orders_per_cycle: Optional[int] = None,
                  max_orders_per_day: Optional[int] = None,
                  max_notional_per_day: Optional[float] = None,
@@ -227,7 +234,10 @@ class Trader:
         # checked it, so entries kept flowing under a kill switch. When configured (run_trader.py
         # passes cfg.kill_switch.path) an existing file HALTS new entries. None (bare Trader/tests)
         # -> never active.
-        self.kill_switch_path = kill_switch_path
+        self.kill_switch_path = kill_switch_path or "./KILL_SWITCH"
+        self.config_path = config_path
+        self.trading_down_path = trading_down_path
+        self.broker_order_lock = broker_order_lock
         # EXIT-CYCLE FAILURE STREAK (2026-07-03): consecutive run_cycle failures. After
         # _EXIT_FAIL_SUPPRESS_ENTRIES in a row, new entries are suppressed (a broken exit path must
         # not be compounded by opening MORE positions we then can't manage).
@@ -283,6 +293,12 @@ class Trader:
             return bool(self.kill_switch_path) and Path(self.kill_switch_path).exists()
         except Exception:
             return False
+
+    def _entry_markers_clear(self) -> entry_safety.SafetyResult:
+        return entry_safety.entry_markers_clear(
+            config_path=self.config_path,
+            kill_switch_path=self.kill_switch_path,
+            trading_down_path=self.trading_down_path)
 
     def _load_baselines(self) -> Dict[str, float]:
         p = Path(self.baseline_path)
@@ -490,7 +506,7 @@ class Trader:
                 kept.append(idea)
         return kept
 
-    async def run_once(self, dry_run: bool) -> None:
+    async def run_once(self, dry_run: bool, *, skip_exit_cycle: bool = False) -> None:
         # SOFT-MUTEX (2026-06-23): if the daily slate is mid-generation on the single-threaded
         # model server, DEFER this tick's exit-management model call so we don't collide/queue
         # behind it. Static stops/targets still run; the model tuning is picked up next tick.
@@ -515,22 +531,25 @@ class Trader:
         # propose timeout) or a pending Slack approval can never delay or skip a stop. The exit
         # cycle only needs positions + regime/price_stats (set by _market_context above) and
         # defer_model (set at top of run_once).
-        try:
-            await self.exit_manager.run_cycle(dry_run, regime=self._regime, price_stats=self._price_stats, defer_model=defer_model)
-            self._exit_fail_streak = 0
-        except Exception as e:
-            self._exit_fail_streak += 1
-            audit(self.audit_path, "exit_cycle_error", error=str(e), streak=self._exit_fail_streak)
-            # NO SILENT FAILURE (2026-07-03): a failing exit cycle means positions may be going
-            # unmanaged -- Slack it, and after N in a row suppress new entries (below) so we don't
-            # pile on more positions we can't exit.
+        if not skip_exit_cycle:
             try:
-                approval.post_proposal(self.slack_token, self.slack_channel,
-                    f":warning: *Exit cycle FAILED* ({self._exit_fail_streak}x consecutive): {e}"
-                    + (f"\n_New entries SUPPRESSED until exits recover._"
-                       if self._exit_fail_streak >= self._EXIT_FAIL_SUPPRESS_ENTRIES else ""))
-            except Exception as _se:
-                print(f"[WARN] exit-cycle-failure Slack alert failed: {_se}")
+                await self.exit_manager.run_cycle(
+                    dry_run, regime=self._regime, price_stats=self._price_stats,
+                    defer_model=defer_model)
+                self._exit_fail_streak = 0
+            except Exception as e:
+                self._exit_fail_streak += 1
+                audit(self.audit_path, "exit_cycle_error", error=str(e), streak=self._exit_fail_streak)
+                # NO SILENT FAILURE (2026-07-03): a failing exit cycle means positions may be going
+                # unmanaged -- Slack it, and after N in a row suppress new entries (below) so we don't
+                # pile on more positions we can't exit.
+                try:
+                    approval.post_proposal(self.slack_token, self.slack_channel,
+                        f":warning: *Exit cycle FAILED* ({self._exit_fail_streak}x consecutive): {e}"
+                        + (f"\n_New entries SUPPRESSED until exits recover._"
+                           if self._exit_fail_streak >= self._EXIT_FAIL_SUPPRESS_ENTRIES else ""))
+                except Exception as _se:
+                    print(f"[WARN] exit-cycle-failure Slack alert failed: {_se}")
 
         # Market-closed guard (2026-06-28): skip the strategist/model call when the market is
         # closed — nothing can be entered, so there's nothing to propose; spares the single-
@@ -542,8 +561,9 @@ class Trader:
         #     inconsistent book);
         #   * the exit cycle has failed N times in a row (don't pile on unmanageable positions).
         _entries_halted, _halt_reason = False, None
-        if self._kill_switch_active():
-            _entries_halted, _halt_reason = True, "kill_switch"
+        _marker_gate = self._entry_markers_clear()
+        if not _marker_gate.allowed:
+            _entries_halted, _halt_reason = True, "; ".join(_marker_gate.reasons)
         elif getattr(self.exit_manager, "_reconcile_ok", True) is False:
             _entries_halted, _halt_reason = True, "reconcile_unsafe"
         elif self._exit_fail_streak >= self._EXIT_FAIL_SUPPRESS_ENTRIES:
@@ -879,8 +899,11 @@ class Trader:
                 _cap_rej("entry_cap", _throttle, resolved=resolved, gate=plan.gate)
                 continue
 
+            resolved.decision_id = entry_safety.new_decision_id()
+            _approval_ttl = min(entry_safety.DEFAULT_APPROVAL_TTL_SECONDS,
+                                max(1, int(self.approve_timeout_s)))
             msg = approval.format_proposal(idea, pot.net_liq, plan.gate.per_trade_cap,
-                                           self.approve_timeout_s // 60, order_summary(resolved))
+                                           max(1, _approval_ttl // 60), order_summary(resolved))
             if getattr(idea, "is_reload", False):
                 # RELOAD: make it unmistakable in Slack that this is a same-name RE-ENTRY on
                 # continued conviction (banked the prior winner; fresh basis + fresh 30% stop).
@@ -896,6 +919,8 @@ class Trader:
             elif getattr(resolved, "assignment_unchecked", False):
                 # A6: never present a spread as verified-clear of assignment risk when ex-div is unknown.
                 msg += "\n:grey_question: ex-dividend date unknown — early-assignment risk UNCHECKED"
+            msg += (f"\n_Decision ID: `{resolved.decision_id}` — approval expires in "
+                    f"{_approval_ttl // 60 or 1} minutes._")
             if dry_run:
                 approval.post_proposal(self.slack_token, self.slack_channel,
                                        "[DRY RUN — nothing will be submitted]\n" + msg)
@@ -929,46 +954,77 @@ class Trader:
             # OFF-LOOP (2026-07-03): await_approval BLOCKS (polls Slack + sleeps) for up to the
             # approve timeout; run it in a worker thread so the IBKR event loop / exit I/O isn't
             # starved for minutes while a human decides.
+            _posted_at = time.monotonic()
             decision = await asyncio.to_thread(
                 approval.await_approval, self.slack_token, self.slack_channel, ts,
-                self.approver_ids, self.approve_timeout_s)
+                self.approver_ids, _approval_ttl)
             audit(self.audit_path, "approval", underlying=idea.underlying,
-                  order=order_summary(resolved), decision=decision)
+                  order=order_summary(resolved), decision=decision,
+                  decision_id=resolved.decision_id)
             if decision != "approve":
                 _cap_rej("approval", f"human decision: {decision}", resolved=resolved, gate=plan.gate)
                 continue
 
-            # PRE-SUBMIT RE-CHECK (2026-07-03): the slow approval wait can straddle a kill-switch
-            # flip, a daily-breaker trip (live -20%, from limits.daily_halt_pct), or a funds change.
-            # Re-verify all three on a FRESH pot
-            # RIGHT before submitting the now-approved order; any trip ABORTS the submit (the idea
-            # can be re-proposed next cycle) rather than firing a stale order into a changed account.
-            if self._kill_switch_active():
-                audit(self.audit_path, "kill_switch_blocked_submit", underlying=idea.underlying)
-                approval.post_proposal(self.slack_token, self.slack_channel,
-                    f":octagonal_sign: KILL_SWITCH active — NOT submitting approved *{idea.underlying}* {order_summary(resolved)}.")
+            _age = entry_safety.approval_expired(_posted_at, ttl_seconds=_approval_ttl)
+            if not _age.allowed:
+                audit(self.audit_path, "approval_expired", underlying=idea.underlying,
+                      decision_id=resolved.decision_id, reasons=_age.reasons)
                 continue
-            try:
-                _pot2 = await get_pot_snapshot(self.ib_conn.ib)
-                _dp2 = day_pnl_pct(_pot2.net_liq, baseline)
-                _cost2 = resolved.limit * 100 * resolved.qty
-                if _dp2 <= -self.limits.daily_halt_pct:
-                    audit(self.audit_path, "breaker_blocked_submit", underlying=idea.underlying,
-                          day_pnl_pct=round(_dp2, 4))
-                    approval.post_proposal(self.slack_token, self.slack_channel,
-                        f":octagonal_sign: Daily -{self.limits.daily_halt_pct:.0%} breaker tripped "
-                        f"({_dp2:.1%}) — NOT submitting approved *{idea.underlying}*.")
+
+            # The approval binds to the displayed terms, not merely the ticker. Rebuild from a new
+            # account/chain/NBBO and rerun every hard gate. A material change gets one new proposal
+            # and a second explicit tap; continued movement aborts rather than looping forever.
+            fresh, _pot2, _final_reasons = await self._refresh_approved_entry(
+                idea, resolved, baseline)
+            if _final_reasons or fresh is None:
+                audit(self.audit_path, "final_entry_gate_blocked", underlying=idea.underlying,
+                      decision_id=resolved.decision_id, reasons=_final_reasons)
+                approval.post_proposal(self.slack_token, self.slack_channel,
+                    f":no_entry: Approved *{idea.underlying}* was NOT submitted — final hard gate: "
+                    + "; ".join(_final_reasons or ("fresh order unavailable",)))
+                continue
+            _changes = entry_safety.material_changes(resolved, fresh)
+            if _changes:
+                _remsg = (f":repeat: *Reapproval required — {idea.underlying}*\n"
+                           f"Refreshed order: `{order_summary(fresh)}`\n"
+                           f"Executable BUY limit: *${entry_safety.executable_price(fresh):.2f}*\n"
+                           f"Changed: {'; '.join(_changes)}\n"
+                           f":point_down: Approve again within {_approval_ttl // 60 or 1} minutes.\n"
+                           f"_Decision ID: `{resolved.decision_id}`, revision 1_")
+                _rts = approval.post_proposal(self.slack_token, self.slack_channel, _remsg)
+                if not _rts:
+                    audit(self.audit_path, "reapproval_post_failed", decision_id=resolved.decision_id)
                     continue
-                if _cost2 > _pot2.available_funds + 1e-6:
-                    audit(self.audit_path, "funds_blocked_submit", underlying=idea.underlying,
-                          cost=round(_cost2, 2), available=round(_pot2.available_funds, 2))
-                    approval.post_proposal(self.slack_token, self.slack_channel,
-                        f":octagonal_sign: Insufficient funds (${_pot2.available_funds:,.0f} < "
-                        f"${_cost2:,.0f}) — NOT submitting approved *{idea.underlying}*.")
+                _reposted_at = time.monotonic()
+                _rdecision = await asyncio.to_thread(
+                    approval.await_approval, self.slack_token, self.slack_channel, _rts,
+                    self.approver_ids, _approval_ttl)
+                audit(self.audit_path, "reapproval", underlying=idea.underlying,
+                      decision_id=resolved.decision_id, decision=_rdecision, changes=_changes)
+                if _rdecision != "approve" or not entry_safety.approval_expired(
+                        _reposted_at, ttl_seconds=_approval_ttl).allowed:
                     continue
-            except Exception as _pe:
-                # Can't verify the account right before a real-money submit -> ABORT (re-proposes next cycle).
-                audit(self.audit_path, "presubmit_recheck_error", underlying=idea.underlying, error=str(_pe))
+                fresh2, _pot3, _recheck_reasons = await self._refresh_approved_entry(
+                    idea, fresh, baseline)
+                if _recheck_reasons or fresh2 is None:
+                    audit(self.audit_path, "reapproval_gate_blocked", underlying=idea.underlying,
+                          decision_id=resolved.decision_id, reasons=_recheck_reasons)
+                    continue
+                _changes2 = entry_safety.material_changes(fresh, fresh2)
+                if _changes2:
+                    audit(self.audit_path, "reapproval_churn_blocked", underlying=idea.underlying,
+                          decision_id=resolved.decision_id, changes=_changes2)
+                    approval.post_proposal(self.slack_token, self.slack_channel,
+                        f":no_entry: *{idea.underlying}* changed again after reapproval — nothing submitted.")
+                    continue
+                fresh = fresh2
+            resolved = fresh
+
+            # Adjacent marker stat: if a halt flips after refresh, _submit_order also refuses.
+            _marker_now = self._entry_markers_clear()
+            if not _marker_now.allowed:
+                audit(self.audit_path, "marker_blocked_submit", underlying=idea.underlying,
+                      decision_id=resolved.decision_id, reasons=_marker_now.reasons)
                 continue
             try:
                 status, reasons = await self._submit_order(resolved)
@@ -982,7 +1038,8 @@ class Trader:
                         f"was NOT placed.\n{reason}")
                 else:
                     audit(self.audit_path, "executed", underlying=idea.underlying,
-                          order=order_summary(resolved), status=status)
+                          order=order_summary(resolved), status=status,
+                          decision_id=resolved.decision_id)
                     # DECISION CAPTURE (v2, record-only): the full DECISION -> ENTRY context for an
                     # ENTERED trade -- raw strategist reasoning, EVERY candidate + conviction, the
                     # chosen idea, the risk GateDecision + bound caps, construction adjustments,
@@ -1004,7 +1061,8 @@ class Trader:
                             sizing={"per_trade_cap": plan.gate.per_trade_cap,
                                     "net_liq": pot.net_liq, "available_funds": pot.available_funds,
                                     "qty": resolved.qty, "limit": resolved.limit},
-                            extra={"order": order_summary(resolved), "status": status})
+                            extra={"order": order_summary(resolved), "status": status,
+                                   "decision_id": resolved.decision_id})
                     except Exception as _dce:
                         print(f"[WARN] capture_decision failed (continuing): {_dce}")
                     # GUARDRAIL 1: append to the FRESH entry book so later ideas THIS cycle see this
@@ -1024,6 +1082,60 @@ class Trader:
             except Exception as e:
                 audit(self.audit_path, "submit_error", underlying=idea.underlying, error=str(e))
 
+
+    async def _refresh_approved_entry(self, idea, original: ResolvedOrder, baseline: float):
+        """Rebuild and hard-gate an approved BUY from current broker state.
+
+        Returns ``(fresh_order, fresh_pot, reasons)``. Any exception becomes a blocking reason;
+        this method never converts unavailable risk data into approval.
+        """
+        reasons = list(self._entry_markers_clear().reasons)
+        fresh = None
+        pot = None
+        try:
+            pot = await get_pot_snapshot(self.ib_conn.ib)
+            reasons.extend(entry_safety.account_snapshot_valid(pot).reasons)
+            open_positions = await self._open_positions()
+            gate = plan_idea(
+                idea, net_liq=pot.net_liq, available_funds=pot.available_funds,
+                positions=open_positions, baseline=baseline,
+                approved_names=self.approved_names, limits=self.limits,
+                regime=self._regime).gate
+            if not gate.approved:
+                reasons.extend(gate.reasons)
+            raw_positions = await self.ib_conn.get_positions()
+            # Slow/error-prone earnings lookup happens before the final contract request so the
+            # NBBO timestamp remains tight at the money boundary.
+            days = await asyncio.to_thread(research.days_to_earnings, idea.underlying)
+            if days is None:
+                reasons.append("earnings date unavailable at approval time")
+            fresh = await self._resolve_order(idea, gate.per_trade_cap)
+            if fresh is None:
+                reasons.append("fresh contract/NBBO resolution returned no order")
+            else:
+                fresh.decision_id = original.decision_id
+                fresh.conviction = original.conviction
+                fresh.thesis = original.thesis
+                fresh.tp_pct = original.tp_pct
+                fresh.sl_pct = original.sl_pct
+                fresh.technical_card = getattr(original, "technical_card", None)
+                reasons.extend(entry_safety.nbbo_valid(fresh).reasons)
+                ok_budget, budget_reasons = construction.check_budget(
+                    entry_safety.executable_price(fresh) * 100 * fresh.qty,
+                    fresh.dte, pot.net_liq,
+                    construction.open_book(raw_positions, self.journal_path), self.construction)
+                if not ok_budget:
+                    reasons.extend(budget_reasons)
+                if days is not None:
+                    entry_date = datetime.now(timezone.utc).date()
+                    earnings_date = entry_date + timedelta(days=days)
+                    earn_ok, earn_reason = construction.earnings_ok(
+                        entry_date, fresh.expiry, earnings_date, self.construction)
+                    if not earn_ok:
+                        reasons.append(earn_reason)
+        except Exception as exc:
+            reasons.append(f"fresh account/contract/NBBO/risk/earnings gate failed: {exc}")
+        return fresh, pot, tuple(dict.fromkeys(str(r) for r in reasons if r))
 
     def _drain_reload_ideas(self, today: str) -> List[TradeIdea]:
         """Drain ready reload tickets into synthetic TradeIdea suggestions (2026-07-03).
@@ -1102,6 +1214,7 @@ class Trader:
         best, best_err, best_greeks = None, 1e9, None
         best_bidask = (None, None)   # bid/ask of the winning long leg (record-only liquidity capture)
         by_strike = {}   # strike -> (mid, contract), for spread short-leg selection
+        quote_by_strike = {}  # strike -> (bid, ask), needed for executable combo NBBO
         for tk in tickers:
             # -1 SENTINEL GUARD (2026-07-03): IB reports "no quote" as None/NaN/-1.0. The old
             # `tk.bid and tk.ask` let a -1 bid/ask through (truthy) and averaged it into a bogus mid;
@@ -1116,6 +1229,7 @@ class Trader:
             k = float(getattr(tk.contract, "strike", 0) or 0)
             if k:
                 by_strike[k] = (mid, tk.contract)
+                quote_by_strike[k] = (getattr(tk, "bid", None), getattr(tk, "ask", None))
             g = getattr(tk, "modelGreeks", None) or getattr(tk, "lastGreeks", None)
             if g and g.delta is not None:
                 err = abs(abs(g.delta) - tgt_delta)
@@ -1128,6 +1242,7 @@ class Trader:
             k_near = min(by_strike, key=lambda k: abs(k - spot))
             if abs(k_near - spot) <= cons.strike_near_spot_pct * spot:
                 best = (by_strike[k_near][1], by_strike[k_near][0])
+                best_bidask = quote_by_strike.get(k_near, (None, None))
         if not best:
             return None
         contract, mid = best
@@ -1142,7 +1257,8 @@ class Trader:
         enrich = dict(spot=float(spot or 0.0),
                       entry_delta=float(abs(best_greeks.delta)) if (best_greeks and best_greeks.delta is not None) else 0.0,
                       entry_iv=float(atm_iv) if (atm_iv and atm_iv == atm_iv) else 0.0,
-                      dte=int(chosen_dte), dte_adjusted=bool(dte_adjusted))
+                      dte=int(chosen_dte), dte_adjusted=bool(dte_adjusted),
+                      quote_observed_at=time.monotonic())
         # FULL GREEKS + LIQUIDITY capture (v2, record-only). Best-effort off the already-fetched
         # ticker/greeks -- no extra IBKR round-trip. Never raises into the resolve path.
         try:
@@ -1185,6 +1301,21 @@ class Trader:
                 return None
             short_strike, net = pick
             short_contract = by_strike[short_strike][1]
+            # Synthetic executable combo NBBO for a BUY debit: sell the short at its bid and buy
+            # the long at its ask.  The reverse legs form the combo bid.  Missing/one-sided quotes
+            # remain zero and the final fail-closed NBBO gate refuses submission.
+            try:
+                _lb, _la = (float(x) for x in best_bidask)
+                _sb, _sa = (float(x) for x in quote_by_strike[short_strike])
+                enrich["entry_bid"] = round(_lb - _sa, 4)
+                enrich["entry_ask"] = round(_la - _sb, 4)
+                _net_mid = (enrich["entry_bid"] + enrich["entry_ask"]) / 2
+                enrich["entry_spread_pct"] = (
+                    round((enrich["entry_ask"] - enrich["entry_bid"]) / _net_mid * 100, 2)
+                    if _net_mid > 0 and enrich["entry_ask"] >= enrich["entry_bid"] else 0.0)
+            except (TypeError, ValueError, KeyError):
+                enrich["entry_bid"] = enrich["entry_ask"] = 0.0
+                enrich["entry_spread_pct"] = 0.0
             # HARD-REJECT (2026-07-03): if a single spread already exceeds the per-trade cap, reject
             # instead of clamping qty to 1 and shipping an order over the risk cap.
             qty = size_within_cap(net * 100, idea.est_debit_usd, per_trade_cap)
@@ -1208,24 +1339,43 @@ class Trader:
                              qty, round(mid, 2), contract, **enrich)
 
     async def _submit_order(self, r: ResolvedOrder):
-        """Place the entry as a MARKETABLE LIMIT (BUY at the resolved price + a small buffer), not a
-        raw MKT (2026-07-03). A raw MKT on an illiquid/wide option book can fill at a runaway price;
-        a marketable limit at (resolved price * (1 + entry_limit_buffer_pct)) still crosses the book
-        and fills, but CAPS the price paid. Wait for a decisive IBKR status and return
+        """Serialize BUY placement against the fast protective-exit mutation loop."""
+        lock = self.broker_order_lock
+        if lock is None:
+            return await self._submit_order_unlocked(r)
+        async with lock:
+            return await self._submit_order_unlocked(r)
+
+    async def _submit_order_unlocked(self, r: ResolvedOrder):
+        """Place the entry as a MARKETABLE LIMIT at the freshly observed executable ask, never raw
+        MKT or a stale mid-plus-buffer. Wait for a decisive IBKR status and return
         (status, [reason msgs]); journal only if it was NOT rejected, so a bounced order never
         pollutes the exit-managed book."""
         from exitmgr.ibkr import Order
-        _buf = 1.0 + max(0.0, float(getattr(self, "entry_limit_buffer_pct", 0.05)))
-        _lmt = round(float(r.limit) * _buf, 2)
+        marker_gate = self._entry_markers_clear()
+        if not marker_gate.allowed:
+            raise RuntimeError("entry markers block submit: " + "; ".join(marker_gate.reasons))
+        quote_gate = entry_safety.nbbo_valid(r)
+        if not quote_gate.allowed:
+            raise RuntimeError("fresh NBBO blocks submit: " + "; ".join(quote_gate.reasons))
+        # Submission is bound to the final, two-sided reqTickersAsync observation.  Using a stale
+        # mid + percentage buffer can still rest below a wide ask; crossing at the observed ask is
+        # both executable and capped.  Callers must run nbbo_valid immediately beforehand.
+        _lmt = entry_safety.executable_price(r)
         order = Order(action="BUY", orderType="LMT", lmtPrice=_lmt, totalQuantity=r.qty, tif="DAY")
+        order.orderRef = entry_safety.decision_order_ref(r.decision_id)
         if r.short_contract is not None:
             # spreads trade as ONE combo order -- legs can never fill/close independently
             combo = self.ib_conn.create_combo_contract(
                 r.underlying,
                 [(r.contract.conId, "BUY"), (r.short_contract.conId, "SELL")])
-            trade = self.ib_conn.ib.placeOrder(combo, order)
+            from exitmgr.order_lock import order_mutation_lock
+            with order_mutation_lock():
+                trade = self.ib_conn.ib.placeOrder(combo, order)
         else:
-            trade = self.ib_conn.ib.placeOrder(r.contract, order)
+            from exitmgr.order_lock import order_mutation_lock
+            with order_mutation_lock():
+                trade = self.ib_conn.ib.placeOrder(r.contract, order)
         live = {"Filled", "Submitted", "PreSubmitted"}
         dead = {"Cancelled", "ApiCancelled", "Inactive"}
         for _ in range(24):  # up to ~12s for IBKR to ACK or REJECT
@@ -1255,6 +1405,8 @@ class Trader:
             _entry_comm = commission_from_trade(trade) if status == "Filled" else None
             _efd, _eslip, _eslip_pct = compute_entry_basis(_est_debit, _afp_val, r.qty)
             fill = {
+                "decision_id": r.decision_id,
+                "order_ref": getattr(trade.order, "orderRef", None),
                 "order_id": getattr(trade.order, "orderId", None),
                 "order_status": status,
                 "avg_fill_price": _afp_val,
@@ -1286,6 +1438,8 @@ class Trader:
             "stop_pct": (getattr(r, "sl_pct", 0.0) or None),           # clamped, default 30
             "conviction": getattr(r, "conviction", -1.0),
             "thesis": getattr(r, "thesis", ""),
+            "decision_id": getattr(r, "decision_id", None),
+            "order_ref": entry_safety.decision_order_ref(r.decision_id),
             # entry-time technical_card (per-name indicators fed to the model at entry). ADDITIVE;
             # consumed by the exit manager's position view so a reload/continuation call sees the
             # ORIGINAL setup, not just live price. None when unavailable (older/mocked entries).

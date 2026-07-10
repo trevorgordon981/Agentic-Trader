@@ -45,6 +45,13 @@ def _trader(tmp_path, resolved):
                audit_path=str(tmp_path / "a.jsonl"), approve_timeout_s=60,
                construction_cfg=ConstructionConfig(earnings_blackout_enabled=True))
     t._resolve_order = AsyncMock(return_value=resolved)
+    resolved.entry_bid = 1.15
+    resolved.entry_ask = 1.25
+    resolved.quote_observed_at = __import__("time").monotonic()
+    resolved.decision_id = "decision-" + "a" * 32
+    t._refresh_approved_entry = AsyncMock(
+        side_effect=lambda idea, original, baseline: (
+            original, PotSnapshot(1010.0, 9000.0, 1010.0), ()))
     t._submit_order = AsyncMock(return_value=("Filled", []))
     return t
 

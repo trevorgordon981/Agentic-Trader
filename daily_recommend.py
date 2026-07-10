@@ -26,8 +26,8 @@ from exitmgr.account import get_pot_snapshot
 from exitmgr.connection import IBConnection
 from exitmgr.ibkr import Stock, Option, Order, pick_chain, strikes_near, underlying_price
 from exitmgr.strategist import propose, discover_names, propose_one, TradeIdea
-from exitmgr.trader import ResolvedOrder, order_summary, audit
-from exitmgr import approval, construction, research, trade_capture, risk
+from exitmgr.trader import ResolvedOrder, order_summary, audit, _trading_day
+from exitmgr import approval, construction, entry_safety, research, trade_capture, risk
 from exitmgr.config import ConstructionConfig, construction_from_dict
 from exitmgr.slate_lock import slate_active_guard
 from exitmgr.market import fetch_universe_quotes, usable_price
@@ -72,13 +72,13 @@ async def _open_book(ib_unused=None):
         return []
 
 
-async def _open_positions_for_risk():
+async def _open_positions_for_risk(positions=None):
     """List[risk.OpenPosition] for the concentration warning (gate H2) -- mirrors
     trader._open_positions EXACTLY: journaled NET debit (max loss) per long leg keyed by con_id
     (newest wins), gross long-leg value as the conservative fallback, SPY/QQQ/IWM flagged index.
     This is the SAME $ premium-at-risk basis risk.py #6/#6b sum. Best-effort: any hiccup yields []
     (the warning simply can't fire -- it never blocks a proposal)."""
-    positions = await CONN.get_positions()
+    positions = await CONN.get_positions() if positions is None else positions
     debits = {}
     p = Path(JOURNAL_PATH)
     if p.exists():
@@ -173,15 +173,18 @@ def _watch_entry_fills(placed_watch, token, audit_path):
             try:
                 with open(FILLS_PATH, "a") as f:
                     f.write(_j.dumps({"ts": datetime.utcnow().isoformat(), "event": "entry_fill",
+                                      "decision_id": w.get("decision_id"),
                                       "contract_id": getattr(w["r"].contract, "conId", None),
                                       "symbol": w["r"].underlying,
                                       "order_id": getattr(getattr(w["trade"], "order", None), "orderId", None),
+                                      "order_ref": getattr(getattr(w["trade"], "order", None), "orderRef", None),
                                       "status": status, "avg_fill_price": fill_px,
                                       "entry_commission": _late_comm,
                                       "quantity": w["r"].qty}) + "\n")
             except Exception as e:
                 print(f"[WARN] fills.log write failed: {e}")
             audit(audit_path, "entry_filled", underlying=w["r"].underlying,
+                  decision_id=w.get("decision_id"),
                   order_id=getattr(getattr(w["trade"], "order", None), "orderId", None),
                   avg_fill_price=fill_px)
             w["filled_logged"] = True
@@ -266,7 +269,9 @@ async def _resolve(ib, idea, available, net_liq=None):
     # already working, not a lottery ticket. The model's target_delta is clamped into the band.
     tgt_delta = construction.effective_delta(idea.target_delta, CONS)
     best, best_err, best_greeks = None, 1e9, None
+    best_bidask = (None, None)
     by_strike = {}
+    quote_by_strike = {}
     for tk in tickers:
         # -1 SENTINEL GUARD (2026-07-03): use market.usable_price so an IB -1.0/NaN "no quote"
         # sentinel on bid/ask/last can never leak into the mid (the old `tk.last or 0` let a -1
@@ -280,17 +285,20 @@ async def _resolve(ib, idea, available, net_liq=None):
         k = float(getattr(tk.contract, "strike", 0) or 0)
         if k:
             by_strike[k] = (mid, tk.contract)
+            quote_by_strike[k] = (getattr(tk, "bid", None), getattr(tk, "ask", None))
         g = getattr(tk, "modelGreeks", None) or getattr(tk, "lastGreeks", None)
         if g and g.delta is not None:
             err = abs(abs(g.delta) - tgt_delta)
             if err < best_err:
                 best, best_err, best_greeks = (tk.contract, mid), err, g
+                best_bidask = (getattr(tk, "bid", None), getattr(tk, "ask", None))
     if not best and by_strike and spot:
         # No greeks streaming -> conservative fallback (gate A3): nearest-to-spot priced
         # strike, only if within the near-spot band; else reject rather than guess.
         k_near = min(by_strike, key=lambda k: abs(k - spot))
         if abs(k_near - spot) <= CONS.strike_near_spot_pct * spot:
             best = (by_strike[k_near][1], by_strike[k_near][0])
+            best_bidask = quote_by_strike.get(k_near, (None, None))
     if not best:
         return None, "no priced strike (OPRA active?)"
     contract, mid = best
@@ -300,10 +308,22 @@ async def _resolve(ib, idea, available, net_liq=None):
     ok, why = construction.long_strike_ok(float(contract.strike), spot, right, chosen_dte, atm_iv, CONS)
     if not ok:
         return None, why
+    def _quote_value(value):
+        try:
+            value = float(value)
+            return value if value == value and value > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    _long_bid, _long_ask = (_quote_value(x) for x in best_bidask)
     enrich = dict(spot=float(spot or 0.0),
                   entry_delta=float(abs(best_greeks.delta)) if (best_greeks and best_greeks.delta is not None) else 0.0,
                   entry_iv=float(atm_iv) if (atm_iv and atm_iv == atm_iv) else 0.0,
-                  dte=int(chosen_dte), dte_adjusted=bool(dte_adjusted))
+                  dte=int(chosen_dte), dte_adjusted=bool(dte_adjusted),
+                  entry_bid=_long_bid, entry_ask=_long_ask,
+                  entry_spread_pct=(round((_long_ask - _long_bid) / mid * 100, 2)
+                                    if mid > 0 and _long_ask >= _long_bid > 0 else 0.0),
+                  quote_observed_at=time.monotonic())
 
     # DEBIT SPREAD: buy the delta-selected leg, sell a further-OTM same-type leg to cut the cost.
     if "spread" in (idea.structure or "").lower():
@@ -317,6 +337,17 @@ async def _resolve(ib, idea, available, net_liq=None):
         if pick:
             short_strike, net = pick
             short_contract = by_strike[short_strike][1]
+            _short_bid, _short_ask = (_quote_value(x) for x in quote_by_strike[short_strike])
+            if _long_bid > 0 and _long_ask > 0 and _short_bid > 0 and _short_ask > 0:
+                enrich["entry_bid"] = round(_long_bid - _short_ask, 4)
+                enrich["entry_ask"] = round(_long_ask - _short_bid, 4)
+                _net_mid = (enrich["entry_bid"] + enrich["entry_ask"]) / 2
+                enrich["entry_spread_pct"] = (
+                    round((enrich["entry_ask"] - enrich["entry_bid"]) / _net_mid * 100, 2)
+                    if _net_mid > 0 and enrich["entry_ask"] >= enrich["entry_bid"] else 0.0)
+            else:
+                enrich["entry_bid"] = enrich["entry_ask"] = 0.0
+                enrich["entry_spread_pct"] = 0.0
             # SYMMETRIC HARD-REJECT (2026-07-03 gap-fix): mirror the trader loop's size_within_cap
             # -- if even ONE spread contract exceeds the available cash-after-reserve budget, REJECT
             # the idea (it just isn't offered) instead of the old `max(1, ...)` that force-shipped
@@ -517,18 +548,23 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
     else:
         size_line = (f"~${cost:,.0f} (*{pct_pot:.0f}% of pot*, your {default_pct:.0%} default). "
                      f"Reply `full size` to use ~${deployable:,.0f} (keeps a 5% cash buffer).")
+    decision_id = entry_safety.new_decision_id()
+    resolved.decision_id = decision_id
     msg = (head + f"*Order:* `{order_summary(resolved)}`\n"
            f"{size_line} Max loss = the debit.\n"
            f"*Sell levels (auto):* take profit ~${tp_price:.2f} (+{tp_pct:.0f}%) | "
            f"stop ~${sl_price:.2f} (-{sl_pct:.0f}%)\n"
            f":point_down: *Tap :white_check_mark: to BUY*, or REPLY to tweak: `full size`, levels (`tp 60 stop 30`), "
-           f"direction (`flip` / `make it bearish`), or `just the call` / `make it a spread`. :x: to skip.")
+           f"direction (`flip` / `make it bearish`), or `just the call` / `make it a spread`. :x: to skip.\n"
+           f"_Decision ID: `{decision_id}` — approval expires in 5 minutes._")
     ts = approval.post_proposal(token, channel, msg)
     if ts:
-        pending.append((ts, resolved, tp_pct, sl_pct, idea, over_default))
+        pending.append((ts, resolved, tp_pct, sl_pct, idea, over_default,
+                        time.monotonic(), decision_id, 0))
         audit(audit_path, audit_event, underlying=idea.underlying,
               conviction=idea.conviction, order=order_summary(resolved),
-              profit_target_pct=tp_pct, stop_pct=sl_pct, over_default=over_default)
+              profit_target_pct=tp_pct, stop_pct=sl_pct, over_default=over_default,
+              decision_id=decision_id)
         # DECISION CAPTURE (v2, record-only): the full DECISION -> ENTRY context for a posted
         # slate idea -- raw strategist reasoning, EVERY candidate + conviction, the chosen idea,
         # construction (clamped tp/sl, dte adjust), regime, and the RAG/news/journal brief.
@@ -549,7 +585,8 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
                               "short_strike": resolved.short_strike},
                 sizing={"cost": cost, "pct_pot": pct_pot, "net_liq": pot.net_liq,
                         "available_funds": pot.available_funds},
-                extra={"label": label, "order": order_summary(resolved)})
+                extra={"label": label, "order": order_summary(resolved),
+                       "decision_id": decision_id})
         except Exception as _dce:
             print(f"[WARN] daily-slate capture_decision failed (continuing): {_dce}")
     return ts
@@ -562,14 +599,7 @@ async def run(args):
     ibc, tr = cfg.get("ib", {}), cfg.get("trading", {})
     CASH_BUFFER_PCT = float(tr.get("cash_buffer_pct", 0.05))  # keep this % of NetLiq liquid
     CONS = construction_from_dict(cfg.get("construction"))    # 2026-07-01 constructor-rework gates
-    # H2 concentration-warning caps -- loaded the SAME minimal way run_trader.py builds RiskLimits
-    # (max_single_name_agg_pct left at its 0.36 dataclass default, matching the trader). Empty
-    # sector_map or a non-positive cap makes the sector check a no-op (old configs unchanged).
-    _RISK_LIMITS = risk.RiskLimits(
-        max_sector_agg_pct=float(tr.get("max_sector_agg_pct", 0.25)),
-        sector_map={str(k).upper(): str(v) for k, v in (tr.get("sector_map", {}) or {}).items()},
-        pot_cap_usd=tr.get("pot_cap_usd", None),
-    )
+    _RISK_LIMITS = entry_safety.risk_limits_from_config(tr)
     ERROR_CHANNEL = tr.get("error_channel", "") or tr.get("alerts_channel", "")
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     channel = tr.get("slack_channel", "")
@@ -577,6 +607,15 @@ async def run(args):
     audit_path = tr.get("audit_path", "./audit.jsonl")
     journal_path = cfg.get("journal", {}).get("path", "./trades.log")
     JOURNAL_PATH = journal_path
+
+    # Entry stand-down is checked before any broker/model/network activity and again immediately
+    # before every placeOrder. Config/marker I/O errors block rather than silently clearing a halt.
+    _markers = entry_safety.entry_markers_clear(
+        config_path=args.config,
+        kill_switch_path=(cfg.get("kill_switch") or {}).get("path"))
+    if not _markers.allowed:
+        print("[BLOCKED] " + "; ".join(_markers.reasons))
+        return 2
 
     conn = IBConnection(host=ibc.get("host", "127.0.0.1"), port=ibc.get("port", 4001),
                         client_id=(getattr(args, "client_id", None) or CLIENT_ID),
@@ -688,7 +727,8 @@ async def run(args):
         pot = await get_pot_snapshot(ib)
         default_pct = float(tr.get("max_trade_pct", 0.12))     # conservative default slice of the pot
         cons_budget = min(pot.available_funds, default_pct * pot.net_liq)
-        pending = []  # (ts, ResolvedOrder, tp_pct, sl_pct, idea, over_default)
+        # (ts, resolved, tp, sl, idea, over_default, posted_monotonic, decision_id, revision)
+        pending = []
         placed_watch = []  # fill-verification watch for orders placed this session (2026-07-01)
 
         # Book review + funding rotation (2026-06-18): synopsis of hold/trim/sell per open position,
@@ -773,7 +813,7 @@ async def run(args):
                                              label="Added & suggested", audit_event="add_suggest_posted",
                                              candidates=[idea], raw_strategist=_one_raw, cot=_one_cot,
                                              market_context=brief, technical_card=_slate_price_stats)
-            for ts, r, tp_pct, sl_pct, idea, over_default in pending:
+            for ts, r, tp_pct, sl_pct, idea, over_default, posted_at, decision_id, revision in pending:
                 if ts in done:
                     continue
                 rxn = approval._api("reactions.get", token, {"channel": channel, "timestamp": ts}, http_post=False)
@@ -798,86 +838,283 @@ async def run(args):
                     qty_ovr.update(approval.parse_qty_override(m.get("text", "")))
                     if approval.parse_size_override(m.get("text", "")):
                         full_size = True
+                # C5 (2026-07-09): a BUY fires ONLY on an EXPLICIT approve (✅ reaction / "approve"
+                # reply). A bare TP/SL/qty/structure tweak modifies the PENDING order but must NOT by
+                # itself place the trade -- previously any tweak set approved=True and bought. The
+                # tweak replies persist in the thread and are re-parsed every poll, so they are still
+                # applied to the order once the explicit approve lands.
                 approved = (approval.decision_from_reactions(reactions, approver_ids) == "approve"
-                            or approval.decision_from_replies(replies, approver_ids, ts) == "approve"
-                            or ov_tp or ov_sl or ovr or full_size or qty_ovr)
+                            or approval.decision_from_replies(replies, approver_ids, ts) == "approve")
                 if not approved:
                     continue
-                # direction/structure change OR a 'full size' opt-in -> re-resolve before placing.
-                # Budget = full available funds only when opted in (or it was already an over-default
-                # full-size proposal); otherwise the conservative default slice.
-                if ovr or full_size:
-                    from dataclasses import replace as _replace
-                    nd = idea.direction
-                    if ovr.get("direction") == "flip":
-                        nd = "bearish" if idea.direction == "bullish" else "bullish"
-                    elif ovr.get("direction") in ("bullish", "bearish"):
-                        nd = ovr["direction"]
-                    ns = idea.structure
-                    if ovr.get("structure") == "single":
-                        ns = "long put" if nd == "bearish" else "long call"
-                    elif ovr.get("structure") == "spread":
-                        ns = "put debit spread" if nd == "bearish" else "call debit spread"
-                    snap = await get_pot_snapshot(ib)
-                    _dep = deployable_funds(snap)  # full size still keeps the 5% cash buffer
-                    _mp = construction.max_premium_budget(snap.net_liq, CONS)
-                    if _mp > 0:
-                        _dep = min(_dep, _mp)  # 15%-of-net-liq premium cap binds even on 'full size'
-                    avail = (_dep if (full_size or over_default)
-                             else min(_dep, default_pct * snap.net_liq))
-                    r2, why2 = await _resolve(ib, _replace(idea, direction=nd, structure=ns), avail, net_liq=snap.net_liq)
-                    if r2 is not None:
-                        r = r2
-                    else:
-                        approval.post_proposal(token, channel,
-                            f":warning: couldn't build your override ({why2}) — placing the original `{order_summary(r)}`")
-                # explicit position-size override ("1 contract", "half size") -> set qty on the resolved order
-                if qty_ovr:
-                    from dataclasses import replace as _replace
-                    newq = qty_ovr["contracts"] if "contracts" in qty_ovr else max(1, round(r.qty * qty_ovr["fraction"]))
-                    snap2 = await get_pot_snapshot(ib)
-                    if r.limit * 100 * newq > snap2.available_funds + 1e-6:
-                        affordable = max(1, int(snap2.available_funds // (r.limit * 100)))
-                        approval.post_proposal(token, channel,
-                            f":warning: {newq}x ~${r.limit*100*newq:,.0f} > available ${snap2.available_funds:,.0f} — placing {affordable}x instead.")
-                        newq = affordable
-                    _mp2 = construction.max_premium_budget(snap2.net_liq, CONS)
-                    if _mp2 > 0 and r.limit * 100 * newq > _mp2 + 1e-6:
-                        capq = max(1, int(_mp2 // (r.limit * 100)))
-                        approval.post_proposal(token, channel,
-                            f":warning: {newq}x ~${r.limit*100*newq:,.0f} exceeds the {CONS.max_premium_pct:.0%}-of-net-liq "
-                            f"premium cap (${_mp2:,.0f}) — placing {capq}x instead.")
-                        newq = capq
-                    if newq != r.qty:
-                        r = _replace(r, qty=newq)
-                eff_tp = max(20.0, min(500.0, ov_tp)) if ov_tp else tp_pct
-                eff_sl = max(10.0, min(90.0, ov_sl)) if ov_sl else sl_pct
-                # FINAL BUDGET RE-CHECK (2026-07-01): an approval can land hours after posting,
-                # so re-check deployed premium + decay against the CURRENT book before spending.
-                try:
-                    _snapf = await get_pot_snapshot(ib)
-                    okf, whyf = construction.check_budget(r.limit * 100 * r.qty, r.dte,
-                                                          _snapf.net_liq, await _open_book(), CONS)
-                except Exception as _be:
-                    okf, whyf = True, []
-                    print(f"[WARN] final budget re-check skipped ({_be})")
-                if not okf:
+                _age = entry_safety.approval_expired(posted_at)
+                if not _age.allowed:
                     approval.post_proposal(token, channel,
-                        f":no_entry: *{r.underlying}* `{order_summary(r)}` NOT placed — budget gate at "
-                        f"approval time: " + "; ".join(whyf))
-                    audit(audit_path, "budget_rejected_at_approval", underlying=r.underlying,
-                          order=order_summary(r), reasons=whyf)
+                        f":hourglass: Approval expired — *{r.underlying}* was NOT placed. "
+                        "Generate a fresh slate to approve a current quote.")
+                    audit(audit_path, "approval_expired", underlying=r.underlying,
+                          decision_id=decision_id, reasons=_age.reasons)
                     done.add(ts)
                     continue
-                # Entries are MARKET orders -- these options do not stream bid/ask, so a LMT
-                # rests unfilled (the 6/12 IWM lesson). Spreads go MKT on the BAG combo below.
-                order = Order(action="BUY", orderType="MKT", totalQuantity=r.qty, tif="DAY")
+
+                # Always reconstruct the effective idea and re-resolve its contract from a new
+                # chain/NBBO/account snapshot. Overrides never fall back to the stale original.
+                from dataclasses import replace as _replace
+                nd = idea.direction
+                if ovr.get("direction") == "flip":
+                    nd = "bearish" if idea.direction == "bullish" else "bullish"
+                elif ovr.get("direction") in ("bullish", "bearish"):
+                    nd = ovr["direction"]
+                ns = idea.structure
+                if ovr.get("structure") == "single":
+                    ns = "long put" if nd == "bearish" else "long call"
+                elif ovr.get("structure") == "spread":
+                    ns = "put debit spread" if nd == "bearish" else "call debit spread"
+                effective_idea = _replace(idea, direction=nd, structure=ns)
+
+                _block_reasons = []
+                try:
+                    _markers = entry_safety.entry_markers_clear(
+                        config_path=args.config,
+                        kill_switch_path=(cfg.get("kill_switch") or {}).get("path"))
+                    _block_reasons.extend(_markers.reasons)
+                    snap = await get_pot_snapshot(ib)
+                    _acct = entry_safety.account_snapshot_valid(snap)
+                    _block_reasons.extend(_acct.reasons)
+                except Exception as _account_error:
+                    snap = None
+                    _block_reasons.append(f"fresh account/stand-down check failed: {_account_error}")
+                if _block_reasons:
+                    approval.post_proposal(token, channel,
+                        f":no_entry: *{r.underlying}* NOT placed — final safety gate: "
+                        + "; ".join(_block_reasons))
+                    audit(audit_path, "final_entry_gate_blocked", underlying=r.underlying,
+                          decision_id=decision_id, reasons=_block_reasons)
+                    done.add(ts)
+                    continue
+
+                _dep = deployable_funds(snap)
+                _mp = construction.max_premium_budget(snap.net_liq, CONS)
+                if _mp > 0:
+                    _dep = min(_dep, _mp)
+                avail = (_dep if (full_size or over_default)
+                         else min(_dep, default_pct * snap.net_liq))
+                try:
+                    fresh_r, why2 = await _resolve(
+                        ib, effective_idea, avail, net_liq=snap.net_liq)
+                except Exception as _resolve_error:
+                    fresh_r, why2 = None, f"fresh contract/NBBO resolution failed: {_resolve_error}"
+                if fresh_r is None:
+                    approval.post_proposal(token, channel,
+                        f":no_entry: *{r.underlying}* NOT placed — {why2}")
+                    audit(audit_path, "fresh_resolve_blocked", underlying=r.underlying,
+                          decision_id=decision_id, reason=why2)
+                    done.add(ts)
+                    continue
+                fresh_r.decision_id = decision_id
+                # explicit position-size override ("1 contract", "half size") -> set qty on the resolved order
+                if qty_ovr:
+                    newq = (qty_ovr["contracts"] if "contracts" in qty_ovr
+                            else max(1, round(fresh_r.qty * qty_ovr["fraction"])))
+                    _unit_cost = entry_safety.executable_price(fresh_r) * 100
+                    if _unit_cost * newq > snap.available_funds + 1e-6:
+                        # C4 (2026-07-09): floor-divide -- if even ONE contract does not fit, REFUSE
+                        # the override rather than silently shipping the old max(1, ...) = 1 contract
+                        # that itself blows the budget.
+                        affordable = int(snap.available_funds // _unit_cost)
+                        if affordable < 1:
+                            approval.post_proposal(token, channel,
+                                f":no_entry: even 1 contract (~${_unit_cost:,.0f}) exceeds available "
+                                f"funds ${snap.available_funds:,.0f} — not placing.")
+                            audit(audit_path, "qty_override_refused_funds", underlying=fresh_r.underlying,
+                                  order=order_summary(fresh_r), available=snap.available_funds,
+                                  decision_id=decision_id)
+                            done.add(ts)
+                            continue
+                        approval.post_proposal(token, channel,
+                            f":warning: {newq}x ~${_unit_cost*newq:,.0f} > available ${snap.available_funds:,.0f} — revised to {affordable}x.")
+                        newq = affordable
+                    _mp2 = construction.max_premium_budget(snap.net_liq, CONS)
+                    if _mp2 > 0 and _unit_cost * newq > _mp2 + 1e-6:
+                        # C4: same refuse-don't-clamp-to-1 rule against the premium cap.
+                        capq = int(_mp2 // _unit_cost)
+                        if capq < 1:
+                            approval.post_proposal(token, channel,
+                                f":no_entry: even 1 contract (~${_unit_cost:,.0f}) exceeds the "
+                                f"{CONS.max_premium_pct:.0%}-of-net-liq premium cap (${_mp2:,.0f}) — not placing.")
+                            audit(audit_path, "qty_override_refused_premium_cap", underlying=fresh_r.underlying,
+                                  order=order_summary(fresh_r), premium_cap=_mp2,
+                                  decision_id=decision_id)
+                            done.add(ts)
+                            continue
+                        approval.post_proposal(token, channel,
+                            f":warning: {newq}x ~${_unit_cost*newq:,.0f} exceeds the {CONS.max_premium_pct:.0%}-of-net-liq "
+                            f"premium cap (${_mp2:,.0f}) — revised to {capq}x.")
+                        newq = capq
+                    if newq != fresh_r.qty:
+                        fresh_r = _replace(fresh_r, qty=newq)
+                        fresh_r.decision_id = decision_id
+                eff_tp = max(20.0, min(500.0, ov_tp)) if ov_tp else tp_pct
+                # M4 (2026-07-09): a manual SL override may only TIGHTEN the stop (smaller max-loss
+                # %), never LOOSEN it past the 30% default. Ceiling 30 (was 90); floor 10.
+                eff_sl = max(10.0, min(30.0, ov_sl)) if ov_sl else sl_pct
+                # Full fail-closed gate on the refreshed account, open book, universe,
+                # concentration, daily breaker, construction budget, earnings and two-sided NBBO.
+                try:
+                    _positions = await CONN.get_positions()
+                    _risk_positions = await _open_positions_for_risk(_positions)
+                    _baseline_path = Path(args.config).resolve().parent / tr.get("baseline_path", "./day_baseline.json")
+                    _baseline = entry_safety.day_start_value(_baseline_path, _trading_day())
+                    if isinstance(_baseline, entry_safety.SafetyResult):
+                        _block_reasons.extend(_baseline.reasons)
+                    _nbbo = entry_safety.nbbo_valid(fresh_r)
+                    _block_reasons.extend(_nbbo.reasons)
+                    _cost = entry_safety.executable_price(fresh_r) * fresh_r.qty * 100
+                    _gate = risk.evaluate_trade(
+                        risk.ProposedTrade(
+                            underlying=fresh_r.underlying, notional=_cost,
+                            is_index=bool(effective_idea.is_index),
+                            conviction=int(getattr(effective_idea, "conviction", 1)),
+                            is_long=(fresh_r.right == "C"),
+                            profit_target_pct=eff_tp, stop_pct=eff_sl),
+                        net_liq=snap.net_liq, available_funds=snap.available_funds,
+                        open_positions=_risk_positions,
+                        pot_day_start=(_baseline if not isinstance(_baseline, entry_safety.SafetyResult)
+                                       else 0.0),
+                        approved_names={str(n).upper() for n in tr.get("approved_names", [])},
+                        limits=_RISK_LIMITS)
+                    if not _gate.approved:
+                        _block_reasons.extend(_gate.reasons)
+                    okf, whyf = construction.check_budget(
+                        _cost, fresh_r.dte, snap.net_liq,
+                        construction.open_book(_positions, JOURNAL_PATH), CONS)
+                    if not okf:
+                        _block_reasons.extend(whyf)
+                    _edays_final = await asyncio.to_thread(
+                        research.days_to_earnings, fresh_r.underlying)
+                    if _edays_final is None:
+                        _block_reasons.append("earnings date unavailable at approval time")
+                    else:
+                        _entry_final = datetime.now(timezone.utc).date()
+                        _earn_final = _entry_final + timedelta(days=_edays_final)
+                        _earn_ok, _earn_why = construction.earnings_ok(
+                            _entry_final, fresh_r.expiry, _earn_final, CONS)
+                        if not _earn_ok:
+                            _block_reasons.append(_earn_why)
+                except Exception as _be:
+                    _block_reasons.append(f"final risk/NBBO/earnings gate failed: {_be}")
+                if _block_reasons:
+                    approval.post_proposal(token, channel,
+                        f":no_entry: *{fresh_r.underlying}* `{order_summary(fresh_r)}` NOT placed — "
+                        "final hard gate: " + "; ".join(_block_reasons))
+                    audit(audit_path, "final_entry_gate_blocked", underlying=fresh_r.underlying,
+                          order=order_summary(fresh_r), decision_id=decision_id,
+                          reasons=_block_reasons)
+                    done.add(ts)
+                    continue
+
+                # The earnings/account/book checks above may take long enough to stale the first
+                # refresh. Request the exact chain/NBBO again as the final network read, then rerun
+                # the pure dollar gates against that executable ask.
+                try:
+                    _latest_r, _latest_why = await _resolve(
+                        ib, effective_idea, avail, net_liq=snap.net_liq)
+                    if _latest_r is None:
+                        raise RuntimeError(_latest_why or "final NBBO refresh returned no order")
+                    if qty_ovr:
+                        _latest_r = _replace(_latest_r, qty=fresh_r.qty)
+                    _latest_r.decision_id = decision_id
+                    _latest_nbbo = entry_safety.nbbo_valid(_latest_r)
+                    if not _latest_nbbo.allowed:
+                        raise RuntimeError("; ".join(_latest_nbbo.reasons))
+                    _latest_cost = entry_safety.executable_price(_latest_r) * 100 * _latest_r.qty
+                    _latest_gate = risk.evaluate_trade(
+                        risk.ProposedTrade(
+                            underlying=_latest_r.underlying, notional=_latest_cost,
+                            is_index=bool(effective_idea.is_index),
+                            conviction=int(getattr(effective_idea, "conviction", 1)),
+                            is_long=(_latest_r.right == "C"),
+                            profit_target_pct=eff_tp, stop_pct=eff_sl),
+                        net_liq=snap.net_liq, available_funds=snap.available_funds,
+                        open_positions=_risk_positions,
+                        pot_day_start=_baseline,
+                        approved_names={str(n).upper() for n in tr.get("approved_names", [])},
+                        limits=_RISK_LIMITS)
+                    if not _latest_gate.approved:
+                        raise RuntimeError("; ".join(_latest_gate.reasons))
+                    _latest_budget, _latest_budget_reasons = construction.check_budget(
+                        _latest_cost, _latest_r.dte, snap.net_liq,
+                        construction.open_book(_positions, JOURNAL_PATH), CONS)
+                    if not _latest_budget:
+                        raise RuntimeError("; ".join(_latest_budget_reasons))
+                    fresh_r = _latest_r
+                except Exception as _latest_error:
+                    approval.post_proposal(token, channel,
+                        f":no_entry: *{fresh_r.underlying}* NOT placed — final NBBO refresh/gate: {_latest_error}")
+                    audit(audit_path, "final_nbbo_gate_blocked", decision_id=decision_id,
+                          underlying=fresh_r.underlying, error=str(_latest_error))
+                    done.add(ts)
+                    continue
+
+                _changes = list(entry_safety.material_changes(r, fresh_r))
+                if revision == 0 and (ovr or full_size or qty_ovr or ov_tp or ov_sl):
+                    _changes.append("human override changed approved terms")
+                if _changes:
+                    if revision >= 2:
+                        approval.post_proposal(token, channel,
+                            f":no_entry: *{fresh_r.underlying}* kept moving after two refreshes — "
+                            "nothing placed; generate a new slate.")
+                        audit(audit_path, "reapproval_churn_blocked", decision_id=decision_id,
+                              underlying=fresh_r.underlying, changes=_changes)
+                        done.add(ts)
+                        continue
+                    _remsg = (f":repeat: *Reapproval required — {fresh_r.underlying}*\n"
+                              f"Refreshed order: `{order_summary(fresh_r)}`\n"
+                              f"Executable BUY limit: *${entry_safety.executable_price(fresh_r):.2f}*\n"
+                              f"Changed: {'; '.join(_changes)}\n"
+                              f":point_down: Tap :white_check_mark: again within 5 minutes to approve these exact terms.\n"
+                              f"_Decision ID: `{decision_id}`, revision {revision + 1}_")
+                    _new_ts = approval.post_proposal(token, channel, _remsg)
+                    done.add(ts)
+                    if _new_ts:
+                        pending.append((_new_ts, fresh_r, eff_tp, eff_sl, effective_idea,
+                                        False, time.monotonic(), decision_id, revision + 1))
+                    audit(audit_path, "reapproval_required", decision_id=decision_id,
+                          underlying=fresh_r.underlying, changes=_changes,
+                          revision=revision + 1)
+                    continue
+
+                r = fresh_r
+                # Final marker stat is adjacent to the only BUY placeOrder call: a halt flipped
+                # during account/quote/risk I/O cannot slip through.
+                _markers_now = entry_safety.entry_markers_clear(
+                    config_path=args.config,
+                    kill_switch_path=(cfg.get("kill_switch") or {}).get("path"))
+                if not _markers_now.allowed:
+                    audit(audit_path, "marker_blocked_submit", decision_id=decision_id,
+                          reasons=_markers_now.reasons)
+                    done.add(ts)
+                    continue
+                _quote_now = entry_safety.nbbo_valid(r)
+                if not _quote_now.allowed:
+                    audit(audit_path, "stale_nbbo_blocked_submit", decision_id=decision_id,
+                          reasons=_quote_now.reasons)
+                    done.add(ts)
+                    continue
+                _lmt = entry_safety.executable_price(r)
+                order = Order(action="BUY", orderType="LMT", lmtPrice=_lmt,
+                              totalQuantity=r.qty, tif="DAY")
+                order.orderRef = entry_safety.decision_order_ref(decision_id)
                 if r.short_contract is not None:
                     combo = conn.create_combo_contract(
                         r.underlying, [(r.contract.conId, "BUY"), (r.short_contract.conId, "SELL")])
-                    trade = ib.placeOrder(combo, order)
+                    from exitmgr.order_lock import order_mutation_lock
+                    with order_mutation_lock():
+                        trade = ib.placeOrder(combo, order)
                 else:
-                    trade = ib.placeOrder(r.contract, order)
+                    from exitmgr.order_lock import order_mutation_lock
+                    with order_mutation_lock():
+                        trade = ib.placeOrder(r.contract, order)
                 # Wait for IBKR to ACK (live) or REJECT — never assume it landed (Error 201 etc.).
                 _reject_states = {"Cancelled", "ApiCancelled", "Inactive"}
                 _live_states = {"PreSubmitted", "Submitted", "Filled"}
@@ -927,7 +1164,9 @@ async def run(args):
                                             "short_strike": r.short_strike,
                                             "width": abs(r.short_strike - r.strike)}}
                                 if r.short_contract is not None else {})
-                    f.write(_j.dumps({"ts": datetime.utcnow().isoformat(), "contract_id": r.contract.conId,
+                    f.write(_j.dumps({"ts": datetime.utcnow().isoformat(),
+                                      "decision_id": decision_id,
+                                      "contract_id": r.contract.conId,
                                       "symbol": r.underlying, "right": r.right, "expiry": r.expiry,
                                       "strike": r.strike, "quantity": r.qty,
                                       "debit": round(r.limit * 100 * r.qty, 2),
@@ -936,6 +1175,7 @@ async def run(args):
                                       "thesis": _thesis_str,
                                       # 2026-07-01 ADDITIVE fields: fill verification + construction annotations
                                       "order_id": getattr(trade.order, "orderId", None),
+                                      "order_ref": getattr(trade.order, "orderRef", None),
                                       "order_status": st,
                                       "avg_fill_price": _fill_px,
                                       "fill_ts": (datetime.utcnow().isoformat() if st == "Filled" else None),
@@ -951,11 +1191,13 @@ async def run(args):
                                       "dte_adjusted": bool(r.dte_adjusted),
                                       **spread_j}, default=str) + "\n")
                 placed_watch.append({"trade": trade, "r": r, "t0": time.monotonic(),
+                                     "decision_id": decision_id,
                                      "alerted": False, "filled_logged": st == "Filled"})
                 tag = " _(your levels)_" if (ov_tp or ov_sl) else ""
                 approval.post_proposal(token, channel,
                     f":white_check_mark: *Placed* `{order_summary(r)}` — exits +{eff_tp:.0f}% / -{eff_sl:.0f}%{tag}")
                 audit(audit_path, "daily_rec_executed", underlying=r.underlying, order=order_summary(r),
+                      decision_id=decision_id,
                       profit_target_pct=eff_tp, stop_pct=eff_sl)
                 done.add(ts)
             # FILL VERIFICATION sweep (2026-07-01): confirm fills of placed orders into
@@ -971,9 +1213,11 @@ async def run(args):
                     with open(FILLS_PATH, "a") as f:
                         f.write(_j.dumps({"ts": datetime.utcnow().isoformat(),
                                           "event": "entry_fill_final",
+                                          "decision_id": w.get("decision_id"),
                                           "contract_id": getattr(w["r"].contract, "conId", None),
                                           "symbol": w["r"].underlying,
                                           "order_id": getattr(getattr(w["trade"], "order", None), "orderId", None),
+                                          "order_ref": getattr(getattr(w["trade"], "order", None), "orderRef", None),
                                           "status": w["trade"].orderStatus.status,
                                           "note": "still unfilled when the slate watcher exited"}) + "\n")
                 except Exception as e:

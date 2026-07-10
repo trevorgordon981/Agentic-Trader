@@ -114,10 +114,11 @@ def test_index_candidate_exempt():
     assert not any("sector" in r for r in d.reasons), d.reasons
 
 
-def test_confident_relaxes_sector_cap():
-    # Like single-name-agg, a confident override (conviction >= threshold) relaxes concentration.
+def test_confident_cannot_relax_sector_cap():
+    # Conviction can alter the soft size curve, never a hard concentration gate.
     lim = RiskLimits(allow_any_name=True, sector_map=dict(SEMIS),
                      confident_full_size=True, cap_bypass_min_conviction=6, max_trade_pct_hard=1.0)
     pos = [OpenPosition("NVDA", 100.0, False), OpenPosition("AMD", 100.0, False)]
     d = gate(ProposedTrade("MU", 100.0, False, conviction=9), open_pos=pos, limits=lim)
-    assert not any("sector" in r for r in d.reasons), d.reasons
+    assert not d.approved
+    assert any("sector" in r for r in d.reasons), d.reasons

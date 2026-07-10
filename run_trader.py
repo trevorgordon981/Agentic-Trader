@@ -25,13 +25,14 @@ TRADING_DOWN_MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 
 
 def _refuse_if_trading_down(arm: bool) -> None:
-    """Refuse to ARM live trading while the TRADING_DOWN marker exists (gap-fix 2026-07-03),
-    mirroring run_trader_service.sh so a manual `python run_trader.py --arm` can't bypass it.
-    Dry-run / read-only invocations (arm=False) are never blocked. Raises typer.Exit(1) to refuse."""
+    """Compatibility hook: warn, but do not disarm risk-reducing exits.
+
+    Entry placement is independently blocked before every proposal/submit.  Refusing to start the
+    process here also refused the protective SELL loop, which made a stand-down increase risk.
+    """
     if arm and os.path.exists(TRADING_DOWN_MARKER):
-        print("[run_trader] TRADING_DOWN marker present -- refusing to arm live trading.", file=sys.stderr)
-        print(f"[run_trader] rm {TRADING_DOWN_MARKER} to re-enable armed trading.", file=sys.stderr)
-        raise typer.Exit(code=1)
+        print("[run_trader] TRADING_DOWN active: BUY entries blocked; protective exits remain armed.",
+              file=sys.stderr)
 
 
 @app.command()
@@ -40,6 +41,9 @@ def main(
     arm: bool = typer.Option(False, "--arm", help="LIVE: place real orders (still needs Slack approval per entry)"),
     loop: bool = typer.Option(False, "--loop"),
     interval: int = typer.Option(900, "--interval", help="seconds between cycles in --loop"),
+    protective_interval: int = typer.Option(
+        30, "--protective-interval", min=15, max=60,
+        help="seconds between independent static protective-exit cycles"),
 ):
     # TRADING-DOWN GUARD (2026-07-03 gap-fix): refuse to ARM live trading while the marker exists,
     # mirroring run_trader_service.sh so a manual `python run_trader.py --arm` cannot bypass it.
@@ -77,6 +81,7 @@ def main(
     exit_mgr = ExitManager(cfg)
     exit_mgr.ib_conn = ib_conn  # share the one connection
 
+    broker_order_lock = asyncio.Lock()
     trader = Trader(
         ib_conn=ib_conn, exit_manager=exit_mgr,
         limits=RiskLimits(
@@ -111,6 +116,9 @@ def main(
         construction_cfg=getattr(cfg, "construction", None),  # 2026-07-01 constructor-rework gates
         caps_tp_tiers=list(getattr(cfg.caps, "tp_tiers", []) or []),  # 2026-07-03 pot-tiered TP ceiling
         kill_switch_path=cfg.kill_switch.path,  # 2026-07-03: KILL_SWITCH halts ENTRIES too
+        config_path=config,
+        trading_down_path=TRADING_DOWN_MARKER,
+        broker_order_lock=broker_order_lock,
         # ENTRY THROTTLE CEILINGS (2026-07-03 gap-fix): caps.* were loaded but only enforced on the
         # EXIT path; wire them so NEW entries also respect per-cycle / per-day order + notional caps.
         max_orders_per_cycle=int(getattr(cfg.caps, "max_orders_per_cycle", 5)),
@@ -132,29 +140,55 @@ def main(
             print("[ERROR] reconciliation failed - aborting"); await ib_conn.disconnect(); return
         print(f"[INFO] {'LIVE (--arm)' if arm else 'DRY RUN'} | port {cfg.ib.port}")
         if loop:
-            while True:
-                try:
-                    # SELF-HEAL: a dropped IBKR link must not leave exits blind. On Error 1100
-                    # the local socket stays open (isConnected() lies True) while the uplink is
-                    # dead -- so we use an ACTIVE liveness probe (ensure_connected) instead of
-                    # isConnected(), and force a real reconnect when it's unhealthy.
-                    if not await ib_conn.ensure_connected():
-                        print("[WARN] IBKR link unhealthy -- forcing reconnect")
-                        if await ib_conn.reconnect(retries=3, retry_delay=10):
-                            # HONOR THE RECONCILE RESULT (2026-07-03): a post-reconnect reconcile
-                            # that comes back UNSAFE means broker/journal state disagrees -- do NOT
-                            # trade this cycle (the per-cycle reconcile inside run_cycle re-checks).
-                            if not await exit_mgr._reconcile_on_startup():
-                                print("[WARN] post-reconnect reconcile UNSAFE -- skipping this cycle (no trading)")
-                                await asyncio.sleep(interval); continue
-                            print("[INFO] reconnected to IBKR")
+            connection_lock = asyncio.Lock()
+
+            async def _ensure_live_connection():
+                async with connection_lock:
+                    if await ib_conn.ensure_connected():
+                        return True
+                    print("[WARN] IBKR link unhealthy -- forcing reconnect")
+                    if not await ib_conn.reconnect(retries=3, retry_delay=10):
+                        print("[ERROR] reconnect failed")
+                        return False
+                    if not await exit_mgr._reconcile_on_startup():
+                        print("[WARN] post-reconnect reconcile UNSAFE")
+                        return False
+                    return True
+
+            async def _protective_loop():
+                # Static rules never call the model.  The order lock serializes their SELL mutations
+                # with BUY submission while leaving slow model/Slack waits free to run concurrently.
+                cadence = min(60, max(15, int(protective_interval)))
+                while True:
+                    started = asyncio.get_running_loop().time()
+                    try:
+                        if await _ensure_live_connection():
+                            async with broker_order_lock:
+                                await exit_mgr.run_cycle(
+                                    dry_run, regime=trader._regime,
+                                    price_stats=trader._price_stats, defer_model=True)
+                            trader._exit_fail_streak = 0
                         else:
-                            print("[ERROR] reconnect failed; retrying next cycle")
-                            await asyncio.sleep(interval); continue
-                    await trader.run_once(dry_run)
-                except Exception as e:
-                    print(f"[ERROR] cycle error (loop continues): {e}")
-                await asyncio.sleep(interval)
+                            trader._exit_fail_streak += 1
+                    except Exception as e:
+                        trader._exit_fail_streak += 1
+                        print(f"[ERROR] protective cycle error: {e}")
+                    elapsed = asyncio.get_running_loop().time() - started
+                    await asyncio.sleep(max(0.0, cadence - elapsed))
+
+            async def _entry_loop():
+                entry_cadence = max(60, int(interval))
+                while True:
+                    started = asyncio.get_running_loop().time()
+                    try:
+                        if await _ensure_live_connection():
+                            await trader.run_once(dry_run, skip_exit_cycle=True)
+                    except Exception as e:
+                        print(f"[ERROR] entry/model cycle error: {e}")
+                    elapsed = asyncio.get_running_loop().time() - started
+                    await asyncio.sleep(max(0.0, entry_cadence - elapsed))
+
+            await asyncio.gather(_protective_loop(), _entry_loop())
         else:
             await trader.run_once(dry_run)
         await ib_conn.disconnect()

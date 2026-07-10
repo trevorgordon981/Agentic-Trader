@@ -311,18 +311,9 @@ def evaluate_trade(
         reasons.append(f"daily circuit breaker: pot down {dp:.1%} (halt at -{limits.daily_halt_pct:.0%}) - no new entries")
 
     # 6. aggregate single-name exposure cap (max_single_name_agg_pct, default 36% of pot).
-    #    INTENTIONALLY skipped when `confident` (confident_full_size on AND conviction >=
-    #    cap_bypass_min_conviction): a confident override relaxes BOTH the per-trade % cap AND this
-    #    concentration cap. Consequence to be aware of: two confident single-name trades can each
-    #    reach the 25%-of-NetLiq hard per-trade ceiling (#2), so confident single-name exposure can
-    #    stack toward ~50% of NetLiq -- ABOVE the 36% aggregate cap that binds in non-confident mode.
-    #    It is still bounded on every path by: the 25% hard per-trade ceiling (#2), buying power (#3),
-    #    the 5% cash buffer, the concurrent-position cap (#4, default 4), the daily breaker (#5), and
-    #    human approval. NOTE: this relaxation only takes effect when confident_full_size is enabled
-    #    in config (default False in config.py -> today this branch always runs). Do NOT re-scope this
-    #    to also honor concentration under confident mode without Trevor's sign-off (that TIGHTENS
-    #    risk, but it is still a deliberate behavior change on a real-money gate).
-    if not confident and not trade.is_index:
+    #    This is a HARD solvency gate. Conviction may relax only the soft per-trade size curve; it
+    #    can never waive concentration. Human approval likewise cannot override it.
+    if not trade.is_index:
         name_exposure = sum(p.notional for p in open_positions if not p.is_index) + trade.notional
         name_cap = limits.max_single_name_agg_pct * pot
         if name_exposure > name_cap + EPS:
@@ -335,10 +326,9 @@ def evaluate_trade(
     #     config.yaml -- the pragmatic no-network source; a live correlation/beta feed is a future
     #     upgrade. Unmapped symbols key to their own name (no clustering => same as today), and an
     #     EMPTY sector_map (or a non-positive cap) makes this whole check a no-op so old configs are
-    #     unchanged. Skipped for index ETFs and -- like #6 -- when `confident` (a confident override
-    #     relaxes the concentration caps; every other gate in this function still binds). See
-    #     sector_exposure() for the pure aggregation.
-    if (not confident and not trade.is_index
+    #     unchanged. Skipped only for index ETFs; conviction and human approval cannot waive it.
+    #     See sector_exposure() for the pure aggregation.
+    if (not trade.is_index
             and limits.sector_map and limits.max_sector_agg_pct > 0):
         sec = sector_of(u, limits.sector_map)
         sec_exposure = sector_exposure(open_positions, u, trade.notional, limits.sector_map).get(sec, 0.0)

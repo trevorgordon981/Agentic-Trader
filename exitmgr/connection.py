@@ -373,7 +373,9 @@ class IBConnection:
             raise RuntimeError("Not connected to IB")
 
         # ib_async: placeOrder is SYNCHRONOUS and returns a Trade immediately
-        trade = self.ib.placeOrder(contract, order)
+        from exitmgr.order_lock import order_mutation_lock
+        with order_mutation_lock():
+            trade = self.ib.placeOrder(contract, order)
         return trade
 
     def reserve_order_id(self) -> int:

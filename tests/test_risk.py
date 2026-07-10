@@ -213,11 +213,13 @@ def test_cash_buffer_clamps_full_size():
     lim = RiskLimits(confident_full_size=True, allow_any_name=True, max_trade_pct_hard=1.0,
                      cash_buffer_pct=0.05,
                      conviction_size_curve={c: 1.0 for c in range(1, 11)})
-    d = gate(ProposedTrade("MU", 940.0, False, conviction=10), net_liq=1000.0, available=1000.0, limits=lim)
+    # Use an index so this test isolates the cash buffer rather than the independent hard
+    # single-name concentration cap.
+    d = gate(ProposedTrade("SPY", 940.0, True, conviction=10), net_liq=1000.0, available=1000.0, limits=lim)
     assert d.approved, d.reasons
     assert abs(d.per_trade_cap - 950.0) < 1e-6           # 95% of NetLiq, never 100%
     # one dollar over the buffer-clamped cap is rejected
-    d2 = gate(ProposedTrade("MU", 960.0, False, conviction=10), net_liq=1000.0, available=1000.0, limits=lim)
+    d2 = gate(ProposedTrade("SPY", 960.0, True, conviction=10), net_liq=1000.0, available=1000.0, limits=lim)
     assert not d2.approved
 
 

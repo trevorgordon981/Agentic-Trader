@@ -1,6 +1,7 @@
 """Tests for debit-spread support: short-leg selection, combo orders, journal, atomic close."""
 import asyncio
 import json
+import time
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -44,13 +45,13 @@ def test_spread_summary_shows_both_strikes_and_risk():
                       short_strike=305.0, short_contract=object())
     s = order_summary(r)
     assert "300/305C debit spread" in s
-    assert "~$1.10 (market order)" in s
+    assert "~$1.10 (marketable limit after fresh NBBO)" in s
     assert "max loss ~$110" in s and "max value $500" in s
 
 
 def test_single_leg_summary_unchanged():
     r = ResolvedOrder("SPY", "C", "20260620", 610.0, 1, 1.20, object())
-    assert "610C @ ~$1.20 (market order)" in order_summary(r)
+    assert "610C @ ~$1.20 (marketable limit after fresh NBBO)" in order_summary(r)
 
 
 # ---------------- submit + journal
@@ -58,6 +59,9 @@ def test_single_leg_summary_unchanged():
 def _trader(tmp_path):
     ibc = MagicMock()
     ibc.ib = MagicMock()
+    ibc.ib.placeOrder.return_value.orderStatus.status = "Filled"
+    ibc.ib.placeOrder.return_value.orderStatus.avgFillPrice = 1.20
+    ibc.ib.placeOrder.return_value.fills = []
     return Trader(ib_conn=ibc, exit_manager=MagicMock(), limits=RiskLimits(),
                   approved_names=set(), endpoint="http://x", model="m", slack_token="t",
                   slack_channel="C", approver_ids=set(), baseline_path=str(tmp_path / "b.json"),
@@ -73,7 +77,10 @@ def _contract(con_id):
 @pytest.mark.asyncio
 async def test_single_leg_submit_journals_entry(tmp_path):
     t = _trader(tmp_path)
-    r = ResolvedOrder("SPY", "C", "20260620", 610.0, 1, 1.20, _contract(111))
+    r = ResolvedOrder(
+        "SPY", "C", "20260620", 610.0, 1, 1.20, _contract(111),
+        entry_bid=1.15, entry_ask=1.25, quote_observed_at=time.monotonic(),
+        decision_id="decision-" + "a" * 32)
     await t._submit_order(r)
     t.ib_conn.ib.placeOrder.assert_called_once()
     rec = json.loads(open(tmp_path / "trades.log").read().splitlines()[-1])
@@ -114,8 +121,11 @@ def test_oversized_debit_still_rejected():
 @pytest.mark.asyncio
 async def test_spread_submit_uses_combo_and_journals_legs(tmp_path):
     t = _trader(tmp_path)
-    r = ResolvedOrder("IWM", "C", "20260626", 300.0, 1, 1.10, _contract(111),
-                      short_strike=305.0, short_contract=_contract(222))
+    r = ResolvedOrder(
+        "IWM", "C", "20260626", 300.0, 1, 1.10, _contract(111),
+        short_strike=305.0, short_contract=_contract(222),
+        entry_bid=1.05, entry_ask=1.15, quote_observed_at=time.monotonic(),
+        decision_id="decision-" + "b" * 32)
     await t._submit_order(r)
     t.ib_conn.create_combo_contract.assert_called_once_with("IWM", [(111, "BUY"), (222, "SELL")])
     placed_contract = t.ib_conn.ib.placeOrder.call_args[0][0]
