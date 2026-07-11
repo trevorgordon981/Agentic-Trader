@@ -21,6 +21,7 @@ from exitmgr import trade_capture
 def _item(symbol, con_id, label=None):
     return {
         "symbol": symbol, "con_id": con_id, "label": label or f"{symbol} test",
+        "decision_id": f"decision-{symbol}-{con_id}",
         "right": "C", "expiry": "20260815", "dte": 40,
         "upnl": 12.0, "debit": 800.0, "pct": 1.5,
     }
@@ -65,17 +66,18 @@ def test_emit_writes_row_and_load_review_reads_it(tmp_path):
     ddir = trade_capture.dataset_dir(journal_path)
 
     # (b) load_review resolves by con_id (date-independent path)
-    got = trade_capture.load_review(ddir, con_id=111)
+    got = trade_capture.load_review(ddir, decision_id="decision-SPY-111", con_id=111)
     assert got is not None
     assert "trend broke" in got["review"]
 
     # ...and by symbol + close date
-    got2 = trade_capture.load_review(ddir, symbol="QQQ", date=date)
+    got2 = trade_capture.load_review(
+        ddir, decision_id="decision-QQQ-222", symbol="QQQ", date=date)
     assert got2 is not None
     assert "breakout thesis" in got2["review"]
 
     # wrong con_id -> None
-    assert trade_capture.load_review(ddir, con_id=999) is None
+    assert trade_capture.load_review(ddir, decision_id="wrong", con_id=999) is None
 
 
 # --------------------------------------------------------------------------- idempotency
@@ -105,6 +107,7 @@ def test_symbol_only_when_con_id_unknown(tmp_path):
     assert mr.emit_reviews(journal_path, reviewed, date) == 0
 
     ddir = trade_capture.dataset_dir(journal_path)
-    got = trade_capture.load_review(ddir, symbol="IWM", date=date)
+    got = trade_capture.load_review(
+        ddir, decision_id="decision-IWM-None", symbol="IWM", date=date)
     assert got is not None and got["con_id"] is None
     assert "range intact" in got["review"]

@@ -31,6 +31,8 @@ def _close_row(symbol, *, trigger_mark, avg_fill_price, fill_status="Filled",
             slip_pct = round(slip / abs(float(trigger_mark)) * 100, 2)
     return {
         "schema": "trade_dataset.v2",
+        "record_status": "CANONICAL", "canonical": True,
+        "usable_for_training": False, "usable_for_pnl": False,
         "kind": "trade",
         "con_id": 1000,
         "symbol": symbol,
@@ -62,6 +64,14 @@ def _write(tmp_path, rows):
         for r in rows:
             f.write(json.dumps(r) + "\n")
     return str(p)
+
+
+def test_unmarked_rows_are_not_consumed(tmp_path):
+    row = _close_row("OLD", trigger_mark=1.0, avg_fill_price=0.9)
+    row.pop("record_status")
+    row.pop("canonical")
+    path = _write(tmp_path, [row])
+    assert list(fq.iter_rows(path)) == []
 
 
 # --------------------------------------------------------------------------- aggregation math

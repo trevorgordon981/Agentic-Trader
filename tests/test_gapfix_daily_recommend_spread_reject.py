@@ -25,3 +25,9 @@ def test_resolve_spread_path_uses_size_within_cap_not_force_clamp():
     assert "return None" in src
     # ...and the old force-to-one clamp is gone from the spread path.
     assert "qty = max(1, int(available // (net * 100)))" not in src
+
+
+def test_daily_does_not_reject_defined_risk_trade_on_underlying_notional():
+    src = inspect.getsource(daily_recommend._resolve)
+    assert "100 * spot >" not in src
+    assert "Underlying share notional is not capital at risk" in src

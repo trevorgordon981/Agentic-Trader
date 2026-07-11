@@ -93,7 +93,7 @@ def test_full_round_trip_pairs_into_one_trade_with_real_pnl():
     # net = gross - (1.0 + 1.0) commissions = 398.0
     assert tr["close"]["realized_pnl_net"] == 398.0
     assert tr["close"]["commission_unknown"] is False
-    assert tr["close"]["realized_pnl_pct"] == 40.0
+    assert tr["close"]["realized_pnl_pct"] == 39.8  # authoritative IB net / entry premium
     assert tr["labels"]["outcome"] == "win" and tr["labels"]["win"] is True
 
 
@@ -105,6 +105,31 @@ def test_missing_commission_marks_unknown_and_null_net():
     assert tr["close"]["realized_pnl_net"] is None
     assert tr["close"]["realized_pnl"] == -100.0     # gross still real
     assert tr["labels"]["outcome"] == "loss"
+
+
+def test_short_round_trip_uses_signed_cashflows_and_ib_label():
+    opens = [_norm(exec_id="o1", side="SLD", shares=1, price=5.0, commission=1.0)]
+    closes = [_norm(exec_id="c1", side="BOT", shares=1, price=2.0,
+                    commission=1.0, realized=298.0)]
+    tr = ec.build_rows_for_contract(555, opens + closes)["trade"]
+    assert tr["entry"]["direction"] == "short"
+    assert tr["entry"]["credit"] == 500.0
+    assert tr["close"]["close_cost"] == 200.0
+    assert tr["close"]["realized_pnl"] == 300.0
+    assert tr["close"]["realized_pnl_net"] == 298.0
+    assert tr["close"]["pnl_valid"] is True
+    assert tr["labels"]["outcome"] == "win"
+
+
+def test_ib_disagreement_is_invalid_and_never_labeled():
+    opens = [_norm(exec_id="o1", side="SLD", shares=1, price=5.0, commission=1.0)]
+    closes = [_norm(exec_id="c1", side="BOT", shares=1, price=2.0,
+                    commission=1.0, realized=-298.0)]
+    tr = ec.build_rows_for_contract(555, opens + closes)["trade"]
+    assert tr["record_status"] == "INVALID"
+    assert tr["usable_for_training"] is False and tr["usable_for_pnl"] is False
+    assert tr["close"]["realized_pnl_net"] is None
+    assert tr["labels"] == {"outcome": None, "win": None, "round_trip": None}
 
 
 # --------------------------------------------------------------------------- pairing: close-only

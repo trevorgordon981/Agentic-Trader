@@ -224,8 +224,10 @@ def decision_order_ref(decision_id: str) -> str:
 
 def risk_limits_from_config(trading: Mapping[str, object]) -> risk.RiskLimits:
     """Build the same hard limits for slate/manual/trader paths from ``trading:``."""
-    curve = trading.get("conviction_size_curve")
-    multipliers = trading.get("conviction_size_multipliers")
+    get = trading.get if isinstance(trading, Mapping) else lambda key, default=None: getattr(
+        trading, key, default)
+    curve = get("conviction_size_curve")
+    multipliers = get("conviction_size_multipliers")
 
     def _int_float_map(raw):
         if not raw:
@@ -233,21 +235,22 @@ def risk_limits_from_config(trading: Mapping[str, object]) -> risk.RiskLimits:
         return {int(k): float(v) for k, v in dict(raw).items()}
 
     return risk.RiskLimits(
-        max_trade_pct=float(trading.get("max_trade_pct", 0.12)),
-        max_trade_pct_hard=float(trading.get("max_trade_pct_hard", 0.25)),
-        max_concurrent=int(trading.get("max_concurrent", 4)),
-        daily_halt_pct=float(trading.get("daily_halt_pct", 0.08)),
-        max_single_name_agg_pct=float(trading.get("max_single_name_agg_pct", 0.36)),
-        max_sector_agg_pct=float(trading.get("max_sector_agg_pct", 0.25)),
-        sector_map={str(k).upper(): str(v) for k, v in dict(trading.get("sector_map") or {}).items()},
-        pot_cap_usd=trading.get("pot_cap_usd"),
-        cash_buffer_pct=float(trading.get("cash_buffer_pct", 0.05)),
-        allow_any_name=bool(trading.get("allow_model_names", False)),
-        confident_full_size=bool(trading.get("confident_full_size", False)),
-        cap_bypass_min_conviction=int(trading.get("cap_bypass_min_conviction", 6)),
+        max_trade_pct=float(get("max_trade_pct", 0.12)),
+        max_trade_pct_hard=float(get("max_trade_pct_hard", 0.25)),
+        max_concurrent=int(get("max_concurrent", 4)),
+        daily_halt_pct=float(get("daily_halt_pct", 0.08)),
+        max_single_name_agg_pct=float(get("max_single_name_agg_pct", 0.36)),
+        max_sector_agg_pct=float(get("max_sector_agg_pct", 0.25)),
+        sector_map={str(k).upper(): str(v) for k, v in dict(get("sector_map") or {}).items()},
+        pot_cap_usd=get("pot_cap_usd"),
+        cash_buffer_pct=float(get("cash_buffer_pct", 0.05)),
+        allow_any_name=bool(get("allow_model_names", False)),
+        confident_full_size=bool(get("confident_full_size", False)),
+        cap_bypass_min_conviction=int(get(
+            "cap_bypass_min_conviction", get("confident_conviction", 6))),
         conviction_size_curve=_int_float_map(curve),
         conviction_size_multipliers=_int_float_map(multipliers),
-        blocked_names={str(n).upper() for n in (trading.get("blocked_names") or [])},
+        blocked_names={str(n).upper() for n in (get("blocked_names") or [])},
     )
 
 

@@ -91,10 +91,11 @@ async def test_trader_threads_cot_into_decision(tmp_path, monkeypatch):
     t = _trader(tmp_path)
     await t.run_once(dry_run=False)
     rows = _read_decisions()
-    assert len(rows) == 1
-    assert rows[0]["cot"] == _COT
-    assert rows[0]["raw_strategist"] == _ANSWER      # clean answer unchanged (parsing target)
-    assert rows[0]["chosen"]["underlying"] == "SPY"   # same trade produced
+    assert len(rows) == 2  # immutable proposal + submitted lifecycle events
+    assert {row["event"] for row in rows} == {"proposal", "submitted"}
+    assert all(row["cot"] == _COT for row in rows)
+    assert all(row["raw_strategist"] == _ANSWER for row in rows)
+    assert all(row["chosen"]["underlying"] == "SPY" for row in rows)
 
 
 @pytest.mark.asyncio

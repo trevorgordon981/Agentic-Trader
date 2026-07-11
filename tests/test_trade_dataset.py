@@ -241,7 +241,7 @@ def _ddir(tmp_path):
 
 
 # --------------------------------------------------------------------------- trade_capture unit
-def test_capture_decision_and_join_by_con_id_and_by_symbol(tmp_path):
+def test_capture_decision_joins_only_by_immutable_decision_id(tmp_path):
     d = _ddir(tmp_path)
     idea = _types.SimpleNamespace(underlying="SPY", direction="bullish", structure="single",
                                   conviction=8, thesis="bull above 20d", target_dte=30)
@@ -250,13 +250,13 @@ def test_capture_decision_and_join_by_con_id_and_by_symbol(tmp_path):
     gate = _types.SimpleNamespace(approved=True, reasons=[], per_trade_cap=1234.5)
     tc.capture_decision(d, source="trader", symbol="SPY", right="C", strike=610.0,
                         expiry="20260731", structure="single", con_id=555,
+                        decision_id="decision-555",
                         chosen_idea=idea, candidates=[idea, other],
                         raw_strategist="MODEL SAID: buy SPY calls, conviction 8",
                         gate=gate, regime={"regime": "bull", "trend_score": 42, "vix": 14.0},
                         market_context="RAG+news+journal brief text",
                         construction={"tp_pct": 30.0, "sl_pct": 30.0, "dte": 30})
-    # join by exact con_id
-    j = tc.load_decision_context(d, con_id=555, symbol="SPY", strike=610.0,
+    j = tc.load_decision_context(d, decision_id="decision-555", con_id=555, symbol="SPY", strike=610.0,
                                  expiry="20260731", right="C")
     assert j is not None and j["kind"] == "decision"
     assert j["symbol"] == "SPY" and j["con_id"] == 555
@@ -266,12 +266,10 @@ def test_capture_decision_and_join_by_con_id_and_by_symbol(tmp_path):
     assert j["gate"]["approved"] is True and j["gate"]["per_trade_cap"] == 1234.5
     assert j["regime"]["regime"] == "bull"
     assert j["construction"]["tp_pct"] == 30.0
-    # join with NO con_id -> falls back to symbol+strike+expiry+right
-    j2 = tc.load_decision_context(d, con_id=None, symbol="SPY", strike=610.0,
-                                  expiry="20260731", right="C")
-    assert j2 is not None and j2["symbol"] == "SPY"
-    # non-matching symbol -> None
-    assert tc.load_decision_context(d, symbol="ZZZZ", strike=1.0, expiry="x", right="C") is None
+    # Causal fallback is forbidden even when every contract field matches.
+    assert tc.load_decision_context(
+        d, con_id=555, symbol="SPY", strike=610.0, expiry="20260731", right="C") is None
+    assert tc.load_decision_context(d, decision_id="wrong-id", con_id=555) is None
 
 
 def test_capture_no_trade_and_rejected_rows(tmp_path):
@@ -380,6 +378,7 @@ def test_spread_v2_record_structure_and_legs(tmp_path):
 def test_closed_trade_v2_joins_decision_context(tmp_path):
     """End-to-end: a decision captured at entry is joined into the closed-trade v2 record."""
     je = {"ts": "2026-07-01T14:00:00+00:00", "contract_id": 8001, "symbol": "SPY",
+          "decision_id": "decision-8001",
           "right": "C", "strike": 610.0, "expiry": "20260731", "quantity": 1, "debit": 800.0,
           "profit_target_pct": 30.0, "stop_pct": 30.0, "conviction": 8,
           "entry_delta": 0.60, "entry_gamma": 0.03, "entry_theta": -0.5, "entry_vega": 1.1,
@@ -390,6 +389,7 @@ def test_closed_trade_v2_joins_decision_context(tmp_path):
                                   direction="bullish", structure="single")
     tc.capture_decision(d, source="trader", symbol="SPY", right="C", strike=610.0,
                         expiry="20260731", structure="single", con_id=8001,
+                        decision_id="decision-8001",
                         chosen_idea=idea, candidates=[idea],
                         raw_strategist="buy SPY 610C, conviction 8",
                         gate=_types.SimpleNamespace(approved=True, reasons=[], per_trade_cap=999.0),

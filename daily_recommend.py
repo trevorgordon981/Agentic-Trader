@@ -26,7 +26,7 @@ from exitmgr.account import get_pot_snapshot
 from exitmgr.connection import IBConnection
 from exitmgr.ibkr import Stock, Option, Order, pick_chain, strikes_near, underlying_price
 from exitmgr.strategist import propose, discover_names, propose_one, TradeIdea
-from exitmgr.trader import ResolvedOrder, order_summary, audit, _trading_day
+from exitmgr.trader import ResolvedOrder, order_summary, contract_snapshot, audit, _trading_day
 from exitmgr import approval, construction, entry_safety, research, trade_capture, risk
 from exitmgr.config import ConstructionConfig, construction_from_dict
 from exitmgr.slate_lock import slate_active_guard
@@ -174,6 +174,7 @@ def _watch_entry_fills(placed_watch, token, audit_path):
                 with open(FILLS_PATH, "a") as f:
                     f.write(_j.dumps({"ts": datetime.utcnow().isoformat(), "event": "entry_fill",
                                       "decision_id": w.get("decision_id"),
+                                      "model_identity": w.get("model_identity"),
                                       "contract_id": getattr(w["r"].contract, "conId", None),
                                       "symbol": w["r"].underlying,
                                       "order_id": getattr(getattr(w["trade"], "order", None), "orderId", None),
@@ -257,11 +258,9 @@ async def _resolve(ib, idea, available, net_liq=None):
     if expiry is None:
         return None, f"no expiry >= {CONS.min_dte} DTE (min-DTE floor)"
     spot = await underlying_price(ib, stk)
-    # IBKR gross-position rule: ~100*spot per contract must not exceed 30x net_liq. High-priced
-    # underlyings (NVDA ~$233, MU ~$989) blow this cap on a small account -> reject before IBKR Error 201.
-    if net_liq and spot and 100 * spot > 0.9 * 30 * net_liq:
-        return None, (f"underlying ${spot:,.0f}/sh too high-priced for ${net_liq:,.0f} acct: "
-                      f"1-contract notional ${100*spot:,.0f} exceeds 30x net_liq cap ${30*net_liq:,.0f}")
+    # Defined-risk long options/debit spreads are gated on executable NET DEBIT (max loss), exactly
+    # like the continuous trader. Underlying share notional is not capital at risk and must not
+    # pre-reject an otherwise affordable spread.
     cands = [Option(idea.underlying, expiry, k, right, "SMART") for k in strikes_near(p.strikes, spot)]
     qualified = await ib.qualifyContractsAsync(*cands)
     tickers = await ib.reqTickersAsync(*[c for c in qualified if getattr(c, "conId", None)])
@@ -385,7 +384,7 @@ def _daily_cap_rejected(stage, reason, idea, resolved):
 async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pending,
                      label="Daily rec", audit_event="daily_rec_posted",
                      candidates=None, raw_strategist=None, market_context=None, regime=None,
-                     technical_card=None, cot=None):
+                     technical_card=None, cot=None, model_identity=None):
     """Resolve an idea to a concrete priced order, post it to #approvals with one-tap, and append it
     to `pending` so the watch loop manages approval/execution. Returns the Slack ts (or None).
     Shared by the daily slate and the same-day 'add a name -> suggest it now' path."""
@@ -550,6 +549,8 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
                      f"Reply `full size` to use ~${deployable:,.0f} (keeps a 5% cash buffer).")
     decision_id = entry_safety.new_decision_id()
     resolved.decision_id = decision_id
+    resolved.decision_revision = 0
+    resolved.model_identity = model_identity
     msg = (head + f"*Order:* `{order_summary(resolved)}`\n"
            f"{size_line} Max loss = the debit.\n"
            f"*Sell levels (auto):* take profit ~${tp_price:.2f} (+{tp_pct:.0f}%) | "
@@ -568,8 +569,7 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
         # DECISION CAPTURE (v2, record-only): the full DECISION -> ENTRY context for a posted
         # slate idea -- raw strategist reasoning, EVERY candidate + conviction, the chosen idea,
         # construction (clamped tp/sl, dte adjust), regime, and the RAG/news/journal brief.
-        # con_id is unknown here (nothing placed yet); the record is joined to the closed trade
-        # at close by symbol+strike+expiry+right. Never raises into the slate path.
+        # The immutable decision_id is the only later join key; contract/symbol fallback is banned.
         try:
             trade_capture.capture_decision(
                 trade_capture.dataset_dir(JOURNAL_PATH), source="daily_slate",
@@ -586,7 +586,9 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
                 sizing={"cost": cost, "pct_pot": pct_pot, "net_liq": pot.net_liq,
                         "available_funds": pot.available_funds},
                 extra={"label": label, "order": order_summary(resolved),
-                       "decision_id": decision_id})
+                       "decision_id": decision_id}, decision_id=decision_id,
+                revision=0, event="proposal", model_identity=model_identity,
+                final_contract=contract_snapshot(resolved))
         except Exception as _dce:
             print(f"[WARN] daily-slate capture_decision failed (continuing): {_dce}")
     return ts
@@ -644,6 +646,7 @@ async def run(args):
         disc_ts, disc_cands = None, []
         _raw_slate = None    # verbatim strategist output (model path), for v2 decision capture
         _slate_cot = None    # [m3cot] chain-of-thought (reasoning_content), separate from the answer
+        _slate_identity = None
         brief = None         # the RAG/news/journal/quote brief fed to the model (model path)
         _slate_price_stats = None  # per-name technical indicators (momentum/vol/IVR) fed to the model
         if args.ticker:
@@ -698,10 +701,13 @@ async def run(args):
 
             try:
                 _res = propose(tr.get("llm_endpoint"), tr.get("llm_model"), brief,
-                               timeout=400, recommend=True, return_cot=True)
+                               timeout=400, recommend=True, return_cot=True,
+                               return_identity=True)
                 # robust to all shapes: (ideas, raw, cot) 3-tuple, (ideas, raw) 2-tuple, or a
                 # bare list (older/mocked propose). cot is optional/None-safe.
-                if isinstance(_res, tuple) and len(_res) == 3:
+                if isinstance(_res, tuple) and len(_res) == 4:
+                    ideas, _raw_slate, _slate_cot, _slate_identity = _res
+                elif isinstance(_res, tuple) and len(_res) == 3:
                     ideas, _raw_slate, _slate_cot = _res
                 elif isinstance(_res, tuple) and len(_res) == 2:
                     ideas, _raw_slate = _res
@@ -726,7 +732,8 @@ async def run(args):
                 try:
                     trade_capture.capture_no_trade(
                         trade_capture.dataset_dir(JOURNAL_PATH), source="daily_slate",
-                        reason="empty_slate", raw_strategist=_raw_slate, cot=_slate_cot, market_context=brief)
+                        reason="empty_slate", raw_strategist=_raw_slate, cot=_slate_cot,
+                        market_context=brief, model_identity=_slate_identity)
                 except Exception as _ce:
                     print(f"[WARN] daily-slate no_trade capture failed (continuing): {_ce}")
                 print("[INFO] no ideas"); return 0
@@ -754,7 +761,7 @@ async def run(args):
             # CONSERVATIVE DEFAULT: size to ~default_pct of the pot; go full only on an opt-in reply.
             await _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pending,
                              candidates=ideas, raw_strategist=_raw_slate, cot=_slate_cot, market_context=brief,
-                             technical_card=_slate_price_stats)
+                             technical_card=_slate_price_stats, model_identity=_slate_identity)
 
         # Watch the posted recs and place the ones you approve, until the deadline.
         deadline = time.monotonic() + args.watch_mins * 60
@@ -791,13 +798,17 @@ async def run(args):
                         for tk in really:
                             _one_raw = None
                             _one_cot = None
+                            _one_identity = None
                             try:
                                 with slate_active_guard():
                                     _one = propose_one(tr.get("llm_endpoint"), tr.get("llm_model"), brief, tk,
-                                                       timeout=400, return_cot=True)
+                                                       timeout=400, return_cot=True,
+                                                       return_identity=True)
                                 # robust to all shapes: (idea, raw, cot) 3-tuple, (idea, raw) 2-tuple,
                                 # or a bare TradeIdea|None (older/mocked). cot is optional/None-safe.
-                                if isinstance(_one, tuple) and len(_one) == 3:
+                                if isinstance(_one, tuple) and len(_one) == 4:
+                                    idea, _one_raw, _one_cot, _one_identity = _one
+                                elif isinstance(_one, tuple) and len(_one) == 3:
                                     idea, _one_raw, _one_cot = _one
                                 elif isinstance(_one, tuple) and len(_one) == 2:
                                     idea, _one_raw = _one
@@ -819,7 +830,8 @@ async def run(args):
                             await _post_idea(ib, idea, snap, default_pct, token, channel, audit_path, pending,
                                              label="Added & suggested", audit_event="add_suggest_posted",
                                              candidates=[idea], raw_strategist=_one_raw, cot=_one_cot,
-                                             market_context=brief, technical_card=_slate_price_stats)
+                                             market_context=brief, technical_card=_slate_price_stats,
+                                             model_identity=_one_identity)
             for ts, r, tp_pct, sl_pct, idea, over_default, posted_at, decision_id, revision in pending:
                 if ts in done:
                     continue
@@ -919,6 +931,8 @@ async def run(args):
                     done.add(ts)
                     continue
                 fresh_r.decision_id = decision_id
+                fresh_r.decision_revision = revision
+                fresh_r.model_identity = getattr(r, "model_identity", None)
                 # explicit position-size override ("1 contract", "half size") -> set qty on the resolved order
                 if qty_ovr:
                     newq = (qty_ovr["contracts"] if "contracts" in qty_ovr
@@ -961,6 +975,8 @@ async def run(args):
                     if newq != fresh_r.qty:
                         fresh_r = _replace(fresh_r, qty=newq)
                         fresh_r.decision_id = decision_id
+                        fresh_r.decision_revision = revision
+                        fresh_r.model_identity = getattr(r, "model_identity", None)
                 eff_tp = max(20.0, min(500.0, ov_tp)) if ov_tp else tp_pct
                 # M4 (2026-07-09): a manual SL override may only TIGHTEN the stop (smaller max-loss
                 # %), never LOOSEN it past the 30% default. Ceiling 30 (was 90); floor 10.
@@ -1031,6 +1047,8 @@ async def run(args):
                     if qty_ovr:
                         _latest_r = _replace(_latest_r, qty=fresh_r.qty)
                     _latest_r.decision_id = decision_id
+                    _latest_r.decision_revision = revision
+                    _latest_r.model_identity = getattr(r, "model_identity", None)
                     _latest_nbbo = entry_safety.nbbo_valid(_latest_r)
                     if not _latest_nbbo.allowed:
                         raise RuntimeError("; ".join(_latest_nbbo.reasons))
@@ -1084,6 +1102,7 @@ async def run(args):
                     _new_ts = approval.post_proposal(token, channel, _remsg)
                     done.add(ts)
                     if _new_ts:
+                        fresh_r.decision_revision = revision + 1
                         pending.append((_new_ts, fresh_r, eff_tp, eff_sl, effective_idea,
                                         False, time.monotonic(), decision_id, revision + 1))
                     audit(audit_path, "reapproval_required", decision_id=decision_id,
@@ -1109,6 +1128,22 @@ async def run(args):
                     done.add(ts)
                     continue
                 _lmt = entry_safety.executable_price(r)
+                try:
+                    trade_capture.capture_decision(
+                        trade_capture.dataset_dir(JOURNAL_PATH), source="daily_slate",
+                        symbol=r.underlying, right=r.right, strike=r.strike, expiry=r.expiry,
+                        structure=("spread" if r.short_contract is not None else "single"),
+                        con_id=getattr(r.contract, "conId", None), chosen_idea=effective_idea,
+                        candidates=[effective_idea], market_context=brief,
+                        decision_id=decision_id, revision=revision, event="approved",
+                        model_identity=getattr(r, "model_identity", None),
+                        final_contract=contract_snapshot(r),
+                        order_ref=entry_safety.decision_order_ref(decision_id),
+                        human_action={"action": "approve", "structure_override": ovr,
+                                      "quantity_override": qty_ovr, "full_size": full_size,
+                                      "tp_pct": eff_tp, "sl_pct": eff_sl})
+                except Exception as _capture_error:
+                    print(f"[WARN] final decision capture failed (continuing): {_capture_error}")
                 order = Order(action="BUY", orderType="LMT", lmtPrice=_lmt,
                               totalQuantity=r.qty, tif="DAY")
                 order.orderRef = entry_safety.decision_order_ref(decision_id)
@@ -1140,6 +1175,22 @@ async def run(args):
                           order=order_summary(r), status=st, reason=reason)
                     done.add(ts)
                     continue
+                try:
+                    trade_capture.capture_decision(
+                        trade_capture.dataset_dir(JOURNAL_PATH), source="daily_slate",
+                        symbol=r.underlying, right=r.right, strike=r.strike, expiry=r.expiry,
+                        structure=("spread" if r.short_contract is not None else "single"),
+                        con_id=getattr(r.contract, "conId", None), chosen_idea=effective_idea,
+                        candidates=[effective_idea], market_context=brief,
+                        decision_id=decision_id, revision=revision, event="submitted",
+                        model_identity=getattr(r, "model_identity", None),
+                        final_contract=contract_snapshot(r),
+                        order_ref=getattr(trade.order, "orderRef", None),
+                        human_action={"action": "approve", "structure_override": ovr,
+                                      "quantity_override": qty_ovr, "full_size": full_size,
+                                      "tp_pct": eff_tp, "sl_pct": eff_sl})
+                except Exception as _capture_error:
+                    print(f"[WARN] submitted decision capture failed (continuing): {_capture_error}")
                 # FILL VERIFICATION (2026-07-01 audit: 5/15 "executed" entries never filled --
                 # the journal recorded intent, not fills). After the ACK, wait a bit longer for
                 # the actual fill so the entry record carries fill status/price/timestamp; a
@@ -1173,6 +1224,8 @@ async def run(args):
                                 if r.short_contract is not None else {})
                     f.write(_j.dumps({"ts": datetime.utcnow().isoformat(),
                                       "decision_id": decision_id,
+                                      "decision_revision": revision,
+                                      "model_identity": getattr(r, "model_identity", None),
                                       "contract_id": r.contract.conId,
                                       "symbol": r.underlying, "right": r.right, "expiry": r.expiry,
                                       "strike": r.strike, "quantity": r.qty,
@@ -1199,6 +1252,7 @@ async def run(args):
                                       **spread_j}, default=str) + "\n")
                 placed_watch.append({"trade": trade, "r": r, "t0": time.monotonic(),
                                      "decision_id": decision_id,
+                                     "model_identity": getattr(r, "model_identity", None),
                                      "alerted": False, "filled_logged": st == "Filled"})
                 tag = " _(your levels)_" if (ov_tp or ov_sl) else ""
                 approval.post_proposal(token, channel,
@@ -1221,6 +1275,7 @@ async def run(args):
                         f.write(_j.dumps({"ts": datetime.utcnow().isoformat(),
                                           "event": "entry_fill_final",
                                           "decision_id": w.get("decision_id"),
+                                          "model_identity": w.get("model_identity"),
                                           "contract_id": getattr(w["r"].contract, "conId", None),
                                           "symbol": w["r"].underlying,
                                           "order_id": getattr(getattr(w["trade"], "order", None), "orderId", None),

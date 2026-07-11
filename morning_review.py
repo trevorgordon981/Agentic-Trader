@@ -214,6 +214,7 @@ async def collect_positions(conn, jrnl):
         pct = (upnl / debit * 100.0) if (upnl is not None and debit) else None
         items.append({
             "symbol": c.symbol, "label": label, "right": right, "con_id": cid,
+            "decision_id": (e.get("decision_id") if e else None),
             "expiry": expiry, "dte": d, "upnl": upnl, "debit": debit, "pct": pct,
         })
     return pot, items
@@ -320,7 +321,7 @@ def emit_reviews(journal_path, reviewed, review_date, dataset_cfg_path=None):
         review_date = str(review_date)[:10]
 
         # Read-back existing keys for idempotency (same (con_id|symbol, date)).
-        seen_con, seen_sym = set(), set()
+        seen_decision, seen_con, seen_sym = set(), set(), set()
         try:
             if os.path.exists(path):
                 for line in open(path):
@@ -332,6 +333,8 @@ def emit_reviews(journal_path, reviewed, review_date, dataset_cfg_path=None):
                     except Exception:
                         continue
                     d = str(r.get("date") or "")[:10]
+                    if r.get("decision_id"):
+                        seen_decision.add((str(r.get("decision_id")), d))
                     if r.get("con_id") is not None:
                         seen_con.add((str(r.get("con_id")), d))
                     if r.get("symbol") is not None:
@@ -342,6 +345,9 @@ def emit_reviews(journal_path, reviewed, review_date, dataset_cfg_path=None):
         for it, v in reviewed:
             con_id = it.get("con_id")
             symbol = it.get("symbol")
+            decision_id = it.get("decision_id")
+            if decision_id and (str(decision_id), review_date) in seen_decision:
+                continue
             if con_id is not None and (str(con_id), review_date) in seen_con:
                 continue
             if con_id is None and (str(symbol), review_date) in seen_sym:
@@ -351,6 +357,7 @@ def emit_reviews(journal_path, reviewed, review_date, dataset_cfg_path=None):
                 "kind": "review",
                 "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "source": "morning_review",
+                "decision_id": decision_id,
                 "con_id": con_id,
                 "symbol": symbol,
                 "date": review_date,
@@ -363,6 +370,8 @@ def emit_reviews(journal_path, reviewed, review_date, dataset_cfg_path=None):
                 with open(path, "a") as f:
                     f.write(json.dumps(rec, default=str) + "\n")
                 written += 1
+                if decision_id:
+                    seen_decision.add((str(decision_id), review_date))
                 if con_id is not None:
                     seen_con.add((str(con_id), review_date))
                 if symbol is not None:

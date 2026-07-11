@@ -79,7 +79,8 @@ def test_normalize_open_vs_close_and_commission_sign(sample_xml):
 def test_build_rows_shape(sample_xml):
     parsed = fi.parse_statement(sample_xml)
     built = fi.build_flex_rows(parsed["fills"], parsed["meta"])
-    assert len(built["trade_rows"]) == 18
+    assert len(built["trade_rows"]) == 11  # 8 two-leg strategies + 3 singles
+    assert built["quarantined_rows"] == []
     assert len(built["position_rows"]) == 2  # Agilent A C135 / C150 spread still open
     # every flex row is honestly tagged + carries NO fabricated reasoning
     for r in built["trade_rows"] + built["position_rows"]:
@@ -92,6 +93,69 @@ def test_build_rows_shape(sample_xml):
     for p in built["position_rows"]:
         assert p["kind"] == "position" and p["status"] == "open"
         assert p["symbol"] == "A"
+
+
+def _strategy_fill(exec_id, con_id, strike, side, oc, price, realized, when):
+    return {
+        "exec_id": exec_id, "order_id": 1, "perm_id": 0, "client_id": 0,
+        "acct": "U", "con_id": con_id, "symbol": "XYZ", "sec_type": "OPT",
+        "right": "C", "strike": strike, "expiry": "20260731", "side": side,
+        "shares": 1.0, "price": price, "time": when, "mult": 100.0,
+        "commission": 1.0, "commission_ccy": "USD", "realized_pnl_ib": realized,
+        "api_order": True, "trade_id": exec_id, "open_close": oc,
+    }
+
+
+def test_flex_aggregates_debit_spread_and_labels_only_ib_valid_strategy():
+    opened, closed = "2026-07-01T14:00:00", "2026-07-02T15:00:00"
+    fills = [
+        _strategy_fill("lo", 101, 100, "BOT", "O", 5.0, None, opened),
+        _strategy_fill("lc", 101, 100, "SLD", "C", 4.0, -102.0, closed),
+        _strategy_fill("so", 102, 105, "SLD", "O", 2.0, None, opened),
+        _strategy_fill("sc", 102, 105, "BOT", "C", 1.0, 98.0, closed),
+    ]
+    built = fi.build_flex_rows(fills, {})
+    assert len(built["trade_rows"]) == 1 and built["quarantined_rows"] == []
+    row = built["trade_rows"][0]
+    assert row["entry"]["structure"] == "call_debit_spread"
+    assert row["entry"]["debit"] == 300.0
+    assert row["close"]["realized_pnl_ib"] == -4.0
+    assert row["close"]["realized_pnl_net"] == -4.0
+    assert row["labels"]["outcome"] == "loss"
+    assert row["record_status"] == "CANONICAL"
+    assert row["usable_for_pnl"] is True and row["usable_for_training"] is False
+
+
+def test_flex_quarantines_strategy_when_any_leg_disagrees_with_ib():
+    opened, closed = "2026-07-01T14:00:00", "2026-07-02T15:00:00"
+    fills = [
+        _strategy_fill("lo", 101, 100, "BOT", "O", 5.0, None, opened),
+        _strategy_fill("lc", 101, 100, "SLD", "C", 4.0, -102.0, closed),
+        _strategy_fill("so", 102, 105, "SLD", "O", 2.0, None, opened),
+        _strategy_fill("sc", 102, 105, "BOT", "C", 1.0, -98.0, closed),
+    ]
+    built = fi.build_flex_rows(fills, {})
+    assert built["trade_rows"] == [] and len(built["quarantined_rows"]) == 1
+    row = built["quarantined_rows"][0]
+    assert row["record_status"] == "INVALID"
+    assert row["usable_for_pnl"] is False and row["usable_for_training"] is False
+
+
+def test_reopened_same_contract_is_two_trade_instances_not_blended():
+    fills = [
+        _strategy_fill("o1", 101, 100, "SLD", "O", 0.03, None, "2026-07-01T10:00:00"),
+        _strategy_fill("c1", 101, 100, "BOT", "C", 0.02, -0.10, "2026-07-02T10:00:00"),
+        _strategy_fill("o2", 101, 100, "BOT", "O", 0.02, None, "2026-07-02T11:00:00"),
+        _strategy_fill("c2", 101, 100, "SLD", "C", 0.01, -3.00, "2026-07-03T10:00:00"),
+    ]
+    # Adjust the authoritative values to side-aware fill net (gross $1/-$1 minus $2 fees).
+    fills[1]["realized_pnl_ib"] = -1.0
+    fills[3]["realized_pnl_ib"] = -3.0
+    built = fi.build_flex_rows(fills, {})
+    assert len(built["trade_rows"]) == 2
+    assert built["quarantined_rows"] == []
+    assert {row["entry"]["direction"] for row in built["trade_rows"]} == {"long", "short"}
+    assert sum(row["close"]["realized_pnl_ib"] for row in built["trade_rows"]) == -4.0
 
 
 # ------------------------------------------------------------------ reconcile / supersede
@@ -123,10 +187,11 @@ def test_reconcile_supersedes_backfill(sample_xml, tmp_path):
     s = fi.ingest_flex(xml_text=sample_xml, ddir=ddir)
     assert s["ok"]
     rc = s["reconcile"]
-    assert rc["superseded"] == 3          # all 3 estimate rows replaced by richer Flex rows
-    assert rc["appended_trades"] == 18
+    assert s["canonical_migration"]["migrated"] == 3
+    assert rc["superseded"] == 0          # legacy rows moved before canonical reconciliation
+    assert rc["appended_trades"] == 11
     assert rc["appended_positions"] == 2
-    assert rc["final_rows"] == 20         # one best row per real trade; no estimate rows remain
+    assert rc["final_rows"] == 13         # strategy-aware trades + two open-position snapshots
     # the file no longer contains any backfilled estimate row
     with open(fi._tc.dataset_path(ddir)) as f:
         rows = [json.loads(x) for x in f if x.strip()]
@@ -157,6 +222,8 @@ def test_execid_dedup_vs_reqexecutions(sample_xml, tmp_path):
     victim = next(r for r in built["trade_rows"] if r["kind"] == "trade")
     exec_ids = victim["provenance"]["exec_ids"]
     app_row = {"schema": "trade_dataset.v2", "kind": "trade", "source": "app",
+               "record_status": "CANONICAL", "canonical": True,
+               "usable_for_training": True, "usable_for_pnl": True,
                "symbol": victim["symbol"], "ts": "2026-07-01T00:00:00+00:00",
                "provenance": {"exec_ids": exec_ids}, "_dedup_key": "app:preexisting"}
     _seed(ddir, [app_row])
@@ -227,4 +294,5 @@ def test_ingest_end_to_end_with_mocked_http(sample_xml, tmp_path, monkeypatch):
 
     s = fi.ingest_flex(ddir=ddir, opener=opener, sleep=lambda *_: None)
     assert s["ok"] and s["fills"] == 46
-    assert s["flex_trade_rows"] == 18 and s["flex_position_rows"] == 2
+    assert s["flex_trade_rows"] == 11 and s["flex_position_rows"] == 2
+    assert s["quarantined_rows"] == 0

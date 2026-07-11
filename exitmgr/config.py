@@ -15,6 +15,7 @@ class IBConfig:
     host: str = "127.0.0.1"
     port: int = 7497
     client_id: int = 42
+    protective_client_id: int = 189  # dedicated CPU-only protective service; must differ from entry
     market_data_type: int = 3  # 1=live (paid subscription), 3=delayed (free, ~15min lag)
 
 

@@ -49,6 +49,8 @@ import os
 import statistics
 import sys
 from collections import defaultdict
+
+from exitmgr import dataset_integrity
 from datetime import datetime, timezone
 
 # ---- derivation tunables (conservative -- this informs REAL-money sizing) ------------------
@@ -187,6 +189,9 @@ def load_closed_trades(dataset_path):
     out = []
     for rec in _iter_jsonl(dataset_path):
         if not isinstance(rec, dict) or rec.get("kind") != "trade":
+            continue
+        allowed, _ = dataset_integrity.allowed(rec, "pnl")
+        if not allowed:
             continue
         close = rec.get("close") or {}
         if close.get("partial"):

@@ -173,8 +173,22 @@ def test_loader_skips_open_and_partial(tmp_path):
         {"kind": "trade", "entry": {}, "decision": {"chosen": {"conviction": 6}},
          "close": {"realized_pnl_pct": 12.0}, "lifecycle": {}, "labels": {}},
     ]
+    for row in rows:
+        if row.get("kind") == "trade":
+            row.update({"record_status": "CANONICAL", "canonical": True,
+                        "usable_for_training": bool(row.get("decision")),
+                        "usable_for_pnl": True})
     p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     trades = cc.load_closed_trades(str(p))
     assert len(trades) == 2, trades                  # only the 2 closed, non-partial trades
     convs = sorted(t["conviction"] for t in trades)
     assert convs == [6, 9]                            # 6 recovered from decision.chosen
+
+
+def test_loader_rejects_unmarked_trade(tmp_path):
+    import json
+    path = tmp_path / "legacy.jsonl"
+    path.write_text(json.dumps({"kind": "trade", "entry": {"conviction": 9},
+                                "close": {"realized_pnl_pct": 25.0},
+                                "labels": {"win": True}}) + "\n")
+    assert cc.load_closed_trades(str(path)) == []

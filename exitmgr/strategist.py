@@ -28,6 +28,7 @@ from dataclasses import dataclass, asdict
 from typing import List, Optional
 
 from exitmgr.risk import INDEX_UNDERLYINGS
+from exitmgr import provenance
 
 # 1-10 conviction rubric (Trevor 2026-06-12): 1-3 desperate-only, 4 below-avg, 5 middle,
 # 6-8 medium confidence, 8-10 high confidence. Score HONESTLY -- a low score is fine and useful.
@@ -208,7 +209,7 @@ def parse_ideas(raw: str) -> List[TradeIdea]:
 _BUSY_BACKOFFS = (8, 16, 24, 32)
 
 
-def _post_json(endpoint, body, timeout, retries=5, backoff=None):
+def _post_json(endpoint, body, timeout, retries=5, backoff=None, return_identity=False):
     _env_r = os.environ.get("SLATE_POST_RETRIES")
     if _env_r and _env_r.isdigit():
         retries = max(retries, int(_env_r))
@@ -220,14 +221,45 @@ def _post_json(endpoint, body, timeout, retries=5, backoff=None):
     caller skips the cycle (safe). Total added wait is bounded (~80s) so it can never stall the
     trader's 900s loop."""
     data = json.dumps(body).encode()
+    before = None
+    identity_error = None
+    if return_identity:
+        try:
+            before = provenance.runtime_snapshot(endpoint)
+        except provenance.RuntimeIdentityError as exc:
+            identity_error = str(exc)
+            if provenance.identity_required():
+                raise
     last = None
     for attempt in range(retries):
-        req = urllib.request.Request(
-            endpoint, data=data, headers={"Content-Type": "application/json"}
-        )
+        priority = int(os.environ.get("TRADER_LLM_PRIORITY", "1"))
+        headers = {"Content-Type": "application/json"}
+        headers.update(provenance.priority_headers(priority))
+        req = urllib.request.Request(endpoint, data=data, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode(), strict=False)
+                result = json.loads(r.read().decode(), strict=False)
+                if not return_identity:
+                    return result
+                if before is not None:
+                    try:
+                        after = provenance.runtime_snapshot(endpoint)
+                        return result, provenance.request_identity(
+                            endpoint=endpoint, body=body, response=result, before=before, after=after)
+                    except provenance.RuntimeIdentityError as exc:
+                        if provenance.identity_required():
+                            raise
+                        identity_error = str(exc)
+                return result, {
+                    "schema": provenance.IDENTITY_SCHEMA,
+                    "verified": False,
+                    "identity_error": identity_error,
+                    "endpoint": endpoint,
+                    "system_prompt_sha256": provenance.sha256(body["messages"][0].get("content") or ""),
+                    "context_sha256": provenance.sha256(body["messages"][1].get("content") or ""),
+                    "request_sha256": provenance.sha256(body),
+                    "response_sha256": provenance.sha256(result),
+                }
         except urllib.error.HTTPError as e:
             last = e
             if e.code in (502, 503, 504, 429) and attempt < retries - 1:
@@ -258,7 +290,7 @@ def _resolve_thinking(default):
 
 def propose(endpoint: str, model: str, market_context: str, timeout: int = 300,
             recommend: bool = False, thinking: str = None, return_raw: bool = False,
-            return_cot: bool = False):
+            return_cot: bool = False, return_identity: bool = False):
     """recommend=False: conservative loop (silence allowed). recommend=True: daily slate (always
     surfaces its best ideas, scored honestly 1-10).
     thinking: enabled/disabled/adaptive for M3 chain-of-thought. Defaults ON for the daily recommend
@@ -286,11 +318,14 @@ def propose(endpoint: str, model: str, market_context: str, timeout: int = 300,
         "temperature": 0.4,
         "thinking": think,
     }
-    d = _post_json(endpoint, body, timeout)
+    posted = _post_json(endpoint, body, timeout, return_identity=return_identity)
+    d, identity = posted if return_identity else (posted, None)
     _msg = d["choices"][0]["message"]
     content = _msg.get("content") or ""
     cot = _msg.get("reasoning_content") or None  # [m3cot] separate CoT field; None if endpoint stripped it
     ideas = parse_ideas(content)  # PARSING UNCHANGED: runs on the clean `content` exactly as before
+    if return_identity:
+        return (ideas, content, cot, identity)
     if return_cot:
         return (ideas, content, cot)
     return (ideas, content) if return_raw else ideas
@@ -306,7 +341,8 @@ SINGLE_PROMPT = (
 
 
 def propose_one(endpoint: str, model: str, market_context: str, ticker: str, timeout: int = 1800,
-                thinking: str = "enabled", return_raw: bool = False, return_cot: bool = False):
+                thinking: str = "enabled", return_raw: bool = False, return_cot: bool = False,
+                return_identity: bool = False):
     """Best SINGLE trade idea for ONE ticker (model picks direction/structure/conviction). Returns a
     TradeIdea or None. Used when the user adds a discovered name and wants a same-day suggestion.
     return_raw (ADDITIVE, record-only 2026-07-03): when True, returns (idea_or_None, raw_content) so
@@ -327,7 +363,8 @@ def propose_one(endpoint: str, model: str, market_context: str, ticker: str, tim
         "temperature": 0.4,
         "thinking": thinking,
     }
-    d = _post_json(endpoint, body, timeout)
+    posted = _post_json(endpoint, body, timeout, return_identity=return_identity)
+    d, identity = posted if return_identity else (posted, None)
     _msg = d["choices"][0]["message"]
     content = _msg.get("content") or ""          # clean answer (parsing target, unchanged)
     cot = _msg.get("reasoning_content") or None  # [m3cot] separate CoT field; None if endpoint stripped it
@@ -335,6 +372,8 @@ def propose_one(endpoint: str, model: str, market_context: str, ticker: str, tim
              if i.underlying.upper() == ticker.upper()]
     ideas.sort(key=lambda i: -i.conviction)
     best = ideas[0] if ideas else None
+    if return_identity:
+        return (best, content, cot, identity)
     if return_cot:
         return (best, content, cot)
     return (best, content) if return_raw else best

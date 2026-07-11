@@ -2,6 +2,7 @@ ib:
   host: 127.0.0.1
   port: 4001
   client_id: 1
+  protective_client_id: 189
   market_data_type: 1
 journal:
   path: ./trades.log

@@ -212,4 +212,6 @@ def test_h3_phantom_row_skipped_by_realized_present_filter(tmp_path):
         os.path.dirname(cfg.journal.path), "data")
     ds_path = os.path.join(_ddir, "trade_dataset.jsonl")
     closed = load_closed_trades(ds_path)
-    assert len(closed) == 1                        # the resting phantom is NOT calibrated on
+    # The filled fixture still lacks commission-complete canonical NET P&L, so the stricter
+    # canonical consumer rejects both it and the resting phantom.
+    assert closed == []

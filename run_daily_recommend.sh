@@ -14,6 +14,11 @@ export SLACK_BOT_TOKEN
 # POINT-IN-TIME: live decisions only (as_of = now). Do NOT reuse this flag for BACKTESTING
 # without date-filtering retrieval to as-of-the-decision-date, or it leaks the future.
 export STRATEGIST_RAG_ENABLED=1
+export M3_PRIORITY_TOKEN_FILE="${M3_PRIORITY_TOKEN_FILE:-$HOME/.config/m3-serving/priority-token}"
+export TRADER_LLM_PRIORITY=0
+export TRADER_REQUIRE_PRIORITY_TOKEN=1
+export TRADER_REQUIRE_RUNTIME_IDENTITY=1
+export EXITMGR_ORDER_LOCK="${EXITMGR_ORDER_LOCK:-$HOME/.local/var/exitmgr/order-mutation.lock}"
 APPROVALS_CHANNEL="C0XXXXXXXXX"  # replace with #trading-approvals channel ID
 notify(){ curl -s -m 10 -X POST https://slack.com/api/chat.postMessage \
   -H "Authorization: Bearer ${SLACK_BOT_TOKEN:-}" -H "Content-type: application/json" \

@@ -43,6 +43,8 @@ import json
 import os
 import sys
 
+from exitmgr import dataset_integrity
+
 # --------------------------------------------------------------------------- knobs (report-side)
 MIN_FILLS = 5              # per-symbol: below this many filled closes -> verdict INSUFFICIENT
 FILL_RATE_TOO_TIGHT = 0.80 # filled/(filled+unfilled) below this => buffer/floor is TOO TIGHT
@@ -149,7 +151,10 @@ def iter_rows(path):
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    row = json.loads(line)
+                    status = str(row.get("record_status") or "").upper()
+                    if status == dataset_integrity.CANONICAL and row.get("canonical") is True:
+                        yield row
                 except Exception:
                     continue
     except Exception:

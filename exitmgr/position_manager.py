@@ -17,6 +17,9 @@ Decision schema (per con_id):
 import json
 import re
 import urllib.request
+import os
+
+from exitmgr import provenance
 import urllib.error
 
 SYSTEM = (
@@ -53,20 +56,54 @@ SYSTEM = (
 )
 
 
-def _post_json(endpoint, model, system, user, timeout=120, retries=3, backoff=8):
-    body = json.dumps({
+def _post_json(endpoint, model, system, user, timeout=120, retries=3, backoff=8,
+               return_identity=False):
+    request_body = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": 0,
         "max_tokens": 1400,
-    }).encode()
+    }
+    body = json.dumps(request_body).encode()
+    before = None
+    identity_error = None
+    if return_identity:
+        try:
+            before = provenance.runtime_snapshot(endpoint)
+        except provenance.RuntimeIdentityError as exc:
+            identity_error = str(exc)
+            if provenance.identity_required():
+                raise
     last = ""
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(endpoint, data=body, headers={"Content-Type": "application/json"})
+            headers = {"Content-Type": "application/json"}
+            headers.update(provenance.priority_headers(
+                int(os.environ.get("TRADER_LLM_PRIORITY", "1"))))
+            req = urllib.request.Request(endpoint, data=body, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 d = json.loads(r.read().decode())
-            return d["choices"][0]["message"].get("content") or ""
+            content = d["choices"][0]["message"].get("content") or ""
+            if not return_identity:
+                return content
+            if before is not None:
+                try:
+                    after = provenance.runtime_snapshot(endpoint)
+                    return content, provenance.request_identity(
+                        endpoint=endpoint, body=request_body, response=d,
+                        before=before, after=after)
+                except provenance.RuntimeIdentityError as exc:
+                    if provenance.identity_required():
+                        raise
+                    identity_error = str(exc)
+            return content, {
+                "schema": provenance.IDENTITY_SCHEMA, "verified": False,
+                "identity_error": identity_error, "endpoint": endpoint,
+                "system_prompt_sha256": provenance.sha256(system),
+                "context_sha256": provenance.sha256(user),
+                "request_sha256": provenance.sha256(request_body),
+                "response_sha256": provenance.sha256(d),
+            }
         except Exception as e:  # noqa: BLE001 - transient busy/connection; retry then give up
             last = str(e)
             if attempt < retries - 1:
@@ -114,8 +151,13 @@ def assess_positions(endpoint, model, positions, market_regime=None, timeout=75,
     # COMPLETE per-cycle model reasoning (untruncated reason + the raw response) onto each mark for
     # fine-tuning. Default False keeps the historical dict-only return byte-identical for every
     # existing caller/test. The exit DECISIONS are unchanged either way.
-    def _ret(out, raw=None):
-        return (out, {"raw": raw}) if return_meta else out
+    def _ret(out, raw=None, model_identity=None):
+        if not return_meta:
+            return out
+        meta = {"raw": raw}
+        if model_identity is not None:
+            meta["model_identity"] = model_identity
+        return out, meta
 
     if not positions:
         return _ret({})
@@ -124,10 +166,14 @@ def assess_positions(endpoint, model, positions, market_regime=None, timeout=75,
         return _ret({})
     try:
         user = json.dumps({"market_regime": market_regime, "positions": positions}, default=str)
-        raw = _post_json(endpoint, model, SYSTEM, user, timeout=timeout, retries=2, backoff=5)
+        capture_identity = os.environ.get("TRADER_CAPTURE_EXIT_IDENTITY", "0").lower() \
+            not in ("0", "false", "no", "off")
+        posted = _post_json(endpoint, model, SYSTEM, user, timeout=timeout, retries=2, backoff=5,
+                            return_identity=capture_identity)
+        raw, model_identity = posted if isinstance(posted, tuple) else (posted, None)
         data = _extract_json(raw)
         if not isinstance(data, dict):
-            return _ret({}, raw)
+            return _ret({}, raw, model_identity)
         decs = data.get("decisions") or {}
         out = {}
         for k, v in decs.items():
@@ -160,7 +206,7 @@ def assess_positions(endpoint, model, positions, market_regime=None, timeout=75,
                 # pathological response (max_tokens=1400 keeps this far below the cap in practice).
                 "reason": str(v.get("reason", ""))[:8000],
             }
-        return _ret(out, raw)
+        return _ret(out, raw, model_identity)
     except Exception as e:  # noqa: BLE001
         print(f"[POSMGMT] assess_positions failed ({e}); falling back to static exit rules")
         return _ret({})

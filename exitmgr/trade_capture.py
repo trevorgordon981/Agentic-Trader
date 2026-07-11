@@ -27,6 +27,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, List
 
+from exitmgr import dataset_integrity as _di
+
 SCHEMA = "trade_dataset.v2"
 DECISION_SCHEMA = "decision_context.v2"
 
@@ -136,6 +138,13 @@ def _dedup_key(rec: dict) -> Optional[str]:
     event on a genuinely different day is still kept). Never raises."""
     try:
         r = {k: v for k, v in rec.items() if k != "_dedup_key"}
+        decision_id = r.get("decision_id")
+        if decision_id:
+            # Decision events are revisioned. Never collapse distinct proposal/approval/submit
+            # events merely because they happened on the same day.
+            blob = json.dumps(r, sort_keys=True, default=str)
+            return (f"{rec.get('kind', '')}:{decision_id}:{r.get('revision', 0)}:"
+                    f"{r.get('event', '')}:{hashlib.sha256(blob.encode()).hexdigest()}")
         ts = r.get("ts")
         if isinstance(ts, str) and len(ts) >= 10:
             r["ts"] = ts[:10]  # day granularity -> retries within a day collapse
@@ -316,7 +325,9 @@ def capture_decision(ddir: str, *, source: str, symbol: str,
                      right=None, strike=None, expiry=None, structure=None, con_id=None,
                      chosen_idea=None, candidates=None, raw_strategist=None, cot=None, gate=None,
                      construction=None, technical_card=None, regime=None,
-                     market_context=None, sizing=None, extra=None) -> Optional[dict]:
+                     market_context=None, sizing=None, extra=None, decision_id=None,
+                     revision: int = 0, event: str = "proposal", model_identity=None,
+                     final_contract=None, order_ref=None, human_action=None) -> Optional[dict]:
     """Append the FULL decision context for an idea that was chosen/entered. Joined into the
     closed-trade v2 record at close by load_decision_context(). Never raises."""
     try:
@@ -324,6 +335,9 @@ def capture_decision(ddir: str, *, source: str, symbol: str,
             "schema": DECISION_SCHEMA,
             "kind": "decision",
             "ts": _now(),
+            "decision_id": decision_id,
+            "revision": int(revision or 0),
+            "event": event,
             # durable per-trade join key: the close row (written by manager) resolves to the SAME
             # uid from the same identity, so an SFT builder can pair this decision with its outcome.
             "trade_uid": trade_uid(con_id=con_id, symbol=symbol, strike=strike,
@@ -345,6 +359,10 @@ def capture_decision(ddir: str, *, source: str, symbol: str,
             "regime": _as_dict(regime),             # regime snapshot (bull/neutral/risk_off + trend/vix)
             "market_context": _cap(market_context, _CONTEXT_CAP),  # RAG/news/journal/quote brief
             "sizing": _as_dict(sizing),
+            "model_identity": _as_dict(model_identity),
+            "final_contract": _as_dict(final_contract),
+            "order_ref": order_ref,
+            "human_action": _as_dict(human_action),
             "extra": _as_dict(extra),
         }
         _append(decision_context_path(ddir), rec, dedup=True)
@@ -359,7 +377,8 @@ def capture_decision(ddir: str, *, source: str, symbol: str,
 
 # --------------------------------------------------------------------------- capture: NO-TRADE
 def capture_no_trade(ddir: str, *, source: str, reason=None, raw_strategist=None, cot=None,
-                     candidates=None, regime=None, market_context=None, extra=None) -> Optional[dict]:
+                     candidates=None, regime=None, market_context=None, extra=None,
+                     model_identity=None) -> Optional[dict]:
     """Append a light NO_TRADE row to the dataset: the model/flow declined to trade. Learns
     from passes, not just fills. Counterfactual outcome can be backfilled later. Never raises."""
     try:
@@ -374,8 +393,11 @@ def capture_no_trade(ddir: str, *, source: str, reason=None, raw_strategist=None
             "candidates": _candidates(candidates),  # ideas the model floated but none chosen (if any)
             "regime": _as_dict(regime),
             "market_context": _cap(market_context, _CONTEXT_CAP),
+            "model_identity": _as_dict(model_identity),
             "extra": _as_dict(extra),
         }
+        _di.mark(rec, status=_di.CANONICAL, training=True, pnl=False,
+                 reason="abstention has no realized P&L")
         _append(dataset_path(ddir), rec, dedup=True)
         return rec
     except Exception as e:
@@ -390,7 +412,8 @@ def capture_no_trade(ddir: str, *, source: str, reason=None, raw_strategist=None
 def capture_rejected(ddir: str, *, source: str, symbol: str, reason, stage,
                      idea=None, gate=None, construction=None, structure=None,
                      right=None, strike=None, expiry=None, order=None,
-                     regime=None, extra=None) -> Optional[dict]:
+                     regime=None, extra=None, decision_id=None, revision: int = 0,
+                     model_identity=None) -> Optional[dict]:
     """Append a light REJECTED row: an idea the model produced that a gate/constructor threw
     out (risk gate, construction gate, budget, gross-size, sector block, human decline). Records
     the reasoning + the rejected structure so the dataset learns which ideas get killed and why.
@@ -401,6 +424,8 @@ def capture_rejected(ddir: str, *, source: str, symbol: str, reason, stage,
             "schema": SCHEMA,
             "kind": "rejected",
             "ts": _now(),
+            "decision_id": decision_id,
+            "revision": int(revision or 0),
             "trade_uid": trade_uid(con_id=None, symbol=symbol, strike=strike,
                                    expiry=expiry, right=right),
             "source": source,
@@ -416,8 +441,11 @@ def capture_rejected(ddir: str, *, source: str, symbol: str, reason, stage,
             "gate": _gate_dict(gate),
             "construction": _as_dict(construction),
             "regime": _as_dict(regime),
+            "model_identity": _as_dict(model_identity),
             "extra": _as_dict(extra),
         }
+        _di.mark(rec, status=_di.CANONICAL, training=True, pnl=False,
+                 reason="rejected proposal has no realized P&L")
         _append(dataset_path(ddir), rec, dedup=True)
         return rec
     except Exception as e:
@@ -478,6 +506,8 @@ def capture_unfilled(ddir: str, *, source: str, symbol: str, con_id=None,
             },
             "extra": _as_dict(extra),
         }
+        _di.mark(rec, status=_di.CANONICAL, training=False, pnl=False,
+                 reason="unfilled exit has no realized outcome")
         _append(dataset_path(ddir), rec)
         return rec
     except Exception as e:  # never raise into the exit path
@@ -513,61 +543,49 @@ def _strike_eq(a, b) -> bool:
         return False
 
 
-def load_decision_context(ddir: str, *, con_id=None, symbol=None, strike=None,
+def load_decision_context(ddir: str, *, decision_id=None, con_id=None, symbol=None, strike=None,
                           expiry=None, right=None) -> Optional[dict]:
-    """Return the best-matching decision record for a closed trade (to embed under the v2
-    record's `decision` block), or None. Match precedence: exact con_id > symbol+strike+expiry+
-    right > symbol+strike > symbol-only; ties broken by most-recent ts. Never raises."""
+    """Return the latest revision for one immutable decision id.
+
+    Contract/symbol fallback is intentionally forbidden: it can attach a later same-name proposal
+    to an unrelated fill and manufacture a causal training example. Legacy rows without a
+    decision_id remain honestly unjoined.
+    """
     try:
+        if not decision_id:
+            return None
         path = decision_context_path(ddir)
         best = None
-        best_rank = -1
+        best_revision = -1
         best_ts = ""
         for rec in _iter_jsonl(path):
-            if rec.get("kind") != "decision":
+            if rec.get("kind") != "decision" or rec.get("decision_id") != decision_id:
                 continue
-            r_sym = rec.get("symbol")
-            rank = -1
-            if con_id is not None and rec.get("con_id") is not None \
-                    and int(rec.get("con_id")) == int(con_id):
-                rank = 4
-            elif symbol is not None and r_sym == symbol and _strike_eq(rec.get("strike"), strike) \
-                    and rec.get("expiry") == expiry and (right is None or rec.get("right") == right):
-                rank = 3
-            elif symbol is not None and r_sym == symbol and _strike_eq(rec.get("strike"), strike):
-                rank = 2
-            elif symbol is not None and r_sym == symbol:
-                rank = 1
-            if rank < 0:
-                continue
+            try:
+                revision = int(rec.get("revision") or 0)
+            except (TypeError, ValueError):
+                revision = 0
             ts = str(rec.get("ts") or "")
-            if rank > best_rank or (rank == best_rank and ts >= best_ts):
-                best, best_rank, best_ts = rec, rank, ts
+            if revision > best_revision or (revision == best_revision and ts >= best_ts):
+                best, best_revision, best_ts = rec, revision, ts
         return best
     except Exception:
         return None
 
 
-def load_review(ddir: str, *, symbol=None, con_id=None, date=None) -> Optional[dict]:
+def load_review(ddir: str, *, decision_id=None, symbol=None, con_id=None, date=None) -> Optional[dict]:
     """Best-effort read-back of a post-trade review/coach artifact for this trade, if one was
     generated (morning_review or a coach path). Looks for a `reviews.jsonl` sidecar in the
     dataset dir whose rows carry {symbol|con_id|date, review/text/reasoning}. Returns the best
     match or None. Never raises -- a missing review simply omits the block."""
     try:
+        if not decision_id:
+            return None
         path = os.path.join(ddir or ".", "reviews.jsonl")
         best = None
         best_ts = ""
         for rec in _iter_jsonl(path):
-            ok = False
-            if con_id is not None and rec.get("con_id") is not None:
-                try:
-                    ok = int(rec.get("con_id")) == int(con_id)
-                except (TypeError, ValueError):
-                    ok = False
-            if not ok and symbol is not None and rec.get("symbol") == symbol:
-                if date is None or str(rec.get("date") or "")[:10] == str(date)[:10]:
-                    ok = True
-            if not ok:
+            if rec.get("decision_id") != decision_id:
                 continue
             ts = str(rec.get("ts") or "")
             if ts >= best_ts:

@@ -49,6 +49,7 @@ This is a MANUAL / periodic archive + reconcile tool (not run every exit cycle -
 already covers going-forward). CLI: `python -m exitmgr.flex_ingest`.
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -60,6 +61,7 @@ from xml.etree import ElementTree as ET
 
 from exitmgr import exec_capture as _ec
 from exitmgr import trade_capture as _tc
+from exitmgr import dataset_integrity as _di
 
 FLEX_BASE = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
 SEND_URL = FLEX_BASE + "/SendRequest"
@@ -67,6 +69,8 @@ DEFAULT_ENV = os.path.expanduser("~/.hermes/.env")
 SOURCE_TAG = "flex_history"
 _INPROGRESS_CODE = "1019"  # "Statement generation in progress. Please try again shortly."
 _BAK_SUFFIX = "bak-flexingest-20260703"
+_STRATEGY_CLOSE_WINDOW_S = 24 * 60 * 60
+_PNL_TOLERANCE_USD = 0.05
 
 
 # --------------------------------------------------------------------------- small utils
@@ -313,28 +317,244 @@ def _retag(row: Dict[str, Any], manual: Optional[bool], meta: Dict[str, Any],
     return row
 
 
+def _parse_iso(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _same_strategy_window(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Conservative two-leg strategy matcher.
+
+    IB Flex assigns distinct order/trade ids to combo legs, so the durable common evidence is the
+    exact opening timestamp plus contract shape. We additionally require matching quantity,
+    underlying/right/expiry, opposite opening sides, and closes within one day. This permits a
+    broker-managed leg-out while refusing unrelated later round trips. Ambiguous
+    groups are deliberately left as single legs instead of fabricating a spread.
+    """
+    ae, be = a.get("entry") or {}, b.get("entry") or {}
+    ac, bc = a.get("close") or {}, b.get("close") or {}
+    if not (ae.get("ts") and ae.get("ts") == be.get("ts")):
+        return False
+    if (a.get("symbol"), ae.get("right"), ae.get("expiry"), ae.get("quantity")) != (
+            b.get("symbol"), be.get("right"), be.get("expiry"), be.get("quantity")):
+        return False
+    if {ae.get("direction"), be.get("direction")} != {"long", "short"}:
+        return False
+    at, bt = _parse_iso(ac.get("ts")), _parse_iso(bc.get("ts"))
+    if at is None or bt is None or abs((at - bt).total_seconds()) > _STRATEGY_CLOSE_WINDOW_S:
+        return False
+    return not bool(ac.get("partial") or bc.get("partial"))
+
+
+def _strategy_kind(long_leg: Dict[str, Any], short_leg: Dict[str, Any]) -> str:
+    le, se = long_leg.get("entry") or {}, short_leg.get("entry") or {}
+    right = str(le.get("right") or "").upper()
+    try:
+        ls, ss = float(le.get("strike")), float(se.get("strike"))
+    except (TypeError, ValueError):
+        return "option_spread"
+    if (right == "C" and ls < ss) or (right == "P" and ls > ss):
+        return "call_debit_spread" if right == "C" else "put_debit_spread"
+    return "option_spread"
+
+
+def _aggregate_pair(long_leg: Dict[str, Any], short_leg: Dict[str, Any]) -> Dict[str, Any]:
+    """Collapse two independently reported Flex legs into one strategy/outcome row."""
+    le, se = long_leg["entry"], short_leg["entry"]
+    lc, sc = long_leg["close"], short_leg["close"]
+    legs = [long_leg, short_leg]
+    exec_ids = sorted({str(x) for row in legs
+                       for x in ((row.get("provenance") or {}).get("exec_ids") or [])})
+    strategy_digest = hashlib.sha256("\n".join(exec_ids).encode()).hexdigest()
+    entry_cashflow = round(sum(float((row["entry"].get("entry_cashflow") or 0.0))
+                               for row in legs), 2)
+    net_debit = round(-entry_cashflow, 2) if entry_cashflow < 0 else None
+    net_credit = round(entry_cashflow, 2) if entry_cashflow > 0 else None
+    ib_realized = round(sum(float(row["close"]["realized_pnl_ib"]) for row in legs), 2)
+    computed_values = [(row["close"].get("pnl_validation") or {}).get("computed_net")
+                       for row in legs]
+    computed_net = (round(sum(float(x) for x in computed_values), 2)
+                    if all(x is not None for x in computed_values) else None)
+    difference = (round(computed_net - ib_realized, 2) if computed_net is not None else None)
+    valid = (all(row["close"].get("pnl_valid") is True for row in legs)
+             and (difference is None or abs(difference) <= _PNL_TOLERANCE_USD))
+    pnl_net = ib_realized if valid else None
+    outcome = _ec._outcome(pnl_net)
+    entry_commission = round(sum(float(row["close"].get("entry_commission") or 0.0)
+                                 for row in legs), 4)
+    exit_commission = round(sum(float(row["close"].get("exit_commission") or 0.0)
+                                for row in legs), 4)
+    structure = _strategy_kind(long_leg, short_leg)
+    close_ts = max(str(lc.get("ts") or ""), str(sc.get("ts") or ""))
+    provenance = {
+        "capture_source": "ibkr_flex_web_service",
+        "exec_ids": exec_ids,
+        "order_ids": sorted({x for row in legs
+                              for x in ((row.get("provenance") or {}).get("order_ids") or [])}),
+        "trade_ids": sorted({x for row in legs
+                              for x in ((row.get("provenance") or {}).get("trade_ids") or [])}),
+        "strategy_match": "exact-open-ts+shape+opposite-side+bounded-close-ts",
+        "leg_trade_uids": [row.get("trade_uid") for row in legs],
+    }
+    leg_payload = [{
+        "con_id": row.get("con_id"),
+        "direction": row["entry"].get("direction"),
+        "open_side": row["entry"].get("open_side"),
+        "close_side": row["entry"].get("close_side"),
+        "strike": row["entry"].get("strike"),
+        "quantity": row["entry"].get("quantity"),
+        "entry_price": (row["entry"].get("debit") or row["entry"].get("credit")),
+        "entry_cashflow": row["entry"].get("entry_cashflow"),
+        "close_cashflow": row["close"].get("close_cashflow"),
+        "realized_pnl_ib": row["close"].get("realized_pnl_ib"),
+    } for row in legs]
+    row = {
+        "schema": "trade_dataset.v2",
+        "kind": "trade",
+        "source": SOURCE_TAG,
+        "manual": (True if all(r.get("manual") is True for r in legs) else
+                   (False if any(r.get("manual") is False for r in legs) else None)),
+        "reasoning_available": False,
+        "ts": _now(),
+        "trade_uid": f"flex-strategy:{strategy_digest}",
+        "trade_instance_uid": f"flex-strategy:{strategy_digest}",
+        "con_id": long_leg.get("con_id"),
+        "con_ids": [long_leg.get("con_id"), short_leg.get("con_id")],
+        "symbol": long_leg.get("symbol"),
+        "decision": None,
+        "entry": {
+            "ts": le.get("ts"), "symbol": long_leg.get("symbol"),
+            "right": le.get("right"), "expiry": le.get("expiry"),
+            "structure": structure, "quantity": le.get("quantity"),
+            "debit": net_debit, "credit": net_credit, "entry_cashflow": entry_cashflow,
+            "spread": {"long_con_id": long_leg.get("con_id"),
+                       "short_con_id": short_leg.get("con_id"),
+                       "long_strike": le.get("strike"), "short_strike": se.get("strike"),
+                       "legs": leg_payload},
+            "profit_target_pct": None, "stop_pct": None, "conviction": None,
+            "thesis": None, "entry_outside_window": False,
+            "basis_source": "IBKR Flex strategy aggregation; signed leg cashflows",
+        },
+        "lifecycle": {"mark_path": [], "marks": 0, "mfe_pct": None, "mae_pct": None,
+                      "drawdown_from_peak_pct": None},
+        "close": {
+            "ts": close_ts, "reason": "manual_close", "rule_fired": None,
+            "realized_pnl": computed_net, "realized_pnl_net": pnl_net,
+            "realized_pnl_ib": ib_realized,
+            "realized_pnl_pct": (round(pnl_net / net_debit * 100, 2)
+                                 if pnl_net is not None and net_debit else None),
+            "entry_commission": entry_commission, "exit_commission": exit_commission,
+            "commission_unknown": any(bool(row["close"].get("commission_unknown")) for row in legs),
+            "pnl_is_estimate": False, "pnl_valid": valid, "pnl_quarantined": not valid,
+            "pnl_validation": {"status": "valid" if valid else "ib_disagreement",
+                               "tolerance_usd": _PNL_TOLERANCE_USD,
+                               "computed_net": computed_net, "ib_realized": ib_realized,
+                               "difference": difference},
+            "holding_days": _ec._holding_days(le.get("ts"), close_ts),
+            "fill_status": "filled", "tp_hit": None, "sl_hit": None, "partial": False,
+            "basis_source": "IBKR Flex strategy aggregation; IB realized P&L authoritative",
+        },
+        "labels": {"outcome": outcome, "win": ((outcome == "win") if outcome else None),
+                   "round_trip": None},
+        "review": None,
+        "provenance": provenance,
+    }
+    row["_dedup_key"] = f"flex-strategy:{strategy_digest}"
+    return row
+
+
+def _aggregate_strategy_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    used: set = set()
+    out: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        if i in used or (row.get("entry") or {}).get("direction") != "long":
+            continue
+        matches = [j for j, candidate in enumerate(rows)
+                   if j not in used and j != i
+                   and (candidate.get("entry") or {}).get("direction") == "short"
+                   and _same_strategy_window(row, candidate)]
+        if len(matches) == 1:
+            j = matches[0]
+            out.append(_aggregate_pair(row, rows[j]))
+            used.update((i, j))
+    out.extend(row for i, row in enumerate(rows) if i not in used)
+    return out
+
+
+def _split_contract_episodes(fills: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Split repeated round trips in the same conId using Flex's explicit O/C indicator.
+
+    A contract can be closed and later reopened inside one statement. Grouping the entire conId
+    blends opposite directions and commissions into one fake trade. Each time cumulative closing
+    quantity flattens the episode, seal it and start a new instance.
+    """
+    if not any(fill.get("open_close") in ("O", "C") for fill in fills):
+        return [fills]
+    ordered = sorted(fills, key=lambda fill: (
+        str(fill.get("time") or ""), 0 if fill.get("open_close") == "O" else 1,
+        str(fill.get("exec_id") or "")))
+    episodes: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    opened = closed = 0.0
+    for fill in ordered:
+        current.append(fill)
+        qty = float(fill.get("shares") or 0.0)
+        if fill.get("open_close") == "O":
+            opened += qty
+        elif fill.get("open_close") == "C":
+            closed += qty
+        if opened > 0 and closed >= opened - 1e-9:
+            episodes.append(current)
+            current, opened, closed = [], 0.0, 0.0
+    if current:
+        episodes.append(current)
+    return episodes
+
+
 def build_flex_rows(fills: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
-    """Group flex fills by contract, reuse exec_capture pairing, retag flex_history. Returns
-    {trade_rows, position_rows, terminal_exec_ids, contracts}."""
+    """Build side-correct contract rows, conservatively aggregate strategy legs, and quarantine
+    any row whose fill-derived net disagrees with IB's authoritative realized P&L."""
     by_con: Dict[int, List[dict]] = {}
     for f in fills:
         by_con.setdefault(int(f.get("con_id") or 0), []).append(f)
     trade_rows, position_rows = [], []
     terminal_exec_ids: set = set()
     for con_id, cfills in by_con.items():
-        built = _ec.build_rows_for_contract(con_id, cfills)
-        # honest manual flag: True only if every fill is a non-API (manual) order
-        flags = [f.get("api_order") for f in cfills]
-        manual = True if all(x is False for x in flags) else (
-            False if any(x is True for x in flags) else None)
-        if built["trade"] is not None:
-            trade_rows.append(_retag(built["trade"], manual, meta, cfills))
-            if built["terminal"]:
-                terminal_exec_ids.update(built["exec_ids"])
-        if built["position"] is not None:
-            position_rows.append(_retag(built["position"], manual, meta, cfills))
-    return {"trade_rows": trade_rows, "position_rows": position_rows,
-            "terminal_exec_ids": terminal_exec_ids, "contracts": len(by_con)}
+        for episode in _split_contract_episodes(cfills):
+            built = _ec.build_rows_for_contract(con_id, episode)
+            # honest manual flag: True only if every fill is a non-API (manual) order
+            flags = [f.get("api_order") for f in episode]
+            manual = True if all(x is False for x in flags) else (
+                False if any(x is True for x in flags) else None)
+            if built["trade"] is not None:
+                trade_rows.append(_retag(built["trade"], manual, meta, episode))
+                if built["terminal"]:
+                    terminal_exec_ids.update(built["exec_ids"])
+            if built["position"] is not None:
+                position_rows.append(_retag(built["position"], manual, meta, episode))
+    strategy_rows = _aggregate_strategy_rows(trade_rows)
+    quarantined_rows = []
+    valid_rows = []
+    for row in strategy_rows:
+        if (row.get("close") or {}).get("pnl_valid") is False:
+            row = dict(row)
+            row["quarantine_reason"] = "computed P&L disagrees with authoritative IB realized P&L"
+            _di.mark(row, status=_di.INVALID, training=False, pnl=False,
+                     reason=row["quarantine_reason"])
+            quarantined_rows.append(row)
+        else:
+            _di.mark(row, status=_di.CANONICAL, training=False, pnl=True,
+                     reason="manual/Flex execution has no attributable model decision")
+            valid_rows.append(row)
+    for row in position_rows:
+        _di.mark(row, status=_di.CANONICAL, training=False, pnl=False,
+                 reason="open position snapshot has no terminal outcome")
+    return {"trade_rows": valid_rows, "position_rows": position_rows,
+            "quarantined_rows": quarantined_rows,
+            "terminal_exec_ids": terminal_exec_ids, "contracts": len(by_con),
+            "strategies": sum(bool((row.get("entry") or {}).get("spread")) for row in valid_rows)}
 
 
 # --------------------------------------------------------------------------- reconcile + write
@@ -380,6 +600,51 @@ def _row_exec_ids(row: Dict[str, Any]) -> set:
     return out
 
 
+def _invalid_pnl(row: Dict[str, Any]) -> bool:
+    close = row.get("close") or {}
+    if close.get("pnl_valid") is False or close.get("pnl_quarantined") is True:
+        return True
+    net, ib = close.get("realized_pnl_net"), close.get("realized_pnl_ib")
+    try:
+        return net is not None and ib is not None and abs(float(net) - float(ib)) > _PNL_TOLERANCE_USD
+    except (TypeError, ValueError):
+        return True
+
+
+def _quarantine_path(dataset_path: str) -> str:
+    stem, _ = os.path.splitext(dataset_path)
+    return stem + ".quarantine.jsonl"
+
+
+def _append_quarantine(dataset_path: str, rows: List[Dict[str, Any]], dry_run: bool = False) -> int:
+    """Persist invalid factual rows outside the training dataset, idempotently."""
+    if not rows or dry_run:
+        return len(rows)
+    path = _quarantine_path(dataset_path)
+    existing = {_row_key(r) for r in _read_rows(path)}
+    fresh = []
+    for source in rows:
+        row = dict(source)
+        original = _row_key(row) or hashlib.sha256(
+            json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()
+        key = f"quarantine:{original}"
+        if key in existing:
+            continue
+        row["quarantined_at"] = _now()
+        row["quarantine_original_key"] = original
+        row["_dedup_key"] = key
+        fresh.append(row)
+        existing.add(key)
+    if fresh:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a") as stream:
+            for row in fresh:
+                stream.write(json.dumps(row, default=str) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    return len(fresh)
+
+
 def _fuzzy_match(row: Dict[str, Any], trade_rows: List[Dict[str, Any]]) -> bool:
     """Fallback identity match by underlying+expiry+right+strike+approx entry date (<=4d) when the
     uuid5 identity differs. Belt-and-suspenders for backfilled rows built before the uuid existed."""
@@ -405,20 +670,45 @@ def _fuzzy_match(row: Dict[str, Any], trade_rows: List[Dict[str, Any]]) -> bool:
 
 def reconcile_and_write(dataset_path: str, trade_rows: List[Dict[str, Any]],
                         position_rows: List[Dict[str, Any]], dry_run: bool = False,
-                        backup: bool = True) -> Dict[str, Any]:
+                        backup: bool = True,
+                        quarantined_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Supersede estimate rows with richer Flex rows, dedup, and rewrite the dataset atomically.
     Returns a summary. Idempotent: a second run supersedes 0 and appends 0."""
     existing = _read_rows(dataset_path)
-    flex_uids = {r.get("trade_uid") for r in trade_rows if r.get("trade_uid")}
-    flex_inst = {r.get("trade_instance_uid") for r in trade_rows if r.get("trade_instance_uid")}
+    replacements = list(trade_rows) + list(quarantined_rows or [])
+    flex_uids = {r.get("trade_uid") for r in replacements if r.get("trade_uid")}
+    flex_inst = {r.get("trade_instance_uid") for r in replacements if r.get("trade_instance_uid")}
+    incoming_exec_ids: set = set()
+    incoming_keys = {_row_key(row) for row in list(trade_rows) + list(position_rows)}
+    for row in replacements + list(position_rows):
+        incoming_exec_ids |= _row_exec_ids(row)
 
     kept: List[Dict[str, Any]] = []
     superseded: List[Dict[str, Any]] = []
+    invalid_existing: List[Dict[str, Any]] = []
     for row in existing:
+        # Replace a prior per-leg Flex representation with the current strategy-aware row whenever
+        # they share executions. Invalid legacy rows are first copied to the quarantine sidecar.
+        if (row.get("source") == SOURCE_TAG and (_row_exec_ids(row) & incoming_exec_ids)
+                and _row_key(row) not in incoming_keys):
+            superseded.append(row)
+            if _invalid_pnl(row):
+                bad = dict(row)
+                bad["quarantine_reason"] = "legacy Flex P&L disagrees with authoritative IB P&L"
+                _di.mark(bad, status=_di.INVALID, training=False, pnl=False,
+                         reason=bad["quarantine_reason"])
+                invalid_existing.append(bad)
+            else:
+                old = dict(row)
+                old["quarantine_reason"] = "superseded by canonical strategy-aware Flex row"
+                _di.mark(old, status=_di.LEGACY, training=False, pnl=False,
+                         reason=old["quarantine_reason"])
+                invalid_existing.append(old)
+            continue
         if _is_estimate_row(row) and (
                 row.get("trade_instance_uid") in flex_inst
                 or row.get("trade_uid") in flex_uids
-                or _fuzzy_match(row, trade_rows)):
+                or _fuzzy_match(row, replacements)):
             superseded.append(row)
             continue
         kept.append(row)
@@ -459,6 +749,9 @@ def reconcile_and_write(dataset_path: str, trade_rows: List[Dict[str, Any]],
         "skipped_execdup": skipped_execdup,
         "final_rows": len(new_rows),
         "dry_run": dry_run,
+        "quarantined_existing": _append_quarantine(
+            dataset_path, invalid_existing, dry_run=dry_run),
+        "quarantine_path": _quarantine_path(dataset_path),
     }
     if dry_run:
         return result
@@ -538,8 +831,15 @@ def ingest_flex(*, token: Optional[str] = None, query_id: Optional[str] = None,
         built = build_flex_rows(fills, meta)
         trade_rows = built["trade_rows"]
         position_rows = built["position_rows"]
+        quarantined_rows = built["quarantined_rows"]
 
-        recon = reconcile_and_write(dpath, trade_rows, position_rows, dry_run=dry_run)
+        migration = _di.migrate_ledger(dpath, dry_run=dry_run)
+
+        quarantined_new = _append_quarantine(dpath, quarantined_rows, dry_run=dry_run)
+
+        recon = reconcile_and_write(
+            dpath, trade_rows, position_rows, dry_run=dry_run,
+            quarantined_rows=quarantined_rows)
 
         # fold terminal-trade execIDs into the SHARED exec_capture watermark so a later
         # reqExecutions run won't re-add this same history.
@@ -556,8 +856,13 @@ def ingest_flex(*, token: Optional[str] = None, query_id: Optional[str] = None,
             "meta": meta,
             "fills": len(fills),
             "contracts": built["contracts"],
+            "strategies": built["strategies"],
             "flex_trade_rows": len(trade_rows),
             "flex_position_rows": len(position_rows),
+            "quarantined_rows": len(quarantined_rows),
+            "quarantined_written": quarantined_new,
+            "quarantine_path": _quarantine_path(dpath),
+            "canonical_migration": migration,
             "reconcile": recon,
             "summary": usum,
         })

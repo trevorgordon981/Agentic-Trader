@@ -37,18 +37,22 @@ Usage:
                           [--dataset-dir DIR] [--include-open] [--min-realized PCT]
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
+import time
 
 # ---- REUSE the app's exact join logic (read-only). Optional: embedded blocks work without it. ----
 _HAVE_TC = False
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from exitmgr import trade_capture as _tc  # noqa: E402
+    from exitmgr import dataset_integrity as _di  # noqa: E402
     _HAVE_TC = True
 except Exception:  # pragma: no cover - exporter still works off embedded decision/review blocks
     _tc = None
+    _di = None
 
 
 SYSTEM_PROMPT = (
@@ -120,6 +124,24 @@ def _derive_trade_uid(rec, entry):
         return None
 
 
+_PNL_TOLERANCE_USD = 0.05
+
+
+def _pnl_integrity(cl):
+    """Return (valid, reason). IB realized P&L is authoritative whenever present."""
+    cl = cl or {}
+    if cl.get("pnl_valid") is False or cl.get("pnl_quarantined") is True:
+        return False, "capture marked P&L invalid/quarantined"
+    net, ib = cl.get("realized_pnl_net"), cl.get("realized_pnl_ib")
+    try:
+        if net is not None and ib is not None and abs(float(net) - float(ib)) > _PNL_TOLERANCE_USD:
+            return False, (f"computed net {float(net):.2f} disagrees with "
+                           f"IB realized {float(ib):.2f}")
+    except (TypeError, ValueError):
+        return False, "non-numeric realized P&L"
+    return True, None
+
+
 def _pnl_from_close(cl):
     """REAL cost-basis resolution (2026-07-03). Prefer realized_pnl_net (gross realized minus BOTH
     round-trip commissions, computed by manager from actual fills). Only fall back to gross
@@ -128,10 +150,16 @@ def _pnl_from_close(cl):
     a non-fill (realized_pnl None but mark_estimate present) is likewise flagged, never promoted to
     'realized'. Returns (pnl_net, pnl_gross, pnl_pct, pnl_is_estimate, basis_note)."""
     cl = cl or {}
+    valid, invalid_reason = _pnl_integrity(cl)
     net = cl.get("realized_pnl_net")
+    ib = cl.get("realized_pnl_ib")
     gross = cl.get("realized_pnl")
     pct = cl.get("realized_pnl_pct")
     commission_unknown = bool(cl.get("commission_unknown"))
+    if not valid:
+        return None, gross, None, True, f"INVALID P&L: {invalid_reason}"
+    if ib is not None:
+        return ib, gross, pct, False, "IB realized P&L (authoritative)"
     if net is not None and not commission_unknown:
         return net, gross, pct, False, "fills+commissions (net)"
     if gross is not None:
@@ -171,12 +199,14 @@ def _resolve_decision(rec, ddir, entry):
     """Return (decision_block, source). Prefer the block already embedded on the trade row
     (joined at close using the exact keys); else re-attempt the SAME join from the sidecar."""
     d = rec.get("decision")
-    if d:
+    decision_id = rec.get("decision_id") or (entry or {}).get("decision_id")
+    if d and (not decision_id or d.get("decision_id") == decision_id):
         return d, "embedded"
     if _HAVE_TC and entry is not None:
         try:
             d = _tc.load_decision_context(
                 ddir,
+                decision_id=decision_id,
                 con_id=rec.get("con_id"),
                 symbol=entry.get("symbol") or rec.get("symbol"),
                 strike=entry.get("strike"),
@@ -193,13 +223,15 @@ def _resolve_decision(rec, ddir, entry):
 def _resolve_review(rec, ddir, entry):
     """Return (review_block, source), same embedded-then-rejoin strategy with load_review's keys."""
     rv = rec.get("review")
-    if rv:
+    decision_id = rec.get("decision_id") or (entry or {}).get("decision_id")
+    if rv and (not decision_id or rv.get("decision_id") == decision_id):
         return rv, "embedded"
     if _HAVE_TC:
         try:
             ets = (entry or {}).get("ts")
             rv = _tc.load_review(
                 ddir,
+                decision_id=rec.get("decision_id") or (entry or {}).get("decision_id"),
                 con_id=rec.get("con_id"),
                 symbol=(entry or {}).get("symbol") or rec.get("symbol"),
                 date=(str(ets)[:10] if ets else None),
@@ -533,6 +565,8 @@ def export(dataset_dir, out_path, fmt, include_open, min_realized):
         "wins": 0, "losses": 0, "scratch": 0,
         "missing_decision": 0, "missing_review": 0,
         "contaminated_dropped": 0, "dedup_dropped": 0, "pnl_estimate": 0,
+        "invalid_pnl_dropped": 0,
+        "noncanonical_dropped": 0,
     }
     examples = []  # (sort_key, record)
     ts_seen = []
@@ -543,11 +577,32 @@ def export(dataset_dir, out_path, fmt, include_open, min_realized):
             counts["malformed"] += 1
             continue
         try:
+            if _di is not None:
+                _canonical_ok, _canonical_reason = _di.allowed(rec, "training")
+                if not _canonical_ok:
+                    counts["noncanonical_dropped"] += 1
+                    dropped_log.append({
+                        "reason": "not_canonical_for_training", "detail": _canonical_reason,
+                        "record_status": rec.get("record_status"), "ts": _resolve_ts(rec),
+                        "symbol": rec.get("symbol"), "con_id": rec.get("con_id"),
+                    })
+                    continue
             kind = rec.get("kind")
             if kind == "trade":
                 has_close = rec.get("close") is not None
                 if not has_close and not include_open:
                     counts["skipped_open"] += 1
+                    continue
+                _pnl_ok, _pnl_reason = _pnl_integrity(rec.get("close") or {})
+                if not _pnl_ok:
+                    counts["invalid_pnl_dropped"] += 1
+                    dropped_log.append({
+                        "reason": "invalid_realized_pnl",
+                        "detail": _pnl_reason,
+                        "ts": _resolve_ts(rec),
+                        "symbol": rec.get("symbol"),
+                        "con_id": rec.get("con_id"),
+                    })
                     continue
                 if min_realized is not None:
                     rp = (rec.get("close") or {}).get("realized_pnl_pct")
@@ -603,6 +658,10 @@ def export(dataset_dir, out_path, fmt, include_open, min_realized):
 
         # --- durable join key on every emitted example ---
         _set_uid(ex, fmt, _derive_trade_uid(rec, rec.get("entry") or {}))
+        _target = ex.setdefault("metadata", {}) if fmt == "chat" else ex
+        _target.update({"record_status": "CANONICAL", "canonical": True,
+                        "usable_for_training": True,
+                        "source_record_status": rec.get("record_status") or "UNMARKED_LEGACY_APP"})
 
         # --- track how many trade labels rest on an estimated (non-net) basis ---
         _lbl = ex.get("label") or (ex.get("metadata") or {}).get("label") or {}
@@ -631,10 +690,24 @@ def export(dataset_dir, out_path, fmt, include_open, min_realized):
         deduped.append((sk, ex))
     examples = deduped
 
+    if os.path.exists(out_path):
+        legacy_path = f"{out_path}.LEGACY_NOT_FOR_TRAINING.{time.time_ns()}"
+        os.replace(out_path, legacy_path)
+        with open(legacy_path + ".manifest.json", "w") as marker:
+            json.dump({"record_status": "LEGACY", "canonical": False,
+                       "usable_for_training": False, "usable_for_pnl": False,
+                       "reason": "superseded by a canonical validated export"}, marker, sort_keys=True)
     with open(out_path, "w") as f:
         for _k, ex in examples:
             f.write(json.dumps(ex, default=str, sort_keys=True) + "\n")
             counts["emitted"] += 1
+    with open(out_path, "rb") as exported:
+        export_sha256 = hashlib.sha256(exported.read()).hexdigest()
+    with open(out_path + ".manifest.json", "w") as manifest:
+        json.dump({"schema": "trade-training-export.v1", "record_status": "CANONICAL",
+                   "canonical": True, "usable_for_training": True, "usable_for_pnl": False,
+                   "source_dataset": os.path.abspath(ds_path), "format": fmt,
+                   "sha256": export_sha256, "records": len(examples)}, manifest, sort_keys=True)
 
     # --- persist the contamination drops so they are never silently discarded ---
     if dropped_log:

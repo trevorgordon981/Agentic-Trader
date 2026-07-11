@@ -151,6 +151,8 @@ class ResolvedOrder:
     net_vega: float = 0.0
     quote_observed_at: float = 0.0  # monotonic timestamp of the reqTickersAsync result
     decision_id: str = ""          # immutable proposal -> order -> fill -> close lineage
+    decision_revision: int = 0
+    model_identity: Optional[dict] = None
 
 
 def order_summary(r: ResolvedOrder) -> str:
@@ -161,6 +163,18 @@ def order_summary(r: ResolvedOrder) -> str:
                 f"(max loss ~${r.limit * 100 * r.qty:,.0f}, max value ${width * 100 * r.qty:,.0f})")
     return (f"BUY {r.qty}x {r.underlying} {r.expiry} {r.strike:g}{r.right} "
             f"@ ~${r.limit:.2f} (marketable limit after fresh NBBO)  (~${r.limit * 100 * r.qty:,.0f})")
+
+
+def contract_snapshot(r: ResolvedOrder) -> dict:
+    """JSON-safe exact terms approved/submitted for one decision revision."""
+    return {
+        "underlying": r.underlying, "right": r.right, "expiry": r.expiry,
+        "long_con_id": getattr(r.contract, "conId", None), "long_strike": r.strike,
+        "short_con_id": getattr(r.short_contract, "conId", None),
+        "short_strike": (r.short_strike or None), "quantity": r.qty,
+        "limit": r.limit, "max_loss_usd": round(r.limit * 100 * r.qty, 2),
+        "quote_observed_at": r.quote_observed_at,
+    }
 
 
 def pick_spread_short(candidates, long_strike: float, long_mid: float, right: str,
@@ -310,8 +324,13 @@ class Trader:
         return {}
 
     def _save_baselines(self, b: Dict[str, float]) -> None:
-        Path(self.baseline_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(self.baseline_path).write_text(json.dumps(b))
+        # Atomic replacement: a crash during a direct write must not erase the daily-loss baseline
+        # and silently disarm the circuit breaker.
+        path = Path(self.baseline_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(b))
+        tmp.replace(path)
 
     def _load_journal_debits(self) -> Dict[int, float]:
         """Map long-leg contract_id -> journaled NET debit (max loss) for every entry in
@@ -571,6 +590,7 @@ class Trader:
 
         _raw_strategist = None      # verbatim model output, for decision/no-trade capture (v2)
         _cot = None                 # [m3cot] chain-of-thought (reasoning_content), separate from the answer
+        _model_identity = None      # immutable artifact/runtime/prompt/request/context hashes
         if not _market_open():
             audit(self.audit_path, "strategist_skipped", reason="market_closed")
             ideas = []
@@ -581,10 +601,14 @@ class Trader:
             try:
                 # OFF-LOOP (2026-07-03): propose() is a BLOCKING HTTP call to the model server;
                 # run it in a worker thread so the IBKR event loop stays responsive.
-                _res = await asyncio.to_thread(propose, self.endpoint, self.model, context, return_cot=True)
+                _res = await asyncio.to_thread(
+                    propose, self.endpoint, self.model, context,
+                    return_cot=True, return_identity=True)
                 # robust to all shapes: (ideas, raw, cot) 3-tuple, (ideas, raw) 2-tuple, or a
                 # bare list (older/mocked propose). cot is optional/None-safe.
-                if isinstance(_res, tuple) and len(_res) == 3:
+                if isinstance(_res, tuple) and len(_res) == 4:
+                    ideas, _raw_strategist, _cot, _model_identity = _res
+                elif isinstance(_res, tuple) and len(_res) == 3:
                     ideas, _raw_strategist, _cot = _res
                 elif isinstance(_res, tuple) and len(_res) == 2:
                     ideas, _raw_strategist = _res
@@ -900,6 +924,21 @@ class Trader:
                 continue
 
             resolved.decision_id = entry_safety.new_decision_id()
+            resolved.model_identity = _model_identity
+            resolved.decision_revision = 0
+            try:
+                trade_capture.capture_decision(
+                    _ddir, source="trader", symbol=idea.underlying,
+                    right=resolved.right, strike=resolved.strike, expiry=resolved.expiry,
+                    structure=("spread" if resolved.short_contract is not None else "single"),
+                    con_id=getattr(resolved.contract, "conId", None), chosen_idea=idea,
+                    candidates=ideas, raw_strategist=_raw_strategist, cot=_cot,
+                    gate=plan.gate, regime=self._regime, market_context=context,
+                    technical_card=self._price_stats,
+                    decision_id=resolved.decision_id, revision=0, event="proposal",
+                    model_identity=_model_identity, final_contract=contract_snapshot(resolved))
+            except Exception as _capture_error:
+                print(f"[WARN] proposal capture failed (continuing): {_capture_error}")
             _approval_ttl = min(entry_safety.DEFAULT_APPROVAL_TTL_SECONDS,
                                 max(1, int(self.approve_timeout_s)))
             msg = approval.format_proposal(idea, pot.net_liq, plan.gate.per_trade_cap,
@@ -1018,6 +1057,7 @@ class Trader:
                         f":no_entry: *{idea.underlying}* changed again after reapproval — nothing submitted.")
                     continue
                 fresh = fresh2
+                fresh.decision_revision = 1
             resolved = fresh
 
             # Adjacent marker stat: if a halt flips after refresh, _submit_order also refuses.
@@ -1062,12 +1102,19 @@ class Trader:
                                     "net_liq": pot.net_liq, "available_funds": pot.available_funds,
                                     "qty": resolved.qty, "limit": resolved.limit},
                             extra={"order": order_summary(resolved), "status": status,
-                                   "decision_id": resolved.decision_id})
+                                   "decision_id": resolved.decision_id},
+                            decision_id=resolved.decision_id,
+                            revision=resolved.decision_revision, event="submitted",
+                            model_identity=resolved.model_identity,
+                            final_contract=contract_snapshot(resolved),
+                            order_ref=entry_safety.decision_order_ref(resolved.decision_id),
+                            human_action={"action": "approve"})
                     except Exception as _dce:
                         print(f"[WARN] capture_decision failed (continuing): {_dce}")
                     # GUARDRAIL 1: append to the FRESH entry book so later ideas THIS cycle see this
                     # fill (intra-cycle sequential gating preserved on the post-exit book).
-                    entry_positions.append(OpenPosition(idea.underlying, idea.est_debit_usd, idea.is_index))
+                    _resolved_cost = round(resolved.limit * 100 * resolved.qty, 2)
+                    entry_positions.append(OpenPosition(idea.underlying, _resolved_cost, idea.is_index))
                     # ENTRY THROTTLE accrual (2026-07-03 gap-fix): count this submitted entry against
                     # the per-cycle counter and the persisted per-day opened order/notional aggregates
                     # so subsequent ideas (this cycle and later cycles today) see the updated ceiling.
@@ -1114,6 +1161,8 @@ class Trader:
                 reasons.append("fresh contract/NBBO resolution returned no order")
             else:
                 fresh.decision_id = original.decision_id
+                fresh.decision_revision = original.decision_revision
+                fresh.model_identity = original.model_identity
                 fresh.conviction = original.conviction
                 fresh.thesis = original.thesis
                 fresh.tp_pct = original.tp_pct
@@ -1406,6 +1455,8 @@ class Trader:
             _efd, _eslip, _eslip_pct = compute_entry_basis(_est_debit, _afp_val, r.qty)
             fill = {
                 "decision_id": r.decision_id,
+                "decision_revision": r.decision_revision,
+                "model_identity": r.model_identity,
                 "order_ref": getattr(trade.order, "orderRef", None),
                 "order_id": getattr(trade.order, "orderId", None),
                 "order_status": status,
@@ -1439,6 +1490,8 @@ class Trader:
             "conviction": getattr(r, "conviction", -1.0),
             "thesis": getattr(r, "thesis", ""),
             "decision_id": getattr(r, "decision_id", None),
+            "decision_revision": getattr(r, "decision_revision", 0),
+            "model_identity": getattr(r, "model_identity", None),
             "order_ref": entry_safety.decision_order_ref(r.decision_id),
             # entry-time technical_card (per-name indicators fed to the model at entry). ADDITIVE;
             # consumed by the exit manager's position view so a reload/continuation call sees the

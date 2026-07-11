@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Background trader service. Runs the orchestrator loop in DRY-RUN (no --arm).
-# Flip to live by adding --arm here ONLY after paper validation.
+# Background ENTRY service. It is explicitly ARMED and still requires Slack approval for every BUY.
+# Protective exits run in the separate CPU-only run_protective_service.sh process.
 set -uo pipefail
 cd "$HOME/exitmgr-app" || exit 1
 
@@ -14,5 +14,11 @@ fi
 source "$HOME/.hermes/.env" 2>/dev/null   # provides SLACK_BOT_TOKEN
 export SLACK_BOT_TOKEN
 export PYTHONUNBUFFERED=1
-exec "$HOME/ib-grader-venv/bin/python" run_trader.py --arm --loop \
+export EXITMGR_ORDER_LOCK="${EXITMGR_ORDER_LOCK:-$HOME/.local/var/exitmgr/order-mutation.lock}"
+export M3_PRIORITY_TOKEN_FILE="${M3_PRIORITY_TOKEN_FILE:-$HOME/.config/m3-serving/priority-token}"
+export TRADER_LLM_PRIORITY=0
+export TRADER_REQUIRE_PRIORITY_TOKEN=1
+export TRADER_REQUIRE_RUNTIME_IDENTITY=1
+export TRADER_CAPTURE_EXIT_IDENTITY=1
+exec "$HOME/ib-grader-venv/bin/python" run_trader.py --arm --loop --mode entry \
   --interval 1200 --protective-interval 30

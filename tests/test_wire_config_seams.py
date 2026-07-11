@@ -112,12 +112,8 @@ def test_seam2_default_none_is_flat_byte_identical():
 def test_seam2_wiring_line_present_in_run_trader_source():
     with open("run_trader.py") as f:
         src = f.read()
-    # 2026-07-03: run_trader now NORMALIZES the config multipliers to int keys (str YAML keys were
-    # dead: conviction_multiplier's exact-match lookup missed them) and passes the normalized dict
-    # into RiskLimits. Assert BOTH: the int-key normalization AND the RiskLimits wiring.
-    assert re.search(
-        r"conviction_multipliers\s*=\s*\{\s*int\(k\)\s*:\s*float\(v\)\s*for\s*k\s*,\s*v\s*in\s*dict\(_mult_raw\)\.items\(\)\s*\}",
-        src), "run_trader.py must normalize conviction_size_multipliers keys to int"
-    assert re.search(
-        r"conviction_size_multipliers\s*=\s*conviction_multipliers\s*,",
-        src), "run_trader.py must pass the normalized conviction multipliers into RiskLimits"
+    # Every entry path now uses one canonical parser, eliminating drift between daily and trader.
+    assert "entry_safety.risk_limits_from_config(cfg)" in src
+    with open("exitmgr/entry_safety.py") as f:
+        helper = f.read()
+    assert "{int(k): float(v) for k, v in dict(raw).items()}" in helper

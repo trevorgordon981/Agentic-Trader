@@ -21,7 +21,7 @@ from exitmgr.rules import evaluate_position, ExitTrigger, days_to_expiry
 from exitmgr.position_manager import assess_positions
 from exitmgr import regime as regime_mod
 from exitmgr.state import StateManager
-from exitmgr import trade_capture
+from exitmgr import trade_capture, dataset_integrity
 
 
 # AIRTIGHT-STOP BACKSTOP magnitude (percent, positive). Last-resort protective stop applied
@@ -274,12 +274,13 @@ class ExitManager:
             # ---------- DECISION CONTEXT (v2, joined from the decision sidecar) ----------
             # The full DECISION -> ENTRY arc: raw strategist reasoning, all candidates + convictions,
             # the chosen idea, the risk GateDecision + bound caps, the construction adjustments,
-            # regime + the RAG/news/journal brief that fed the idea. Best-effort join by con_id, else
-            # symbol+strike+expiry+right. None if the trade predates decision capture (e.g. v1 rows).
+            # regime + the RAG/news/journal brief that fed the idea. The immutable decision_id is the
+            # ONLY causal join; legacy rows without it remain honestly unjoined.
             decision = None
             try:
                 decision = trade_capture.load_decision_context(
-                    self._dataset_dir(), con_id=con_id, symbol=je.get("symbol"),
+                    self._dataset_dir(), decision_id=je.get("decision_id"),
+                    con_id=con_id, symbol=je.get("symbol"),
                     strike=je.get("strike"), expiry=je.get("expiry"), right=je.get("right"))
             except Exception as _de:
                 print(f"[WARN] decision-context join failed for con_id={con_id}: {_de}")
@@ -290,7 +291,8 @@ class ExitManager:
             review = None
             try:
                 review = trade_capture.load_review(
-                    self._dataset_dir(), con_id=con_id, symbol=je.get("symbol"),
+                    self._dataset_dir(), decision_id=je.get("decision_id"),
+                    con_id=con_id, symbol=je.get("symbol"),
                     date=(str(je.get("ts") or "")[:10] or None))
             except Exception as _re:
                 print(f"[WARN] review join failed for con_id={con_id}: {_re}")
@@ -298,6 +300,7 @@ class ExitManager:
                 "schema": "trade_dataset.v2",
                 "kind": "trade",                     # trade | no_trade | rejected (v2 row taxonomy)
                 "decision_id": je.get("decision_id"),
+                "model_identity": je.get("model_identity"),
                 "con_id": con_id,
                 "symbol": exit_rec.get("symbol"),
                 # ---------- DECISION -> the reasoning that produced the trade ----------
@@ -306,6 +309,7 @@ class ExitManager:
                 "entry": {
                     "ts": je.get("ts"),
                     "decision_id": je.get("decision_id"),
+                    "model_identity": je.get("model_identity"),
                     "symbol": je.get("symbol"),
                     "right": je.get("right"),
                     "strike": je.get("strike"),
@@ -378,6 +382,7 @@ class ExitManager:
                     "reason": exit_rec.get("reason"),
                     "rule_fired": exit_rec.get("rule_fired"),          # the raw trigger_type that fired
                     "exit_reasoning": exit_rec.get("exit_reasoning"),  # trigger message / model-cut text
+                    "exit_model_identity": exit_rec.get("exit_model_identity"),
                     "exit_price_per_share": exit_rec.get("exit_price_per_share"),
                     "proceeds": exit_rec.get("proceeds"),
                     "realized_pnl": exit_rec.get("realized_pnl"),
@@ -433,6 +438,14 @@ class ExitManager:
                 # ---------- REVIEW (post-trade coach verdict, if persisted) ----------
                 "review": review,
             }
+            _pnl_canonical = (rec["close"].get("realized_pnl_net") is not None
+                              and not bool(rec["close"].get("commission_unknown")))
+            _training_canonical = _pnl_canonical and decision is not None
+            _reason = ("missing immutable decision join" if decision is None else
+                       "net realized P&L unavailable")
+            dataset_integrity.mark(
+                rec, status=dataset_integrity.CANONICAL,
+                training=_training_canonical, pnl=_pnl_canonical, reason=_reason)
             with open(self._dataset_path(), "a") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
                 f.flush()
@@ -703,6 +716,7 @@ class ExitManager:
                 "ts": now.isoformat(),                 # close timestamp (close_ts for calibration)
                 "close_ts": now.isoformat(),
                 "decision_id": je.get("decision_id"),
+                "model_identity": je.get("model_identity"),
                 "contract_id": con_id,                 # matches journal contract_id / --fills key
                 "conId": con_id,
                 "symbol": symbol,
@@ -1755,6 +1769,7 @@ class ExitManager:
                 "avg_fill_price": fill_px,
                 "fill_ts": self._trade_fill_timestamp(trade),
                 "exit_commission": commission_from_trade(trade),
+                "exit_model_identity": ctx.get("exit_model_identity"),
                 "partial": partial,
                 "close_qty": qty,
                 "remaining_qty": max(0, position_qty - qty),
@@ -2516,6 +2531,7 @@ class ExitManager:
         # = the exact per-position view fed to the model (its input). Both default empty so the
         # enrich block below is safe when management is off / deferred / errored.
         mgmt_raw = None
+        mgmt_identity = None
         views_by_cid = {}
         # FLAT-SKIP (2026-06-23): only spend a model call when there is actually something to manage.
         # managed_positions is already non-empty here (we early-returned above on a flat book), but
@@ -2540,6 +2556,7 @@ class ExitManager:
                     self.config.llm_endpoint, self.config.llm_model,
                     views, market_regime=self._regime, return_meta=True)
                 mgmt_raw = (_mgmt_meta or {}).get("raw")
+                mgmt_identity = (_mgmt_meta or {}).get("model_identity")
                 if model_decisions:
                     rg = (self._regime or {}).get("regime", "n/a")
                     print(f"[POSMGMT] regime={rg} model decisions for con_ids {sorted(model_decisions)}")
@@ -2698,6 +2715,7 @@ class ExitManager:
                     # mgmt_input = the exact per-position view fed to the model. record_mark merges
                     # only non-None keys, so both are simply absent on cycles with no assessment.
                     "mgmt_raw": mgmt_raw,
+                    "mgmt_model_identity": mgmt_identity,
                     "mgmt_input": views_by_cid.get(con_id),
                     # P1.2 audit: for a journaled debit spread, current_price above is the NET combo
                     # mark (long - short, computed at the top of this loop), NOT a single leg -- flag
@@ -2873,6 +2891,9 @@ class ExitManager:
                         "position_qty": quantity,
                         "entry_debit": closed_basis,
                         "journal_entry": dict(je),
+                        "decision_id": je.get("decision_id"),
+                        "entry_model_identity": je.get("model_identity"),
+                        "exit_model_identity": mgmt_identity,
                         "manual_request": False,
                         "extra": {
                             "partial": is_partial,

@@ -36,7 +36,9 @@ def _close_row(symbol, *, trigger_mark, avg_fill_price, fill_status="Filled", ru
         if float(trigger_mark) != 0:
             slip_pct = round(slip / abs(float(trigger_mark)) * 100, 2)
     return {
-        "schema": "trade_dataset.v2", "kind": "trade", "con_id": 1000, "symbol": symbol,
+        "schema": "trade_dataset.v2", "record_status": "CANONICAL", "canonical": True,
+        "usable_for_training": False, "usable_for_pnl": False,
+        "kind": "trade", "con_id": 1000, "symbol": symbol,
         "entry": {"symbol": symbol, "quantity": 1, "spread": None},
         "close": {"fill_status": fill_status, "avg_fill_price": avg_fill_price,
                   "trigger_mark": trigger_mark, "slippage_per_share": slip,

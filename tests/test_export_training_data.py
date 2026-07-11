@@ -101,6 +101,14 @@ def _write_dataset(tmpdir):
         "gate": {"approved": False, "reasons": ["cap"], "bound_caps": ["cap"], "per_trade_cap": 0.0},
     }
 
+    for row in (winner, loser):
+        row.update({"record_status": "CANONICAL", "canonical": True,
+                    "usable_for_training": True, "usable_for_pnl": True})
+    for row in (no_trade, rejected):
+        row.update({"record_status": "CANONICAL", "canonical": True,
+                    "usable_for_training": True, "usable_for_pnl": False,
+                    "not_for_pnl_reason": "no realized outcome"})
+
     with open(ds, "w") as f:
         f.write(json.dumps(winner) + "\n")
         f.write("{this is not valid json,,,\n")  # MALFORMED line
@@ -217,3 +225,38 @@ def test_min_realized_filter(tmp_path):
     syms = {json.loads(l).get("symbol") for l in open(out)
             if json.loads(l)["example_kind"] == "trade"}
     assert syms == {"AAPL"}
+
+
+def test_export_drops_noncanonical_and_ib_disagreement_rows(tmp_path):
+    ds = _write_dataset(str(tmp_path))
+    legacy = {
+        "schema": "trade_dataset.v2", "kind": "trade", "source": "flex_history",
+        "record_status": "LEGACY", "usable_for_training": False, "usable_for_pnl": False,
+        "symbol": "OLD", "entry": {"ts": "2026-07-01T00:00:00Z"},
+        "close": {"realized_pnl_net": 10, "realized_pnl_ib": 10},
+        "labels": {"outcome": "win", "win": True},
+    }
+    disagreement = {
+        "schema": "trade_dataset.v2", "kind": "trade", "source": "app",
+        "record_status": "CANONICAL", "canonical": True,
+        "usable_for_training": True, "usable_for_pnl": True,
+        "symbol": "BAD", "entry": {"ts": "2026-07-01T00:00:01Z"},
+        "close": {"realized_pnl_net": -100, "realized_pnl_ib": 100},
+        "labels": {"outcome": "loss", "win": False},
+    }
+    unmarked = {
+        "schema": "trade_dataset.v2", "kind": "trade", "source": "app",
+        "symbol": "UNMARKED", "entry": {"ts": "2026-07-01T00:00:02Z"},
+        "close": {"realized_pnl_net": 1, "realized_pnl_ib": 1},
+        "labels": {"outcome": "win", "win": True},
+    }
+    with open(ds, "a") as stream:
+        stream.write(json.dumps(legacy) + "\n")
+        stream.write(json.dumps(disagreement) + "\n")
+        stream.write(json.dumps(unmarked) + "\n")
+    out = str(tmp_path / "guarded.jsonl")
+    counts = etd.export(str(tmp_path), out, "jsonl-flat", include_open=False, min_realized=None)
+    assert counts["noncanonical_dropped"] == 2
+    assert counts["invalid_pnl_dropped"] == 1
+    assert counts["emitted"] == 4
+    assert os.path.exists(out + ".manifest.json")

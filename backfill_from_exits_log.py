@@ -41,9 +41,11 @@ _HAVE_TC = False
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from exitmgr import trade_capture as _tc  # noqa: E402
+    from exitmgr import dataset_integrity as _di  # noqa: E402
     _HAVE_TC = True
 except Exception:
     _tc = None
+    _di = None
 
 
 BACKFILL_SOURCE = "backfill:exits.log+trades.log"
@@ -227,6 +229,15 @@ def build_backfill_row(close_ev, entry_j, decision):
     # only in retry timestamp / holding_days); those collapse to ONE reconstructed trade rather than
     # N phantom -$2 losses. Falls back to the content hash only if no instance identity exists.
     row["_dedup_key"] = f"trade_instance:{uid_inst}" if uid_inst else (_dedup_key(row) or "")
+    if _di is not None:
+        _di.mark(
+            row, status=_di.ESTIMATE, training=False, pnl=False,
+            reason="legacy exits.log reconstruction lacks authoritative commissions/decision lineage")
+    else:
+        row.update({"record_status": "ESTIMATE", "canonical": False,
+                    "usable_for_training": False, "usable_for_pnl": False,
+                    "not_for_training_reason": "legacy estimate",
+                    "not_for_pnl_reason": "legacy estimate"})
     return row, None
 
 

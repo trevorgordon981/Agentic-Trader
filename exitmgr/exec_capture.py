@@ -53,11 +53,13 @@ from typing import Optional, List, Dict, Any
 
 # reuse the app's durable join key + dedup + dataset paths (read-only helpers)
 from exitmgr import trade_capture as _tc
+from exitmgr import dataset_integrity as _di
 
 # IBKR UNSET_DOUBLE sentinel: realizedPNL is set to ~1.8e308 on OPENING fills (no realization yet).
 _UNSET_DOUBLE = 1.0e300
 # options multiplier (100 shares/contract). Non-option secTypes fall back to 1.
 _OPT_MULT = 100.0
+_PNL_TOLERANCE_USD = 0.05
 
 WATERMARK_NAME = ".exec_watermark.json"
 WATERMARK_SCHEMA = "exec_watermark.v1"
@@ -403,6 +405,8 @@ def build_rows_for_contract(con_id: int, fills: List[dict]) -> Dict[str, Any]:
         # open exec_ids are NOT terminally watermarked (they'll be paired when the close appears);
         # the position snapshot is deduped at the dataset level by its content _dedup_key.
         result["position"]["_dedup_key"] = _position_dedup_key(uid_inst, opens)
+        _di.mark(result["position"], status=_di.CANONICAL, training=False, pnl=False,
+                 reason="open position snapshot has no terminal outcome")
         return result
 
     # ---- CASE: something closed -> terminal TRADE row ----
@@ -411,28 +415,65 @@ def build_rows_for_contract(con_id: int, fills: List[dict]) -> Dict[str, Any]:
     matched_qty = min(open_qty, close_qty) if open_qty > 0 else close_qty
     entry_visible = open_qty > 0
 
+    open_side = str(opens[0].get("side") or "").upper() if opens else None
+    close_side = str(closes[0].get("side") or "").upper() if closes else None
+    side_valid = (open_side, close_side) in (("BOT", "SLD"), ("SLD", "BOT"))
+    direction = "long" if open_side == "BOT" else ("short" if open_side == "SLD" else None)
+    ib_realized = round(sum(f["realized_pnl_ib"] for f in closes), 2) if closes else None
+
     if entry_visible:
         avg_open, _ = _wavg(opens)
-        debit = round(avg_open * matched_qty * mult, 2)          # REAL basis from opening fills
-        proceeds = round(avg_close * matched_qty * mult, 2)
-        realized_gross = round((avg_close - avg_open) * matched_qty * mult, 2)
+        entry_premium = round(avg_open * matched_qty * mult, 2)
+        close_premium = round(avg_close * matched_qty * mult, 2)
+        # Cash-flow math must honor the opening side. A short option receives cash on SLD and
+        # spends cash on the closing BOT; treating every opener as BOT reverses every short-leg
+        # result and poisons debit-spread labels.
+        entry_cashflow = -entry_premium if open_side == "BOT" else (
+            entry_premium if open_side == "SLD" else None)
+        close_cashflow = close_premium if close_side == "SLD" else (
+            -close_premium if close_side == "BOT" else None)
+        debit = entry_premium if direction == "long" else None
+        credit = entry_premium if direction == "short" else None
+        proceeds = close_premium if close_side == "SLD" else None
+        close_cost = close_premium if close_side == "BOT" else None
+        realized_gross = (round(entry_cashflow + close_cashflow, 2)
+                          if entry_cashflow is not None and close_cashflow is not None else None)
         comm, all_pres = _sum_commissions(fills)
-        realized_net = round(realized_gross - comm, 2) if (comm is not None and all_pres) else None
+        computed_net = (round(realized_gross - comm, 2)
+                        if (realized_gross is not None and comm is not None and all_pres) else None)
         commission_unknown = (not all_pres)
-        realized_pct = round(realized_gross / abs(debit) * 100, 2) if debit else None
+        pnl_difference = (round(computed_net - ib_realized, 2)
+                          if computed_net is not None and ib_realized is not None else None)
+        pnl_valid = bool(side_valid and (
+            pnl_difference is None or abs(pnl_difference) <= _PNL_TOLERANCE_USD))
+        # IB's per-close realized P&L is the authority. A disagreement is retained as evidence but
+        # never promoted to a training label; Flex ingestion quarantines the row.
+        realized_net = ib_realized if (ib_realized is not None and pnl_valid and all_pres) else (
+            computed_net if ib_realized is None and pnl_valid else None)
+        realized_pct_basis = ib_realized if pnl_valid and ib_realized is not None else realized_net
+        realized_pct = (round(realized_pct_basis / abs(entry_premium) * 100, 2)
+                        if realized_pct_basis is not None and entry_premium else None)
         entry_ts = open_ts
-        basis_source = "ibkr executions (real open+close fills)"
+        basis_source = "ibkr executions + side-aware cashflows; IB realized P&L authoritative"
         entry_outside_window = False
     else:
         # opener predates the ~7d reqExecutions window -> no recoverable basis. Use IBKR's REAL
         # realizedPNL for the close; NEVER fabricate an entry debit/pct.
         debit = None
-        proceeds = round(avg_close * matched_qty * mult, 2)
-        realized_gross = round(sum(f["realized_pnl_ib"] for f in closes), 2)
+        credit = None
+        close_premium = round(avg_close * matched_qty * mult, 2)
+        proceeds = close_premium if close_side == "SLD" else None
+        close_cost = close_premium if close_side == "BOT" else None
+        entry_cashflow = None
+        close_cashflow = None
+        realized_gross = ib_realized
         comm, all_pres = _sum_commissions(closes)
         # IBKR realizedPNL is already net of commissions -> expose it as realized_pnl_net when the
         # closing fees are known, and keep the gross field = the same IB figure (best available).
         realized_net = realized_gross if all_pres else None
+        computed_net = None
+        pnl_difference = None
+        pnl_valid = ib_realized is not None
         commission_unknown = (not all_pres)
         realized_pct = None
         entry_ts = None
@@ -443,7 +484,7 @@ def build_rows_for_contract(con_id: int, fills: List[dict]) -> Dict[str, Any]:
     net_open_remaining = open_qty - close_qty  # >0 => runner still open after a partial close
     partial = matched_qty < max(open_qty, close_qty) or net_open_remaining > 0
 
-    outcome_pnl = realized_net if realized_net is not None else realized_gross
+    outcome_pnl = ((ib_realized if ib_realized is not None else realized_net) if pnl_valid else None)
     outcome = _outcome(outcome_pnl)
 
     trade = {
@@ -466,8 +507,13 @@ def build_rows_for_contract(con_id: int, fills: List[dict]) -> Dict[str, Any]:
             "expiry": expiry,
             "structure": "single",                 # per-leg; combos are recorded leg-by-leg
             "spread": None,
+            "direction": direction,
+            "open_side": open_side,
+            "close_side": close_side,
             "quantity": int(matched_qty) if matched_qty == int(matched_qty) else matched_qty,
             "debit": debit,
+            "credit": credit,
+            "entry_cashflow": entry_cashflow,
             "profit_target_pct": None,
             "stop_pct": None,
             "conviction": None,                    # honest nulls -- no decision arc
@@ -485,6 +531,8 @@ def build_rows_for_contract(con_id: int, fills: List[dict]) -> Dict[str, Any]:
             "rule_fired": None,
             "exit_price_per_share": round(avg_close, 6),
             "proceeds": proceeds,
+            "close_cost": close_cost,
+            "close_cashflow": close_cashflow,
             "realized_pnl": realized_gross,        # REAL (fill-derived, or IBKR realizedPNL)
             "realized_pnl_net": realized_net,      # net of fees when known; else None
             "entry_commission": None if not entry_visible else _entry_commission(opens),
@@ -493,7 +541,17 @@ def build_rows_for_contract(con_id: int, fills: List[dict]) -> Dict[str, Any]:
             "pnl_is_estimate": bool(partial),      # a partial-close allocation is approximate
             "realized_pnl_pct": realized_pct,
             "holding_days": _holding_days(entry_ts, close_ts),
-            "realized_pnl_ib": round(sum(f["realized_pnl_ib"] for f in closes), 2) if closes else None,
+            "realized_pnl_ib": ib_realized,
+            "pnl_valid": pnl_valid,
+            "pnl_quarantined": not pnl_valid,
+            "pnl_validation": {
+                "status": "valid" if pnl_valid else "ib_disagreement",
+                "tolerance_usd": _PNL_TOLERANCE_USD,
+                "computed_net": computed_net,
+                "ib_realized": ib_realized,
+                "difference": pnl_difference,
+                "side_valid": side_valid,
+            },
             "fill_status": "filled",
             "tp_hit": None,
             "sl_hit": None,
@@ -509,6 +567,12 @@ def build_rows_for_contract(con_id: int, fills: List[dict]) -> Dict[str, Any]:
         "provenance": _provenance(fills),
     }
     trade["_dedup_key"] = f"trade_instance:{uid_inst}" if uid_inst else (_tc._dedup_key(trade) or "")
+    if pnl_valid:
+        _di.mark(trade, status=_di.CANONICAL, training=False, pnl=True,
+                 reason="manual execution has no attributable model decision")
+    else:
+        _di.mark(trade, status=_di.INVALID, training=False, pnl=False,
+                 reason="computed P&L disagrees with authoritative IB realized P&L")
 
     result["trade"] = trade
     # terminal (watermark every exec_id) only when the position is fully flat -- a still-open runner
@@ -538,6 +602,8 @@ def build_rows_for_contract(con_id: int, fills: List[dict]) -> Dict[str, Any]:
             "provenance": _provenance(fills),
         }
         result["position"]["_dedup_key"] = _position_dedup_key(uid_inst, opens) + ":runner"
+        _di.mark(result["position"], status=_di.CANONICAL, training=False, pnl=False,
+                 reason="open runner snapshot has no terminal outcome")
     return result
 
 

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from exitmgr import entry_safety, risk
-from exitmgr import order_lock
+from exitmgr import order_lock, reload_queue
 from exitmgr.trader import ResolvedOrder, Trader
 
 
@@ -158,6 +158,28 @@ def test_cross_process_order_lock_refuses_overlap(tmp_path, monkeypatch):
         with pytest.raises(order_lock.OrderMutationBusy):
             with order_lock.order_mutation_lock(timeout_seconds=0):
                 pass
+
+
+def test_reload_fill_identity_survives_drain_and_restart(tmp_path):
+    path = str(tmp_path / "reload.json")
+    ticket = reload_queue.make_ticket(
+        symbol="AAPL", thesis="continue", right="C", width=None, dte_target=30,
+        structure="single", is_index=False, reload_conviction=8,
+        realized_pnl=100, original_debit=500, source_fill_key="fill-123")
+    queue = reload_queue.ReloadQueue(path)
+    assert queue.add_once(ticket)
+    assert len(queue.drain(today="2026-07-10", max_per_name=2)[0]) == 1
+    assert not reload_queue.ReloadQueue(path).add_once(ticket)
+
+
+def test_entry_and_protective_services_are_separate():
+    root = Path(__file__).resolve().parents[1]
+    entry = (root / "run_trader_service.sh").read_text()
+    protective = (root / "run_protective_service.sh").read_text()
+    assert "--mode entry" in entry
+    assert "--mode protective" in protective
+    assert "TRADER_LLM_PRIORITY" not in protective
+    assert "CPU-only" in protective
 
 
 def test_every_executable_placeorder_site_uses_shared_mutation_lock():
