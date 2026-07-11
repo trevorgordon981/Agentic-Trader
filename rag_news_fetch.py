@@ -37,6 +37,31 @@ TICKER_NAMES = {
     "TQQQ": ["proshares ultrapro qqq", "ultrapro qqq", "nasdaq-100", "nasdaq 100"],
     "UPRO": ["proshares ultrapro s&p", "ultrapro s&p", "s&p 500 bull", "s&p500 3x"],
     "URTY": ["proshares ultrapro russell", "russell 2000", "ultrapro russell"],
+    # Bare one- and two-letter symbols are too ambiguous for ordinary word
+    # matching. These names (or an explicit $CASHTAG) are required instead.
+    "A": ["agilent"],
+    "AA": ["alcoa"],
+    "AS": ["amer sports"],
+    "BA": ["boeing"],
+    "C": ["citigroup", "citibank"],
+    "CB": ["chubb"],
+    "CL": ["colgate"],
+    "D": ["dominion energy"],
+    "DE": ["deere", "john deere"],
+    "EL": ["estee lauder", "estée lauder"],
+    "ES": ["eversource"],
+    "GE": ["ge aerospace"],
+    "GS": ["goldman sachs", "goldman"],
+    "HD": ["home depot"],
+    "KO": ["coca-cola", "coca cola"],
+    "MA": ["mastercard"],
+    "MS": ["morgan stanley"],
+    "PG": ["procter & gamble", "procter and gamble", "p&g"],
+    "PH": ["parker hannifin", "parker-hannifin"],
+    "T": ["at&t"],
+    "TW": ["tradeweb"],
+    "V": ["visa"],
+    "VZ": ["verizon"],
 }
 
 SOURCE_DENYLIST = [
@@ -64,6 +89,7 @@ TITLE_DENY_PATTERNS = [
 TITLE_DENY_PATTERNS.append(chr(92)+chr(40)+chr(92)+chr(119)+"{6,}"+chr(92)+chr(41)+chr(92)+"s*$")
 _TITLE_DENY = [re.compile(p, re.I) for p in TITLE_DENY_PATTERNS]
 _WORD_RE_CACHE = {}
+_CASHTAG_RE_CACHE = {}
 
 
 def watchlist_tickers():
@@ -102,6 +128,14 @@ def _word_re(token):
     return pat
 
 
+def _cashtag_re(token):
+    pat = _CASHTAG_RE_CACHE.get(token)
+    if pat is None:
+        pat = re.compile(r"\$" + re.escape(token) + r"(?![A-Za-z0-9])", re.I)
+        _CASHTAG_RE_CACHE[token] = pat
+    return pat
+
+
 def norm_title(title):
     # Google News titles end with " - Outlet"; strip it so cross-outlet
     # reprints of the same story dedupe together.
@@ -133,12 +167,13 @@ def title_denied(title):
 
 
 def ticker_relevant(ticker, title):
-    if _word_re(ticker).search(title):
-        return True
+    low = title.lower()
     for kw in TICKER_NAMES.get(ticker, []):
-        if kw in title.lower():
+        if kw in low:
             return True
-    return False
+    if len(ticker) <= 2:
+        return bool(_cashtag_re(ticker).search(title))
+    return bool(_word_re(ticker).search(title))
 
 
 def fetch_rss(query):
