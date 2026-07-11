@@ -80,6 +80,8 @@ def test_service_contract_has_launchagent_distinct_ids_and_shared_process_lock()
     lock_line = 'EXITMGR_ORDER_LOCK="${EXITMGR_ORDER_LOCK:-$HOME/.local/var/exitmgr/order-mutation.lock}"'
     assert lock_line in entry and lock_line in protective
     assert "ai.alfred.protective" in plist and "run_protective_service.sh" in plist
+    assert "StandardOutPath" in plist and "protective-service.log" in plist
+    assert "StandardErrorPath" in plist and "protective-service.error.log" in plist
     # Both mutation implementations—not just the in-process asyncio lock—hold the host lock.
     assert "order_mutation_lock" in (root / "exitmgr" / "connection.py").read_text()
     assert "order_mutation_lock" in (root / "exitmgr" / "trader.py").read_text()
