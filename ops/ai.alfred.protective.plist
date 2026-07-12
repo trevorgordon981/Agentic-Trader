@@ -19,8 +19,8 @@
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>StandardOutPath</key>
-  <string>/Users/alfredpennyworth/exitmgr-app/logs/protective-service.log</string>
+  <string>/var/tmp/ai.alfred.protective-service.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/alfredpennyworth/exitmgr-app/logs/protective-service.error.log</string>
+  <string>/var/tmp/ai.alfred.protective-service.error.log</string>
 </dict>
 </plist>
