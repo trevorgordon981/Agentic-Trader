@@ -54,8 +54,18 @@ def runtime_snapshot(endpoint: str, timeout: float = 3.0,
     if not isinstance(payload, dict) or payload.get("ready") is not True:
         raise RuntimeIdentityError("model runtime is not ready")
     identity = {key: payload.get(key) for key in _RUNTIME_KEYS}
+    # This is emitted by the custom Python server inside its immutable runtime
+    # receipt.  Surface it as a compact identity field so safety gates can prove
+    # the backend instead of trusting a model-name string or endpoint label.
+    runtime_receipt = payload.get("runtime_receipt")
+    contract = runtime_receipt.get("contract") if isinstance(runtime_receipt, dict) else None
+    identity["runtime_backend"] = (
+        contract.get("backend") if isinstance(contract, dict) else None)
+    identity["runtime_schema"] = (
+        runtime_receipt.get("schema") if isinstance(runtime_receipt, dict) else None)
     required = ("artifact_id", "artifact_manifest_sha256", "runtime_receipt_sha256",
-                "runtime_contract_sha256", "model_realpath", "startup_nonce")
+                "runtime_contract_sha256", "model_realpath", "startup_nonce",
+                "runtime_backend")
     missing = [key for key in required if not identity.get(key)]
     if missing:
         raise RuntimeIdentityError("model runtime identity missing: " + ", ".join(missing))

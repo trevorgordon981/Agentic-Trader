@@ -27,7 +27,8 @@ from exitmgr.connection import IBConnection
 from exitmgr.ibkr import Stock, Option, Order, pick_chain, strikes_near, underlying_price
 from exitmgr.strategist import propose, discover_names, propose_one, TradeIdea
 from exitmgr.trader import ResolvedOrder, order_summary, contract_snapshot, audit, _trading_day
-from exitmgr import approval, construction, entry_safety, research, trade_capture, risk
+from exitmgr import (approval, construction, entry_safety, research, trade_capture, risk,
+                     model_release_gate)
 from exitmgr.config import ConstructionConfig, construction_from_dict
 from exitmgr.slate_lock import slate_active_guard
 from exitmgr.market import fetch_universe_quotes, usable_price
@@ -599,6 +600,11 @@ async def run(args):
     cfg = yaml.safe_load(open(args.config))
     CAPS_TP_TIERS = (cfg.get("caps") or {}).get("tp_tiers") or []   # 2026-07-03 pot-tiered TP ceiling
     ibc, tr = cfg.get("ib", {}), cfg.get("trading", {})
+    try:
+        _release_gate = model_release_gate.settings_from_mapping(tr)
+    except model_release_gate.ModelReleaseGateError as exc:
+        print(f"[BLOCKED] invalid model release gate configuration: {exc}")
+        return 2
     CASH_BUFFER_PCT = float(tr.get("cash_buffer_pct", 0.05))  # keep this % of NetLiq liquid
     CONS = construction_from_dict(cfg.get("construction"))    # 2026-07-01 constructor-rework gates
     _RISK_LIMITS = entry_safety.risk_limits_from_config(tr)
@@ -1127,6 +1133,22 @@ async def run(args):
                           reasons=_quote_now.reasons)
                     done.add(ts)
                     continue
+                try:
+                    _release_evidence = model_release_gate.require_v3_release(
+                        _release_gate, endpoint=tr.get("llm_endpoint", ""),
+                        decision_identity=getattr(r, "model_identity", None))
+                except model_release_gate.ModelReleaseGateError as _release_error:
+                    audit(audit_path, "model_release_gate_blocked", decision_id=decision_id,
+                          underlying=r.underlying, reason=str(_release_error))
+                    approval.post_proposal(
+                        token, channel,
+                        f":no_entry: *{r.underlying}* NOT placed — v3 model release gate: "
+                        f"{_release_error}")
+                    done.add(ts)
+                    continue
+                if _release_evidence.get("enabled"):
+                    audit(audit_path, "model_release_gate_passed", decision_id=decision_id,
+                          underlying=r.underlying, promotion=_release_evidence)
                 _lmt = entry_safety.executable_price(r)
                 try:
                     trade_capture.capture_decision(

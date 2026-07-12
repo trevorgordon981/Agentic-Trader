@@ -6,6 +6,20 @@ import pytest
 from exitmgr import provenance
 
 
+class _Response:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode()
+
+
 def test_priority_zero_requires_owner_only_token_file(tmp_path, monkeypatch):
     token = tmp_path / "priority-token"
     token.write_text("x" * 40)
@@ -42,3 +56,30 @@ def test_request_identity_binds_runtime_and_exact_material():
     with pytest.raises(provenance.RuntimeIdentityError):
         provenance.request_identity(endpoint="http://x/v1/chat/completions", body=body,
                                     response={}, before=runtime, after=changed)
+
+
+def test_runtime_snapshot_proves_custom_backend_from_runtime_receipt():
+    payload = {
+        "ready": True,
+        "artifact_id": "artifact-a",
+        "artifact_manifest_sha256": "a" * 64,
+        "runtime_receipt_sha256": "b" * 64,
+        "runtime_contract_sha256": "c" * 64,
+        "model_realpath": "/models/a",
+        "startup_nonce": "nonce",
+        "runtime_receipt": {
+            "schema": "pipeline-m3-runtime.v1",
+            "contract": {"backend": "custom-python-mlx"},
+        },
+    }
+    identity = provenance.runtime_snapshot(
+        "http://127.0.0.1:8082/v1/chat/completions",
+        opener=lambda request, timeout: _Response(payload))
+    assert identity["runtime_backend"] == "custom-python-mlx"
+    assert identity["runtime_schema"] == "pipeline-m3-runtime.v1"
+
+    payload["runtime_receipt"] = None
+    with pytest.raises(provenance.RuntimeIdentityError, match="runtime_backend"):
+        provenance.runtime_snapshot(
+            "http://127.0.0.1:8082/v1/chat/completions",
+            opener=lambda request, timeout: _Response(payload))

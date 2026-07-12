@@ -12,7 +12,7 @@ import typer
 from exitmgr.config import load_config
 from exitmgr.connection import IBConnection
 from exitmgr.manager import ExitManager
-from exitmgr import entry_safety
+from exitmgr import entry_safety, model_release_gate
 from exitmgr.trader import Trader
 
 app = typer.Typer(help="LLM trading orchestrator (propose -> gate -> approve -> execute -> manage)")
@@ -78,6 +78,19 @@ def main(
     cfg = load_config(config_path=config, arm=arm, loop=loop, interval=interval)
     dry_run = not arm
 
+    try:
+        _release_gate = model_release_gate.settings_from_mapping(
+            {"model_release_gate": cfg.model_release_gate}
+            if getattr(cfg, "model_release_gate", None) is not None else {})
+    except model_release_gate.ModelReleaseGateError as exc:
+        # Do not abort the process: combined/protective mode must retain its
+        # risk-reducing SELL loop.  Carry a poisoned enabled setting so every
+        # future BUY fails closed at the final seam while exits continue.
+        print(f"[BLOCKED] new entries: invalid model release gate configuration: {exc}. "
+              "Protective exits remain armed.")
+        _release_gate = model_release_gate.ModelReleaseGateSettings(
+            enabled=True, configuration_error=str(exc))
+
     selected_client_id = _selected_client_id(cfg, mode, client_id)
     ib_conn = IBConnection(host=cfg.ib.host, port=cfg.ib.port, client_id=selected_client_id,
                            market_data_type=getattr(cfg.ib, "market_data_type", 3))
@@ -117,6 +130,7 @@ def main(
         reload_friction_k=float(getattr(cfg, "reload_friction_k", 1.5)),
         reload_max_per_name_per_day=int(getattr(cfg, "reload_max_per_name_per_day", 2)),
         reload_ttl_cycles=int(getattr(cfg, "reload_ttl_cycles", 3)),
+        model_release_gate_settings=_release_gate,
     )
 
     async def run():

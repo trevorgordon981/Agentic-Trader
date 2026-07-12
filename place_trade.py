@@ -24,7 +24,8 @@ from exitmgr.account import get_pot_snapshot
 from exitmgr.connection import IBConnection
 from exitmgr.ibkr import Stock, Option, Order
 from exitmgr.trader import ResolvedOrder, order_summary, audit, _trading_day
-from exitmgr import approval, construction, entry_safety, research, risk
+from exitmgr import (approval, construction, entry_safety, research, risk,
+                     model_release_gate)
 from exitmgr.config import construction_from_dict
 
 CLIENT_ID = 90
@@ -79,6 +80,11 @@ async def run(args):
         return 2
     ibc = cfg.get("ib", {})
     tr = cfg.get("trading", {})
+    try:
+        release_gate = model_release_gate.settings_from_mapping(tr)
+    except model_release_gate.ModelReleaseGateError as exc:
+        print(f"[BLOCKED] invalid model release gate configuration: {exc}")
+        return 2
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     channel = tr.get("slack_channel", "")
     approver_ids = set(tr.get("approver_ids", []))
@@ -302,6 +308,18 @@ async def run(args):
         if not quote_now.allowed:
             print("[BLOCKED] " + "; ".join(quote_now.reasons))
             return 2
+        try:
+            release_evidence = model_release_gate.require_v3_release(
+                release_gate, endpoint=tr.get("llm_endpoint", ""),
+                decision_identity=getattr(fresh, "model_identity", None))
+        except model_release_gate.ModelReleaseGateError as exc:
+            print(f"[BLOCKED] v3 model release gate: {exc}")
+            audit(audit_path, "model_release_gate_blocked", decision_id=decision_id,
+                  underlying=args.symbol, reason=str(exc))
+            return 2
+        if release_evidence.get("enabled"):
+            audit(audit_path, "model_release_gate_passed", decision_id=decision_id,
+                  underlying=args.symbol, promotion=release_evidence)
         order = Order(action="BUY", orderType="LMT", totalQuantity=fresh.qty,
                       lmtPrice=entry_safety.executable_price(fresh), tif="DAY")
         order.orderRef = entry_safety.decision_order_ref(decision_id)

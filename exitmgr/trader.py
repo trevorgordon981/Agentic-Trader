@@ -23,7 +23,8 @@ from exitmgr.risk import (
     RiskLimits, OpenPosition, ProposedTrade, GateDecision, evaluate_trade, day_pnl_pct,
 )
 from exitmgr.strategist import propose, TradeIdea
-from exitmgr import approval, construction, research, regime, slate_lock, trade_capture, reload_queue
+from exitmgr import (approval, construction, research, regime, slate_lock, trade_capture,
+                     reload_queue, model_release_gate)
 from exitmgr import entry_safety
 from dataclasses import replace as _replace_dc
 from exitmgr.config import ConstructionConfig
@@ -242,7 +243,9 @@ class Trader:
                  reload_conviction_min: float = 6,
                  reload_friction_k: float = 1.5,
                  reload_max_per_name_per_day: int = 2,
-                 reload_ttl_cycles: int = 3):
+                 reload_ttl_cycles: int = 3,
+                 model_release_gate_settings: Optional[
+                     model_release_gate.ModelReleaseGateSettings] = None):
         self.ib_conn = ib_conn
         # KILL SWITCH (2026-07-03): the manager's kill switch only gated EXITS; the trader never
         # checked it, so entries kept flowing under a kill switch. When configured (run_trader.py
@@ -292,6 +295,11 @@ class Trader:
         self.reload_friction_k = float(reload_friction_k)
         self.reload_max_per_name_per_day = int(reload_max_per_name_per_day)
         self.reload_ttl_cycles = int(reload_ttl_cycles)
+        # OFF unless an explicit, strictly parsed config block is supplied.  When
+        # enabled, the final BUY seam re-proves the signed v3 promotion and exact
+        # active custom-Python runtime immediately before placeOrder.
+        self.model_release_gate_settings = (
+            model_release_gate_settings or model_release_gate.ModelReleaseGateSettings())
         # market regime + per-underlying momentum, refreshed each cycle in _market_context;
         # feeds both regime-aware sizing (entries) and the position manager (exits)
         self._regime = None
@@ -1407,6 +1415,18 @@ class Trader:
         quote_gate = entry_safety.nbbo_valid(r)
         if not quote_gate.allowed:
             raise RuntimeError("fresh NBBO blocks submit: " + "; ".join(quote_gate.reasons))
+        try:
+            release_evidence = model_release_gate.require_v3_release(
+                self.model_release_gate_settings, endpoint=self.endpoint,
+                decision_identity=r.model_identity)
+        except model_release_gate.ModelReleaseGateError as exc:
+            audit(self.audit_path, "model_release_gate_blocked",
+                  decision_id=r.decision_id, underlying=r.underlying, reason=str(exc))
+            raise RuntimeError("v3 model release gate blocks entry: " + str(exc)) from exc
+        if release_evidence.get("enabled"):
+            audit(self.audit_path, "model_release_gate_passed",
+                  decision_id=r.decision_id, underlying=r.underlying,
+                  promotion=release_evidence)
         # Submission is bound to the final, two-sided reqTickersAsync observation.  Using a stale
         # mid + percentage buffer can still rest below a wide ask; crossing at the observed ask is
         # both executable and capped.  Callers must run nbbo_valid immediately beforehand.

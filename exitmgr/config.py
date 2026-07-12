@@ -280,6 +280,7 @@ def load_config(
                    ('error_channel', ''),  # #error-logs -- unfilled-order fill alarms (2026-07-01)
                    ('llm_endpoint', 'http://127.0.0.1:8082/v1/chat/completions'),
                    ('llm_model', ''), ('manage_positions', True),
+                   ('model_release_gate', None),  # signed v3 promotion gate; absent/off by default
                    ('approved_names', []), ('allow_model_names', False),
                    ('pot_cap_usd', None), ('confident_full_size', False), ('confident_conviction', 4),
                    ('cap_bypass_min_conviction', 6),  # conviction >= this may exceed the soft 12% cap

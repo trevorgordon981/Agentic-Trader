@@ -24,6 +24,10 @@ ring-fenced IBKR pot.
 - **`TRADING_DOWN` is a second independent entry halt.** Both markers are checked before any daily
   slate/manual entry work and again beside every BUY submission. Missing config, unreadable markers,
   stale/missing NBBO, account errors, unknown earnings, or failed risk checks block the entry.
+- **Optional signed v3 release gate:** when deliberately enabled, every BUY must match an
+  owner-signed canonical promotion receipt for the exact active custom-Python runtime plus frozen
+  general-reasoning, trading, and portfolio noninferiority passes. It never gates protective exits.
+  See [docs/v3-model-release-gate.md](docs/v3-model-release-gate.md).
 - **Protective exits run independently every 30 seconds** using static rules; the slower model/entry
   cycle runs every 1,200 seconds. A host-wide order lock serializes all broker mutations.
 - The former scheduled `KILL_SWITCH` auto-lift is permanently retired. Re-arming is manual.
