@@ -65,7 +65,8 @@ def runtime_snapshot(endpoint: str, timeout: float = 3.0,
         runtime_receipt.get("schema") if isinstance(runtime_receipt, dict) else None)
     required = ("artifact_id", "artifact_manifest_sha256", "runtime_receipt_sha256",
                 "runtime_contract_sha256", "model_realpath", "startup_nonce",
-                "runtime_backend")
+                "runtime_backend", "runtime_schema", "binding_kind",
+                "readiness_smoke_sha256")
     missing = [key for key in required if not identity.get(key)]
     if missing:
         raise RuntimeIdentityError("model runtime identity missing: " + ", ".join(missing))
@@ -77,7 +78,9 @@ def request_identity(*, endpoint: str, body: Dict[str, Any], response: Dict[str,
                      before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
     """Bind one exact request/response to an unchanged immutable runtime."""
     for key in ("artifact_id", "artifact_manifest_sha256", "runtime_receipt_sha256",
-                "runtime_contract_sha256", "model_realpath", "startup_nonce"):
+                "runtime_contract_sha256", "model_realpath", "startup_nonce",
+                "runtime_backend", "runtime_schema", "binding_kind",
+                "readiness_smoke_sha256"):
         if before.get(key) != after.get(key):
             raise RuntimeIdentityError(f"model runtime changed across request ({key})")
     messages = body.get("messages") or []
@@ -86,6 +89,7 @@ def request_identity(*, endpoint: str, body: Dict[str, Any], response: Dict[str,
     settings = {key: value for key, value in body.items() if key != "messages"}
     return {
         "schema": IDENTITY_SCHEMA,
+        "verified": True,
         "endpoint": endpoint,
         "runtime": dict(after),
         "artifact_id": after.get("artifact_id"),

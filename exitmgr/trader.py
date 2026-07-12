@@ -1418,7 +1418,7 @@ class Trader:
         try:
             release_evidence = model_release_gate.require_v3_release(
                 self.model_release_gate_settings, endpoint=self.endpoint,
-                decision_identity=r.model_identity)
+                decision_identity=r.model_identity, decision_origin="model")
         except model_release_gate.ModelReleaseGateError as exc:
             audit(self.audit_path, "model_release_gate_blocked",
                   decision_id=r.decision_id, underlying=r.underlying, reason=str(exc))
@@ -1440,10 +1440,16 @@ class Trader:
                 [(r.contract.conId, "BUY"), (r.short_contract.conId, "SELL")])
             from exitmgr.order_lock import order_mutation_lock
             with order_mutation_lock():
+                model_release_gate.revalidate_v3_release(
+                    release_evidence, self.model_release_gate_settings, endpoint=self.endpoint,
+                    decision_identity=r.model_identity, decision_origin="model")
                 trade = self.ib_conn.ib.placeOrder(combo, order)
         else:
             from exitmgr.order_lock import order_mutation_lock
             with order_mutation_lock():
+                model_release_gate.revalidate_v3_release(
+                    release_evidence, self.model_release_gate_settings, endpoint=self.endpoint,
+                    decision_identity=r.model_identity, decision_origin="model")
                 trade = self.ib_conn.ib.placeOrder(r.contract, order)
         live = {"Filled", "Submitted", "PreSubmitted"}
         dead = {"Cancelled", "ApiCancelled", "Inactive"}

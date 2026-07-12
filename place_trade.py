@@ -308,10 +308,21 @@ async def run(args):
         if not quote_now.allowed:
             print("[BLOCKED] " + "; ".join(quote_now.reasons))
             return 2
+        manual_intent = None
+        manual_proof = None
+        if release_gate.enabled:
+            manual_intent = model_release_gate.manual_order_intent(
+                decision_id=decision_id, symbol=args.symbol, right=args.right,
+                expiry=expiry, strike=float(strike), quantity=fresh.qty,
+                limit_price=entry_safety.executable_price(fresh),
+                contract_id=int(getattr(fresh.contract, "conId", 0) or 0))
+            manual_proof = model_release_gate.issue_manual_decision_proof(
+                release_gate, intent=manual_intent, approved=True)
         try:
             release_evidence = model_release_gate.require_v3_release(
                 release_gate, endpoint=tr.get("llm_endpoint", ""),
-                decision_identity=getattr(fresh, "model_identity", None))
+                decision_identity=None, decision_origin="manual",
+                manual_proof=manual_proof, manual_intent=manual_intent)
         except model_release_gate.ModelReleaseGateError as exc:
             print(f"[BLOCKED] v3 model release gate: {exc}")
             audit(audit_path, "model_release_gate_blocked", decision_id=decision_id,
@@ -325,6 +336,9 @@ async def run(args):
         order.orderRef = entry_safety.decision_order_ref(decision_id)
         from exitmgr.order_lock import order_mutation_lock
         with order_mutation_lock():
+            model_release_gate.revalidate_v3_release(
+                release_evidence, release_gate, endpoint=tr.get("llm_endpoint", ""),
+                decision_origin="manual", manual_proof=manual_proof, manual_intent=manual_intent)
             trade = ib.placeOrder(fresh.contract, order)
         r = fresh
         line = order_summary(r)

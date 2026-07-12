@@ -1136,7 +1136,8 @@ async def run(args):
                 try:
                     _release_evidence = model_release_gate.require_v3_release(
                         _release_gate, endpoint=tr.get("llm_endpoint", ""),
-                        decision_identity=getattr(r, "model_identity", None))
+                        decision_identity=getattr(r, "model_identity", None),
+                        decision_origin="model")
                 except model_release_gate.ModelReleaseGateError as _release_error:
                     audit(audit_path, "model_release_gate_blocked", decision_id=decision_id,
                           underlying=r.underlying, reason=str(_release_error))
@@ -1174,10 +1175,16 @@ async def run(args):
                         r.underlying, [(r.contract.conId, "BUY"), (r.short_contract.conId, "SELL")])
                     from exitmgr.order_lock import order_mutation_lock
                     with order_mutation_lock():
+                        model_release_gate.revalidate_v3_release(
+                            _release_evidence, _release_gate, endpoint=tr.get("llm_endpoint", ""),
+                            decision_identity=getattr(r, "model_identity", None), decision_origin="model")
                         trade = ib.placeOrder(combo, order)
                 else:
                     from exitmgr.order_lock import order_mutation_lock
                     with order_mutation_lock():
+                        model_release_gate.revalidate_v3_release(
+                            _release_evidence, _release_gate, endpoint=tr.get("llm_endpoint", ""),
+                            decision_identity=getattr(r, "model_identity", None), decision_origin="model")
                         trade = ib.placeOrder(r.contract, order)
                 # Wait for IBKR to ACK (live) or REJECT — never assume it landed (Error 201 etc.).
                 _reject_states = {"Cancelled", "ApiCancelled", "Inactive"}

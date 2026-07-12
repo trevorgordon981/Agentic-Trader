@@ -24,7 +24,7 @@ def main(argv=None) -> int:
         if not settings.enabled:
             raise model_release_gate.ModelReleaseGateError(
                 "model release gate is disabled; nothing is eligible for entry")
-        evidence = model_release_gate.require_v3_release(
+        evidence = model_release_gate.preflight_v3_release(
             settings, endpoint=trading.get("llm_endpoint", ""))
     except (OSError, yaml.YAMLError, model_release_gate.ModelReleaseGateError) as exc:
         print("BLOCKED: " + str(exc), file=sys.stderr)

@@ -48,6 +48,7 @@ def test_request_identity_binds_runtime_and_exact_material():
         endpoint="http://127.0.0.1:8082/v1/chat/completions", body=body,
         response={"choices": []}, before=runtime, after=runtime)
     assert identity["artifact_id"] == "artifact-a"
+    assert identity["verified"] is True
     assert identity["system_prompt_sha256"] == provenance.sha256("system")
     assert identity["context_sha256"] == provenance.sha256("context")
     assert identity["request_sha256"] == provenance.sha256(body)
@@ -65,6 +66,8 @@ def test_runtime_snapshot_proves_custom_backend_from_runtime_receipt():
         "artifact_manifest_sha256": "a" * 64,
         "runtime_receipt_sha256": "b" * 64,
         "runtime_contract_sha256": "c" * 64,
+        "readiness_smoke_sha256": "d" * 64,
+        "binding_kind": "pipeline-artifact",
         "model_realpath": "/models/a",
         "startup_nonce": "nonce",
         "runtime_receipt": {

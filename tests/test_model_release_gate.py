@@ -1,9 +1,11 @@
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -15,6 +17,9 @@ from exitmgr.risk import RiskLimits
 from exitmgr.trader import ResolvedOrder, Trader
 
 
+_PRODUCTION_LEDGER_READER = model_release_gate._activation_head_from_ledger
+
+
 def _digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -22,6 +27,25 @@ def _digest(path):
 def _write_canonical(path, value):
     path.write_bytes((json.dumps(value, sort_keys=True, separators=(",", ":"),
                                 ensure_ascii=True, allow_nan=False) + "\n").encode("ascii"))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_activation_reader(monkeypatch):
+    """Production requires a root-owned ledger; tests inject an isolated head."""
+    monkeypatch.setattr(
+        model_release_gate, "_activation_head_from_ledger",
+        lambda path: json.loads(Path(path).read_text()))
+
+
+def _model_identity(runtime):
+    return {
+        "schema": "trader-model-request.v1",
+        "verified": True,
+        "runtime": dict(runtime),
+        **{key: runtime[key] for key in (
+            "artifact_id", "artifact_manifest_sha256", "runtime_receipt_sha256",
+            "runtime_contract_sha256", "model_realpath")},
+    }
 
 
 def _release_fixture(tmp_path):
@@ -43,6 +67,7 @@ def _release_fixture(tmp_path):
     manifest_sha = _digest(artifact)
     runtime = {
         "runtime_backend": "custom-python-mlx",
+        "runtime_schema": "pipeline-m3-runtime.v1",
         "binding_kind": "pipeline-artifact",
         "artifact_id": artifact_id,
         "artifact_manifest_sha256": manifest_sha,
@@ -50,7 +75,7 @@ def _release_fixture(tmp_path):
         "runtime_receipt_sha256": "b" * 64,
         "runtime_contract_sha256": "c" * 64,
         "readiness_smoke_sha256": "d" * 64,
-        "startup_nonce": "nonce",
+        "startup_nonce": "startup-nonce-20260711",
     }
     noninferiority = {}
     for pillar, path in evaluations.items():
@@ -62,11 +87,18 @@ def _release_fixture(tmp_path):
             "candidate_artifact_id": artifact_id,
             "candidate_artifact_manifest_sha256": manifest_sha,
         }
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    not_before = now - timedelta(minutes=1)
+    expires_at = now + timedelta(days=1)
     receipt_value = {
         "schema": "alfred-model-promotion.v1",
         "promotion_id": "m3-v3-release-20260711",
+        "release_sequence": 1,
+        "activation_nonce": "a" * 64,
         "status": "PROMOTED",
-        "promoted_at": "2026-07-11T19:00:00Z",
+        "not_before": not_before.isoformat().replace("+00:00", "Z"),
+        "promoted_at": now.isoformat().replace("+00:00", "Z"),
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
         "lineage": {
             "stage": "v3",
             "parent_bf16": {
@@ -77,6 +109,7 @@ def _release_fixture(tmp_path):
         },
         "serving_artifact": {
             "backend": "custom-python-mlx",
+            "runtime_schema": "pipeline-m3-runtime.v1",
             "binding_kind": "pipeline-artifact",
             "artifact_id": artifact_id,
             "artifact_manifest_path": str(artifact),
@@ -85,6 +118,7 @@ def _release_fixture(tmp_path):
             "runtime_receipt_sha256": "b" * 64,
             "runtime_contract_sha256": "c" * 64,
             "readiness_smoke_sha256": "d" * 64,
+            "startup_nonce": "startup-nonce-20260711",
             "quantization_receipt_path": str(quant),
             "quantization_receipt_sha256": _digest(quant),
         },
@@ -92,6 +126,19 @@ def _release_fixture(tmp_path):
     }
     receipt = root / "promotion.json"
     _write_canonical(receipt, receipt_value)
+
+    activation = root / "activation-head.json"
+    _write_canonical(activation, {
+        "schema": "alfred-model-activation.v1",
+        "sequence": 1,
+        "action": "ACTIVATE",
+        "promotion_id": receipt_value["promotion_id"],
+        "promotion_receipt_sha256": _digest(receipt),
+        "activation_nonce": receipt_value["activation_nonce"],
+        "recorded_at": now.isoformat().replace("+00:00", "Z"),
+        "expires_at": receipt_value["expires_at"],
+        "previous_record_sha256": "0" * 64,
+    })
 
     key = root / "promotion_signing"
     subprocess.run(
@@ -105,9 +152,13 @@ def _release_fixture(tmp_path):
          "-n", "alfred-model-promotion-v1", str(receipt)],
         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     signature = Path(str(receipt) + ".sig")
+    manual_key = root / "manual-provenance.key"
+    manual_key.write_text("manual-test-key-which-is-at-least-thirty-two-bytes\n")
+    manual_key.chmod(0o600)
     settings = model_release_gate.ModelReleaseGateSettings(
         enabled=True, promotion_receipt=str(receipt), signature=str(signature),
-        allowed_signers=str(allowed))
+        allowed_signers=str(allowed), activation_ledger=str(activation),
+        manual_provenance_key=str(manual_key))
     return settings, runtime, receipt_value, evaluations
 
 
@@ -139,7 +190,7 @@ def test_valid_signed_v3_release_binds_exact_runtime(tmp_path):
     settings, runtime, _, _ = _release_fixture(tmp_path)
     evidence = model_release_gate.require_v3_release(
         settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
-        runtime_snapshot=lambda _: runtime)
+        decision_identity=_model_identity(runtime), runtime_snapshot=lambda _: runtime)
     assert evidence["enabled"] is True
     assert evidence["stage"] == "v3"
     assert evidence["artifact_id"] == runtime["artifact_id"]
@@ -187,7 +238,7 @@ def test_noncanonical_or_duplicate_receipt_fails_closed(tmp_path):
 @pytest.mark.parametrize("key", [
     "artifact_id", "artifact_manifest_sha256", "model_realpath",
     "runtime_receipt_sha256", "runtime_contract_sha256", "readiness_smoke_sha256",
-    "binding_kind", "runtime_backend",
+    "binding_kind", "runtime_backend", "runtime_schema", "startup_nonce",
 ])
 def test_every_active_runtime_binding_mismatch_blocks(tmp_path, key):
     settings, runtime, _, _ = _release_fixture(tmp_path)
@@ -201,18 +252,141 @@ def test_every_active_runtime_binding_mismatch_blocks(tmp_path, key):
 
 def test_model_name_is_irrelevant_but_captured_decision_runtime_must_match(tmp_path):
     settings, runtime, _, _ = _release_fixture(tmp_path)
-    identity = {key: runtime[key] for key in (
-        "artifact_id", "artifact_manifest_sha256", "runtime_receipt_sha256",
-        "runtime_contract_sha256", "model_realpath")}
+    identity = _model_identity(runtime)
     evidence = model_release_gate.require_v3_release(
         settings, endpoint="http://localhost:8082/a/model/name/is/not/trusted",
         decision_identity=identity, runtime_snapshot=lambda _: runtime)
     assert evidence["enabled"]
-    identity["runtime_receipt_sha256"] = "0" * 64
+    identity["runtime"]["runtime_receipt_sha256"] = "0" * 64
     with pytest.raises(model_release_gate.ModelReleaseGateError, match="decision"):
         model_release_gate.require_v3_release(
             settings, endpoint="http://localhost:8082/v1/chat/completions",
             decision_identity=identity, runtime_snapshot=lambda _: runtime)
+
+
+def test_model_entry_missing_or_unverified_identity_fails_closed(tmp_path):
+    settings, runtime, _, _ = _release_fixture(tmp_path)
+    with pytest.raises(model_release_gate.ModelReleaseGateError, match="missing runtime identity"):
+        model_release_gate.require_v3_release(
+            settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
+            runtime_snapshot=lambda _: runtime)
+    identity = _model_identity(runtime)
+    identity["verified"] = False
+    with pytest.raises(model_release_gate.ModelReleaseGateError, match="verified request"):
+        model_release_gate.require_v3_release(
+            settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
+            decision_identity=identity, runtime_snapshot=lambda _: runtime)
+
+
+def test_activation_head_prevents_replay_and_revocation_is_immediate(tmp_path):
+    settings, runtime, value, _ = _release_fixture(tmp_path)
+    identity = _model_identity(runtime)
+    head_path = Path(settings.activation_ledger)
+    head = json.loads(head_path.read_text())
+    head.update(sequence=2, promotion_id="newer-release",
+                promotion_receipt_sha256="9" * 64,
+                activation_nonce="8" * 64)
+    _write_canonical(head_path, head)
+    with pytest.raises(model_release_gate.ModelReleaseGateError, match="ledger head"):
+        model_release_gate.require_v3_release(
+            settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
+            decision_identity=identity, runtime_snapshot=lambda _: runtime)
+
+    head.update(action="REVOKE", promotion_id=value["promotion_id"],
+                promotion_receipt_sha256=_digest(Path(settings.promotion_receipt)),
+                activation_nonce=value["activation_nonce"])
+    _write_canonical(head_path, head)
+    with pytest.raises(model_release_gate.ModelReleaseGateError, match="revoked"):
+        model_release_gate.require_v3_release(
+            settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
+            decision_identity=identity, runtime_snapshot=lambda _: runtime)
+
+
+def test_root_ledger_reader_enforces_contiguous_hash_chained_records(tmp_path):
+    ledger = tmp_path / "ledger"
+    ledger.mkdir()
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    previous = "0" * 64
+    for sequence, action in ((1, "ACTIVATE"), (2, "REVOKE")):
+        record = {
+            "schema": "alfred-model-activation.v1",
+            "sequence": sequence,
+            "action": action,
+            "promotion_id": "release-one",
+            "promotion_receipt_sha256": "1" * 64,
+            "activation_nonce": "2" * 64,
+            "recorded_at": (now + timedelta(seconds=sequence)).isoformat().replace(
+                "+00:00", "Z"),
+            "expires_at": (now + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+            "previous_record_sha256": previous,
+        }
+        scratch = ledger / "scratch"
+        _write_canonical(scratch, record)
+        digest = _digest(scratch)
+        final = ledger / f"{sequence:020d}-{action.lower()}-{digest}.json"
+        scratch.rename(final)
+        final.chmod(0o444)
+        previous = digest
+    head = _PRODUCTION_LEDGER_READER(str(ledger), required_uid=os.geteuid())
+    assert head["sequence"] == 2
+    assert head["action"] == "REVOKE"
+
+    last = sorted(ledger.iterdir())[-1]
+    bad = json.loads(last.read_text())
+    bad["previous_record_sha256"] = "f" * 64
+    last.chmod(0o600)
+    last.unlink()
+    scratch = ledger / "scratch"
+    _write_canonical(scratch, bad)
+    bad_digest = _digest(scratch)
+    scratch.rename(ledger / f"{2:020d}-revoke-{bad_digest}.json")
+    (ledger / f"{2:020d}-revoke-{bad_digest}.json").chmod(0o444)
+    with pytest.raises(model_release_gate.ModelReleaseGateError, match="hash chain"):
+        _PRODUCTION_LEDGER_READER(str(ledger), required_uid=os.geteuid())
+
+def test_signed_release_expiry_is_enforced(tmp_path):
+    settings, runtime, value, _ = _release_fixture(tmp_path)
+    after_expiry = datetime.fromisoformat(value["expires_at"].replace("Z", "+00:00")) \
+        + timedelta(seconds=1)
+    with pytest.raises(model_release_gate.ModelReleaseGateError, match="expired"):
+        model_release_gate.require_v3_release(
+            settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
+            decision_identity=_model_identity(runtime), runtime_snapshot=lambda _: runtime,
+            now=after_expiry)
+
+
+def test_manual_entry_requires_short_lived_hmac_bound_to_exact_order(tmp_path):
+    settings, runtime, _, _ = _release_fixture(tmp_path)
+    intent = model_release_gate.manual_order_intent(
+        decision_id="decision-" + "a" * 32, symbol="SPY", right="C",
+        expiry="20270115", strike=600.0, quantity=1, limit_price=1.10,
+        contract_id=11)
+    proof = model_release_gate.issue_manual_decision_proof(
+        settings, intent=intent, approved=True)
+    evidence = model_release_gate.require_v3_release(
+        settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
+        decision_origin="manual", manual_proof=proof, manual_intent=intent,
+        runtime_snapshot=lambda _: runtime)
+    assert evidence["enabled"]
+    changed = dict(intent, quantity=2)
+    with pytest.raises(model_release_gate.ModelReleaseGateError, match="another order"):
+        model_release_gate.require_v3_release(
+            settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
+            decision_origin="manual", manual_proof=proof, manual_intent=changed,
+            runtime_snapshot=lambda _: runtime)
+
+
+def test_final_revalidation_blocks_runtime_swap_after_approval(tmp_path):
+    settings, runtime, _, _ = _release_fixture(tmp_path)
+    identity = _model_identity(runtime)
+    evidence = model_release_gate.require_v3_release(
+        settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
+        decision_identity=identity, runtime_snapshot=lambda _: runtime)
+    swapped = dict(runtime, startup_nonce="swapped-startup")
+    with pytest.raises(model_release_gate.ModelReleaseGateError, match="startup_nonce"):
+        model_release_gate.revalidate_v3_release(
+            evidence, settings, endpoint="http://127.0.0.1:8082/v1/chat/completions",
+            decision_identity=identity, runtime_snapshot=lambda _: swapped)
 
 
 def test_frozen_noninferiority_file_must_remain_read_only_and_unchanged(tmp_path):
@@ -282,6 +456,9 @@ def test_all_direct_new_entry_call_sites_have_release_gate_and_exits_do_not():
                 continue
             context = "\n".join(lines[max(0, idx - 70):idx + 1])
             assert "require_v3_release" in context, f"ungated new entry in {rel}:{idx + 1}"
+            adjacent = "\n".join(lines[max(0, idx - 12):idx + 1])
+            assert "revalidate_v3_release" in adjacent, \
+                f"no immediate runtime revalidation in {rel}:{idx + 1}"
     # Protective SELL-to-close placement is intentionally independent: a failed
     # release proof must never suppress de-risking.
     assert "model_release_gate" not in (root / "exitmgr" / "order.py").read_text()
@@ -298,3 +475,9 @@ def test_all_direct_new_entry_call_sites_have_release_gate_and_exits_do_not():
         if ".place_order(" in path.read_text():
             wrapper_callers.add(rel)
     assert wrapper_callers == {"close_symbol.py", "liquidate.py", "exitmgr/order.py"}
+    for rel in ("daily_recommend.py", "exitmgr/trader.py"):
+        assert 'decision_origin="model"' in (root / rel).read_text()
+        assert "preflight_v3_release" not in (root / rel).read_text()
+    manual = (root / "place_trade.py").read_text()
+    assert 'decision_origin="manual"' in manual
+    assert "issue_manual_decision_proof" in manual

@@ -135,9 +135,11 @@ trading:
   # Protective exits never consult this gate.
   model_release_gate:
     enabled: false
-    promotion_receipt: /Users/alfredpennyworth/model-releases/v3/promotion.json
-    signature: /Users/alfredpennyworth/model-releases/v3/promotion.json.sig
-    allowed_signers: /Users/alfredpennyworth/model-releases/trusted_allowed_signers
+    promotion_receipt: /var/lib/alfred/model-releases/v3/promotion.json
+    signature: /var/lib/alfred/model-releases/v3/promotion.json.sig
+    allowed_signers: /etc/alfred/model-release/trusted_allowed_signers
+    activation_ledger: /var/lib/alfred/model-releases/activation-ledger
+    manual_provenance_key: /etc/alfred/model-release/manual-provenance.key
   manage_positions: true
   approved_names: [SPY, QQQ, IWM, AAPL, MSFT, NVDA]  # placeholder -- real ~400-name universe scrubbed (strategy)
   allow_model_names: true
