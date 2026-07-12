@@ -319,6 +319,14 @@ class IBConnection:
             print(f"[WARN] qualify failed in fetch_quotes: {e}")
         # Request tickers
         tickers = await self.ib.reqTickersAsync(*contracts)
+        try:
+            from exitmgr.byron_evidence import record_ibkr_quotes
+            record_ibkr_quotes(
+                tickers, context="exit_manager_mark",
+                metadata={"requested_contract_ids": list(con_ids)},
+            )
+        except Exception:
+            pass
 
         result: Dict[int, dict] = {}
         for ticker in tickers:

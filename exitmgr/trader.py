@@ -36,6 +36,11 @@ def audit(path: str, event: str, **fields) -> dict:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
         f.write(json.dumps(rec, default=str) + "\n")
+    try:
+        from exitmgr.byron_evidence import record_audit
+        record_audit(rec)
+    except Exception:
+        pass
     return rec
 
 
@@ -1257,6 +1262,14 @@ class Trader:
         cands = [Option(idea.underlying, expiry, k, right, "SMART") for k in strikes_near(p.strikes, spot)]
         qualified = await ib.qualifyContractsAsync(*cands)
         tickers = await ib.reqTickersAsync(*[c for c in qualified if getattr(c, "conId", None)])
+        try:
+            from exitmgr.byron_evidence import record_ibkr_quotes
+            record_ibkr_quotes(
+                tickers, context="entry_option_chain",
+                metadata={"underlying": idea.underlying, "expiry": expiry, "right": right},
+            )
+        except Exception:
+            pass
         # LONG-LEG DELTA BAND (gate A3): target ~0.55-0.65 delta -- a leg that is already
         # working, not a lottery ticket. The model's target_delta is clamped into the band.
         tgt_delta = construction.effective_delta(idea.target_delta, cons)

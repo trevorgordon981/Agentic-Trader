@@ -124,7 +124,7 @@ def normalize_fill(fill) -> Optional[Dict[str, Any]]:
                 mult = float(m)
         except (TypeError, ValueError):
             pass
-        return {
+        normalized = {
             "exec_id": str(exec_id),
             "order_id": int(getattr(ex, "orderId", 0) or 0),
             "perm_id": int(getattr(ex, "permId", 0) or 0),
@@ -145,6 +145,12 @@ def normalize_fill(fill) -> Optional[Dict[str, Any]]:
             "commission_ccy": getattr(cr, "currency", None) if cr is not None else None,
             "realized_pnl_ib": _real_realized(getattr(cr, "realizedPNL", None)) if cr is not None else None,
         }
+        try:
+            from exitmgr.byron_evidence import record_fill
+            record_fill(normalized)
+        except Exception:
+            pass
+        return normalized
     except Exception:
         return None
 

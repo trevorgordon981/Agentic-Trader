@@ -26,8 +26,19 @@ async def get_pot_snapshot(ib) -> PotSnapshot:
                     return default
         return default
 
-    return PotSnapshot(
+    snapshot = PotSnapshot(
         net_liq=val("NetLiquidation"),
         available_funds=val("AvailableFunds"),
         cash=val("TotalCashValue"),
     )
+    try:
+        from exitmgr.byron_evidence import record_account_snapshot
+        record_account_snapshot({
+            "net_liq": snapshot.net_liq,
+            "available_funds": snapshot.available_funds,
+            "cash": snapshot.cash,
+            "source": "IBKR.accountSummaryAsync",
+        })
+    except Exception:
+        pass
+    return snapshot

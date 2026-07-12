@@ -57,6 +57,28 @@ manager (`main.py` logic, folded into the loop) manages exits on whatever opens.
 | `exitmgr/approval.py` | Slack approve-each (reject-wins, approver allowlist, expiry) |
 | `exitmgr/trader.py` | orchestrator + audit log + day-start baseline |
 | `exitmgr/{connection,order,state,rules,manager}.py` | execution + exit management |
+| `exitmgr/byron_evidence.py` | optional point-in-time source capture for Byron replay |
+
+## Byron production-evidence capture
+
+Source capture is deliberately **off by default** and does not change model,
+risk, construction, order, or exit behavior. To collect prospective evidence,
+set `BYRON_SOURCE_CAPTURE_PATH` to a protected local JSONL path before starting
+the trader. The capture mirrors audit events and records IBKR account snapshots,
+broker fills, and the source-native timestamp, size, bid, and ask of entry and
+exit quotes.
+
+```sh
+export BYRON_SOURCE_CAPTURE_PATH="$HOME/protected/byron/exitmgr-source.jsonl"
+python run_trader.py --loop --interval 1200 --protective-interval 30
+```
+
+If a quote lacks an IBKR timestamp, bid/ask size, or a complete two-sided
+market, capture writes `exitmgr-source.jsonl.INVALID.json`. Trading continues,
+but the entire evidence run is invalid for portfolio claims. This source stream
+is not itself P&L: Byron must join it to the locked calendar, model/runtime/config
+receipts, capital reservations, commissions, benchmark tape, and official-close
+broker reconciliation, then terminally attest it outside this repository.
 
 ## Known surfaces to validate on paper first
 - **Option contract selection** in `trader._execute_entry` (chain → expiry near DTE → strike by
