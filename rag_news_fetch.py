@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch fresh, Trevor-relevant news into the Alfred RAG news domain."""
+"""Fetch fresh, the operator-relevant news into the Alfred RAG news domain."""
 from __future__ import annotations
 import html, os, re, time, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
@@ -266,7 +266,7 @@ def main():
         "---", "date: " + today.isoformat(), "type: news-digest",
         "source: google-news-rss", "---", "",
         "# News digest " + today.isoformat(), "",
-        "Fresh headlines for Trevor watchlist tickers and the topics he follows.",
+        "Fresh headlines for the operator watchlist tickers and the topics he follows.",
         "",
     ]
     tickers = watchlist_tickers()

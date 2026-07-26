@@ -32,7 +32,7 @@ HOST, PORT, CLIENT_ID = "127.0.0.1", 4001, 96
 JOURNAL = os.path.expanduser("~/exitmgr-app/trades.log")
 POSITIONS_CH = "C0XXXXXXXXX"   # #trading-positions  (heartbeat)
 ALERTS_CH = "C0XXXXXXXXX"      # #trading-alerts     (escalation)
-TREVOR = "U0XXXXXXXXX"
+the operator = "U0XXXXXXXXX"
 
 NEAR_STOP_FRAC = 0.8    # flag when uPnL <= -0.8 * stop_pct
 NEAR_TARGET_FRAC = 0.9  # flag when uPnL >= 0.9 * profit_target_pct
@@ -200,7 +200,7 @@ def main():
     slack(head + "\n" + body, POSITIONS_CH)
 
     if alerts:
-        msg = (f"<@{TREVOR}> :rotating_light: *Thesis/level erosion — review for exit:*\n"
+        msg = (f"<@{the operator}> :rotating_light: *Thesis/level erosion — review for exit:*\n"
                + "\n".join("• " + a for a in alerts)
                + "\n\nClose one now: reply here, or I can run "
                  "`close_symbol.py --symbol XXX --confirm`.")

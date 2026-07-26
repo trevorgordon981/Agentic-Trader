@@ -13,9 +13,24 @@ class PositionData:
     con_id: int
     symbol: str
     right: str  # 'C' or 'P'
-    quantity: int  # contracts (positive for long)
+    quantity: int  # contracts; POSITIVE = long, NEGATIVE = short (sign is never stripped)
     avg_cost: float  # average cost per share
     expiry: str = ""  # option expiry YYYYMMDD
+    # SHORT VISIBILITY (2026-07-26): two ADDITIVE fields, both defaulted so every existing
+    # construction (production and tests, positional or keyword) is unchanged.
+    #   sec_type -- 'OPT'/'FOP' for an option, 'STK' for assigned shares. Needed because an
+    #     ASSIGNED put leaves a STOCK row that can still carry residual right/strike fields
+    #     (IBKR does this), so `right` alone cannot tell an option from stock.
+    #   strike   -- the option strike; a short put's collateral is strike*100*|qty|, which is
+    #     the only honest way to value it (avg_cost is the premium, ~1/300th of the risk).
+    sec_type: str = "OPT"
+    strike: float = 0.0
+
+    @property
+    def is_short(self) -> bool:
+        """True for a SOLD position. Callers that only understand long positions must test
+        this (or `quantity > 0`) rather than assuming the sign."""
+        return self.quantity < 0
 
 
 @dataclass
@@ -166,13 +181,49 @@ class IBConnection:
         print("[WARN] forcing IBKR reconnect ...")
         return await self.connect(retries=retries, retry_delay=retry_delay, force=True)
 
-    async def get_positions(self) -> Dict[int, PositionData]:
+    @staticmethod
+    def _str_field(obj, name: str) -> str:
+        """Read a STRING attribute defensively. Returns '' when the attribute is missing or is
+        not a real string (a MagicMock in a test, a None from a partial IBKR contract). Used so
+        an unreadable secType can never be mistaken for a real one."""
+        v = getattr(obj, name, None)
+        return v if isinstance(v, str) else ""
+
+    @staticmethod
+    def _num_field(obj, name: str) -> float:
+        """Read a NUMERIC attribute defensively; 0.0 when missing/unreadable/NaN."""
+        v = getattr(obj, name, None)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return 0.0
+        return float(v) if v == v else 0.0
+
+    async def get_positions(self, include_short: bool = False,
+                            include_stock: bool = False) -> Dict[int, PositionData]:
         """
         Fetch all current positions using reqPositionsAsync.
         Returns dict mapping con_id to PositionData.
-        Only includes LONG option positions (calls AND puts, quantity > 0). Short legs of
-        debit spreads are intentionally excluded -- they are managed as a unit via the
-        journaled long leg (see manager.py spread handling).
+
+        DEFAULT (include_short=False, include_stock=False) -- UNCHANGED, and deliberately so:
+        only LONG option positions (calls AND puts, quantity > 0). Short legs of debit spreads
+        are excluded -- they are managed as a unit via the journaled long leg (see manager.py
+        spread handling). EVERY pre-existing caller uses this default and sees exactly what it
+        always saw. That is not laziness: an audit of the consumers (2026-07-26) found that
+        feeding negatives into them silently corrupts risk gates rather than merely widening
+        them -- construction.open_book_items() would add a short put's MAX LOSS to the
+        long-premium deployment book (blowing the 40% deployed + 4%/day theta caps and locking
+        out every entry), risk.evaluate_trade()'s single-name aggregate would do the same, and
+        order.py's close path hardcodes SELL and would size an order off a negative quantity.
+        Until those files are made short-aware, a caller must ASK for shorts.
+
+        include_short=True -- ALSO returns SHORT options with the sign PRESERVED
+        (quantity < 0). It is never abs()'d: a short that looks like a long to a consumer that
+        does not check is a worse bug than a short that is invisible. Callers must branch on
+        `quantity < 0` / `PositionData.is_short`.
+
+        include_stock=True -- ALSO returns STOCK rows (sec_type='STK', right=''). Used solely to
+        recognise an ASSIGNED cash-secured put: the option row disappears and a stock row
+        appears, and without this the assignment is indistinguishable from a manual buy-back.
+        Stock is NEVER fed to the option management path (its close is not an option order).
         """
         if not self._connected or not self.ib:
             raise RuntimeError("Not connected to IB")
@@ -182,12 +233,13 @@ class IBConnection:
         result: Dict[int, PositionData] = {}
         for pos in positions:
             # pos.contract should have conId, symbol, right
-            # pos.position is the number of contracts (positive=long)
+            # pos.position is the number of contracts (positive=long, negative=short)
             # pos.avgCost is average cost per share
             contract = pos.contract
             position_qty = pos.position
 
             # Filter: long options only (calls and puts, quantity > 0)
+            # NOTE: this predicate is byte-identical to the pre-2026-07-26 one and must stay so.
             if (hasattr(contract, 'right') and contract.right in ('C', 'P') and position_qty > 0):
                 con_id = contract.conId
                 result[con_id] = PositionData(
@@ -197,6 +249,48 @@ class IBConnection:
                     quantity=position_qty,
                     avg_cost=pos.avgCost if hasattr(pos, 'avgCost') else 0.0,
                     expiry=getattr(contract, 'lastTradeDateOrContractMonth', '') or '',
+                    sec_type=(self._str_field(contract, 'secType').upper() or "OPT"),
+                    strike=self._num_field(contract, 'strike'),
+                )
+                continue
+
+            if include_short and position_qty < 0:
+                # A SHORT OPTION. secType gates it, not the option-shaped fields: an assigned
+                # (or called-away) STOCK row can still carry a residual right/strike, and
+                # closing that as an option would be a wrong-instrument order. Unreadable
+                # secType ('' -- absent, None, or a test double) is treated as an option so a
+                # real short can never be silently dropped by a broker field we failed to read.
+                sec_type = self._str_field(contract, 'secType').upper()
+                if sec_type not in ('', 'OPT', 'FOP'):
+                    continue
+                if not (hasattr(contract, 'right') and contract.right in ('C', 'P')):
+                    continue
+                con_id = contract.conId
+                result[con_id] = PositionData(
+                    con_id=con_id,
+                    symbol=contract.symbol if hasattr(contract, 'symbol') else "",
+                    right=contract.right,
+                    quantity=position_qty,          # NEGATIVE -- sign preserved on purpose
+                    avg_cost=pos.avgCost if hasattr(pos, 'avgCost') else 0.0,
+                    expiry=getattr(contract, 'lastTradeDateOrContractMonth', '') or '',
+                    sec_type=(sec_type or "OPT"),
+                    strike=self._num_field(contract, 'strike'),
+                )
+                continue
+
+            if include_stock and position_qty != 0:
+                if self._str_field(contract, 'secType').upper() != 'STK':
+                    continue
+                con_id = contract.conId
+                result[con_id] = PositionData(
+                    con_id=con_id,
+                    symbol=contract.symbol if hasattr(contract, 'symbol') else "",
+                    right="",                       # stock has no right, whatever IBKR echoes
+                    quantity=position_qty,          # may be negative (called-away short stock)
+                    avg_cost=pos.avgCost if hasattr(pos, 'avgCost') else 0.0,
+                    expiry="",
+                    sec_type="STK",
+                    strike=0.0,
                 )
 
         return result

@@ -183,7 +183,7 @@ def test_blocked_name_case_insensitive():
 
 def test_non_blocked_name_still_allowed():
     lim = RiskLimits(allow_any_name=True, blocked_names={"TSLA"})
-    d = gate(ProposedTrade("RKLB", 50.0, False), limits=lim)  # space name Trevor kept
+    d = gate(ProposedTrade("RKLB", 50.0, False), limits=lim)  # space name the operator kept
     assert d.approved, d.reasons
 
 

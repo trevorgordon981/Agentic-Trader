@@ -22,7 +22,13 @@ from exitmgr.account import get_pot_snapshot
 from exitmgr.risk import (
     RiskLimits, OpenPosition, ProposedTrade, GateDecision, evaluate_trade, day_pnl_pct,
 )
-from exitmgr.strategist import propose, TradeIdea
+from exitmgr.strategist import (
+    propose, TradeIdea,
+    # THE structure allow-list and its choke point are IMPORTED, never re-declared here.
+    # Two copies of a safety list can drift out of step, and a drifted allow-list is a
+    # worse bug than a gate in the wrong place.
+    DEBIT_STRUCTURES, _require_allowed_structure,
+)
 from exitmgr import approval, construction, research, regime, slate_lock, trade_capture, reload_queue
 from exitmgr import entry_safety
 from dataclasses import replace as _replace_dc
@@ -90,6 +96,266 @@ def _market_open() -> bool:
     return 13 * 60 + 30 <= mins <= 20 * 60
 
 
+# ----------------------------------------------------------- CREDIT LIMB (CREDIT_PATH_SPEC.md S2)
+# The ONLY short-premium structure this system may ever submit is a CASH-SECURED PUT. Everything
+# below exists to make the two catastrophic failure modes UNREACHABLE rather than merely
+# discouraged:
+#   INVARIANT 1  a naked call (or any short that is not a CSP) never reaches an order;
+#   INVARIANT 2  a put is never sold without `strike * 100 * contracts` of cash verified
+#                AVAILABLE AT SUBMIT TIME (not merely at proposal time).
+CREDIT_SIDE = "credit"
+CSP_STRUCTURE = "cash secured put"
+# the operator's ruling (RULING_CREDIT_CAP.md): total reserved collateral -- ALREADY-DEPLOYED plus this
+# trade -- may never exceed 80% of net liquidation value.
+CREDIT_MAX_COLLATERAL_PCT = 0.80
+# Credit DTE window (spec S3). Read from ConstructionConfig when the structure-aware floor lands;
+# these are the fallbacks so this path is never accidentally handed the 25-DTE DEBIT floor.
+CREDIT_MIN_DTE_DEFAULT = 3
+CREDIT_MAX_DTE_DEFAULT = 45
+_EPS = 1e-6
+
+
+def _side_of(obj) -> str:
+    """"credit" | "debit". Absent/unparseable == "debit" -- the historical contract."""
+    try:
+        s = str(getattr(obj, "side", "debit") or "debit").strip().lower()
+    except Exception:
+        return "debit"
+    return CREDIT_SIDE if s == CREDIT_SIDE else "debit"
+
+
+def is_credit(obj) -> bool:
+    """True for a credit TradeIdea or a credit ResolvedOrder. Everything else is a debit."""
+    return _side_of(obj) == CREDIT_SIDE
+
+
+def _fnum(x, default=None):
+    """float(x) if finite, else `default`. Never raises."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return v if v == v and v not in (float("inf"), float("-inf")) else default
+
+
+def credit_structure_ok(idea) -> tuple:
+    """INVARIANT 1 + the credit contract's field requirements. Returns (ok, reason).
+
+    A short structure that is NOT a cash-secured put has unbounded (naked call) or undefined
+    risk, so it is REFUSED here -- before any contract is qualified and long before an order
+    object exists. Debit ideas pass through untouched (this is a no-op for them)."""
+    if not is_credit(idea):
+        return True, ""
+    structure = str(getattr(idea, "structure", "") or "").strip().lower()
+    if structure != CSP_STRUCTURE:
+        return False, (f"NAKED-SHORT REFUSED: credit structure {structure!r} is not a "
+                       f"{CSP_STRUCTURE!r} -- the only short this account may ever sell")
+    strike = _fnum(getattr(idea, "strike", 0.0), None)
+    collateral = _fnum(getattr(idea, "collateral_usd", 0.0), None)
+    net_credit = _fnum(getattr(idea, "net_credit_usd", 0.0), None)
+    max_loss = _fnum(getattr(idea, "max_loss_usd", 0.0), None)
+    for label, v in (("strike", strike), ("collateral_usd", collateral),
+                     ("net_credit_usd", net_credit), ("max_loss_usd", max_loss)):
+        if v is None or v <= 0:
+            return False, f"credit idea missing/invalid {label} ({v!r})"
+    if abs(max_loss - (collateral - net_credit)) > 0.01:
+        return False, (f"credit idea inconsistent: max_loss ${max_loss:,.2f} != collateral "
+                       f"${collateral:,.2f} - credit ${net_credit:,.2f}")
+    if net_credit >= collateral:
+        return False, "credit idea claims a credit >= its collateral (impossible for a CSP)"
+    return True, ""
+
+
+# ------------------------------------------------------------------- DEBIT LIMB STRUCTURE GATE
+# THE DEFECT THIS CLOSES (2026-07-26). strategist._require_allowed_structure() only runs on ideas
+# the STRATEGIST PARSES. Three routes build a TradeIdea directly and never touch the parser, so
+# the allow-list never saw them:
+#   1. daily_recommend.py  --structure          -- an arbitrary CLI string
+#   2. trader.py           _drain_reload_ideas  -- reload tickets
+#   3. daily_recommend.py  Slack approval structure/direction override
+#
+# THE CONSEQUENCE IS SILENT SEMANTIC CORRUPTION, NOT UNBOUNDED LOSS -- state it accurately.
+# Both executors branch on the substring "spread" (trader._resolve_order, daily_recommend._resolve)
+# and take the option right from `direction`, NEVER from the structure string. "naked call" has no
+# "spread" in it, so it routed to the SINGLE LONG LEG builder and BOUGHT a call. The debit path
+# cannot emit a sell-to-open at all. What it COULD do is fill a long call and journal it as a
+# "naked call" / "short strangle" -- and the journal is the training corpus, so the model would be
+# taught from a row describing a position the account never held. That is the defect: a
+# correctness and data-integrity failure at the label, not a risk failure at the position.
+def _structure_implied_right(raw) -> str:
+    '''"C" | "P" | "" -- the option right a structure NAMES, or "" when it names none
+    ("long option", "debit spread"). Uses the same two substrings strategist.normalize_direction()
+    already uses to infer a direction FROM a structure, so a consistent pair is classified exactly
+    as it is today. No entry in DEBIT_STRUCTURES contains both words, so this is unambiguous for
+    everything the allow-list permits.'''
+    s = str(raw or "").lower()
+    has_call, has_put = "call" in s, "put" in s
+    if has_call and not has_put:
+        return "C"
+    if has_put and not has_call:
+        return "P"
+    return ""
+
+
+def debit_structure_ok(idea) -> tuple:
+    """THE debit-side structure gate. Returns (ok, reason). Credit ideas pass through untouched --
+    credit_structure_ok() is their gate exactly as this is the debit side's, and the two never
+    both judge the same idea.
+
+    Two independent conditions:
+      1. the structure is on strategist.DEBIT_STRUCTURES (the ONE allow-list, imported above);
+      2. the structure does not CONTRADICT the direction.
+
+    (2) closes a pre-existing hole that is the same defect as (1) wearing different clothes:
+    {"structure": "bull call spread", "direction": "bearish"} passes the allow-list, and then the
+    constructor -- which reads the right off `direction` -- builds a PUT vertical and journals it
+    as a bull call spread. REJECTED rather than repaired: `direction` and the structure's own noun
+    disagree, and nothing in the idea says which of the two the author meant. Deriving the right
+    from the structure instead would silently overrule an explicit `direction` and swap the trade's
+    side -- trading one silent corruption for a worse one. A CONSISTENT pair is unaffected: the
+    check only fires when the structure names a right and the direction names the opposite one.
+
+    A failure is REFUSED and reported. It is never coerced to a default -- quietly substituting
+    "long call" for a rejected string is precisely the mislabelling this gate exists to stop."""
+    if is_credit(idea):
+        return True, ""
+    raw = getattr(idea, "structure", "")
+    try:
+        _require_allowed_structure("debit", raw)
+    except ValueError as exc:
+        return False, "STRUCTURE REFUSED: %s" % (exc,)
+    implied = _structure_implied_right(raw)
+    stated = {"bullish": "C", "bearish": "P"}.get(
+        str(getattr(idea, "direction", "") or "").strip().lower())
+    if implied and stated and implied != stated:
+        _word = {"C": "call", "P": "put"}
+        return False, (
+            "STRUCTURE/DIRECTION CONTRADICTION: structure %r names a %s but direction is %r. The "
+            "constructor takes the option right from `direction`, so this idea would be built and "
+            "journalled as a %s under a %s's name. Refused, not repaired -- neither field can be "
+            "shown to be the mistaken one. Permitted: %s."
+            % (raw, _word[implied], getattr(idea, "direction", ""), _word[stated], _word[implied],
+               ", ".join(sorted(DEBIT_STRUCTURES))))
+    return True, ""
+
+
+def required_collateral(strike: float, contracts: int) -> Optional[float]:
+    """INVARIANT 2's arithmetic: cash that must be RESERVED = strike * 100 * contracts.
+    None when either input is unusable -- the caller must then REFUSE, never assume."""
+    k = _fnum(strike, None)
+    try:
+        q = int(contracts)
+    except (TypeError, ValueError):
+        return None
+    if k is None or k <= 0 or q < 1:
+        return None
+    return round(k * 100.0 * q, 2)
+
+
+def collateral_capacity(*, required: Optional[float], deployed: Optional[float],
+                        net_liq: Optional[float], available_funds: Optional[float],
+                        max_pct: float = CREDIT_MAX_COLLATERAL_PCT):
+    """Pure, FAIL-CLOSED capacity check for a cash-secured put. Returns SafetyResult.
+
+    Refuses unless ALL of the following are verifiably true:
+      * `required` (strike*100*qty) is a positive finite number;
+      * live net_liq / available_funds are usable (positive / non-negative finite);
+      * `deployed` -- collateral ALREADY reserved by open short puts and working sell-to-open
+        orders -- is known.  Unknown (None) REFUSES: an unverifiable book can never be treated
+        as empty (invariant 3 counts already-deployed collateral, not just this trade);
+      * required <= available_funds  (invariant 2: cash-secured, not naked);
+      * deployed + required <= max_pct * net_liq  (invariant 3: the 80% ruling).
+
+    A refusal is a CORRECT outcome, not an error."""
+    reasons: List[str] = []
+    req = _fnum(required, None)
+    nl = _fnum(net_liq, None)
+    af = _fnum(available_funds, None)
+    dep = _fnum(deployed, None) if deployed is not None else None
+    if req is None or req <= 0:
+        reasons.append(f"required collateral unavailable/non-positive ({required!r})")
+    if nl is None or nl <= 0:
+        reasons.append(f"net liquidation value unusable ({net_liq!r})")
+    if af is None or af < 0:
+        reasons.append(f"available funds unusable ({available_funds!r})")
+    if dep is None or dep < 0:
+        reasons.append("already-deployed collateral could not be verified "
+                       "(refusing: an unverifiable book is never treated as empty)")
+    if reasons:
+        return entry_safety.SafetyResult(False, tuple(reasons))
+    if req > af + _EPS:
+        reasons.append(f"insufficient cash to secure the put: need ${req:,.2f}, "
+                       f"available ${af:,.2f}")
+    cap = max(0.0, float(max_pct)) * nl
+    if dep + req > cap + _EPS:
+        reasons.append(f"collateral cap: deployed ${dep:,.2f} + this ${req:,.2f} = "
+                       f"${dep + req:,.2f} > {float(max_pct):.0%}-of-net-liq cap ${cap:,.2f}")
+    return entry_safety.SafetyResult(not reasons, tuple(reasons))
+
+
+def credit_executable_price(r) -> float:
+    """The SELL limit that crosses the final observed NBBO: we sell TO the bid.
+    (entry_safety.executable_price is the BUY mirror -- it crosses at the ask.)"""
+    return round(float(getattr(r, "entry_bid")), 2)
+
+
+def credit_material_changes(original, refreshed, *,
+                            max_price_change_pct: float = entry_safety.DEFAULT_MATERIAL_PRICE_PCT):
+    """entry_safety.material_changes for a SELL-to-open: the executable leg is the BID, and a
+    change in reserved collateral also invalidates the human's approval."""
+    changes = []
+    try:
+        if entry_safety.contract_fingerprint(original) != entry_safety.contract_fingerprint(refreshed):
+            changes.append("contract/structure changed")
+    except Exception as exc:
+        changes.append(f"contract identity could not be compared: {exc}")
+    try:
+        if int(getattr(original, "qty")) != int(getattr(refreshed, "qty")):
+            changes.append(f"quantity changed {getattr(original, 'qty')} -> {getattr(refreshed, 'qty')}")
+    except Exception as exc:
+        changes.append(f"quantity could not be compared: {exc}")
+    try:
+        o = _fnum(getattr(original, "collateral_usd", 0.0), None)
+        n = _fnum(getattr(refreshed, "collateral_usd", 0.0), None)
+        if not o or not n or o <= 0 or n <= 0:
+            raise ValueError("non-positive collateral")
+        if abs(n - o) > 0.01:
+            changes.append(f"reserved collateral changed ${o:,.2f} -> ${n:,.2f}")
+    except Exception as exc:
+        changes.append(f"collateral could not be compared: {exc}")
+    try:
+        old = credit_executable_price(original)
+        new = credit_executable_price(refreshed)
+        if old <= 0 or new <= 0:
+            raise ValueError("non-positive executable credit")
+        move = abs(new - old) / old
+        if move > max(0.0, float(max_price_change_pct)) + 1e-12:
+            changes.append(f"executable credit changed {move:.1%} (${old:.2f} -> ${new:.2f})")
+    except Exception as exc:
+        changes.append(f"executable credit could not be compared: {exc}")
+    return tuple(changes)
+
+
+def capital_at_risk(r) -> float:
+    """$ this order can lose -- the figure every existing $-ceiling should measure.
+    Debit: the net debit paid (limit*100*qty). Credit (CSP): collateral - credit received."""
+    if is_credit(r):
+        ml = _fnum(getattr(r, "credit_max_loss_usd", 0.0), 0.0) or 0.0
+        if ml > 0:
+            return round(ml, 2)
+        coll = _fnum(getattr(r, "collateral_usd", 0.0), 0.0) or 0.0
+        return round(max(0.0, coll - (_fnum(getattr(r, "net_credit_usd", 0.0), 0.0) or 0.0)), 2)
+    return round(float(r.limit) * 100 * int(r.qty), 2)
+
+
+def capital_committed(r) -> float:
+    """$ of the pot this order ties up -- what the risk gate / throttles should count.
+    Debit: the debit paid. Credit: the FULL reserved collateral (cash locked, not max loss)."""
+    if is_credit(r):
+        return round(_fnum(getattr(r, "collateral_usd", 0.0), 0.0) or 0.0, 2)
+    return round(float(r.limit) * 100 * int(r.qty), 2)
+
+
 @dataclass
 class Plan:
     idea: TradeIdea
@@ -101,6 +367,29 @@ class Plan:
 def plan_idea(idea: TradeIdea, *, net_liq: float, available_funds: float,
               positions: List[OpenPosition], baseline: float,
               approved_names: Set[str], limits: RiskLimits, regime=None) -> Plan:
+    # CREDIT (spec S2): the gate's `notional` is the capital the trade ties up. For a CSP that is
+    # the RESERVED COLLATERAL, not the (tiny) credit received -- so a short put is measured against
+    # exactly the same per-trade cap, buying-power check, concurrent cap, daily breaker, and
+    # single-name/sector concentration caps as a debit of the same size. Using the credit received
+    # would make every CSP look like a ~$100 trade and wave a $50,000 cash commitment straight
+    # through the solvency layer.
+    if is_credit(idea):
+        notional = _fnum(getattr(idea, "collateral_usd", 0.0), None)
+        if notional is None or notional <= 0:
+            # unusable collateral -> a notional the gate can only REJECT (never a free pass)
+            notional = float("inf")
+        # never let a short-premium entry be regime-SIZED-UP: is_long=False pins the regime
+        # multiplier at 1.0 regardless of the idea's stated direction.
+        trade = ProposedTrade(idea.underlying, notional, idea.is_index, idea.conviction,
+                              is_long=False,
+                              profit_target_pct=getattr(idea, "profit_target_pct", 0.0) or 0.0,
+                              stop_pct=getattr(idea, "stop_pct", 0.0) or 0.0)
+        gate = evaluate_trade(
+            trade, net_liq=net_liq, available_funds=available_funds,
+            open_positions=positions, pot_day_start=baseline,
+            approved_names=approved_names, limits=limits, regime_info=regime,
+        )
+        return Plan(idea, trade, gate, "needs_approval" if gate.approved else "gate_rejected")
     trade = ProposedTrade(idea.underlying, idea.est_debit_usd, idea.is_index, idea.conviction,
                           is_long=(getattr(idea, "direction", "bullish") == "bullish"),
                           profit_target_pct=getattr(idea, "profit_target_pct", 0.0) or 0.0,
@@ -153,9 +442,31 @@ class ResolvedOrder:
     decision_id: str = ""          # immutable proposal -> order -> fill -> close lineage
     decision_revision: int = 0
     model_identity: Optional[dict] = None
+    intended_hold_days: Optional[int] = None  # source-bound calendar underwriting window
+    # -- CREDIT LIMB (spec S2). ADDITIVE + defaulted, so every existing debit construction site
+    # (including the positional-arg ones in tests) is byte-identical. side == "credit" is the ONLY
+    # thing that can produce a SELL-to-open action in _submit_order_unlocked.
+    side: str = "debit"                 # "debit" | "credit"
+    collateral_usd: float = 0.0         # credit: strike * 100 * qty -- cash RESERVED
+    net_credit_usd: float = 0.0         # credit: total dollars received (limit * 100 * qty)
+    credit_max_loss_usd: float = 0.0    # credit: collateral_usd - net_credit_usd
+    # -- STRUCTURE (2026-07-26). ADDITIVE + defaulted, so every existing construction site --
+    # including the positional-arg ones in the tests and in place_trade.py -- is byte-identical.
+    # It carries the idea's structure string down to the money boundary so _submit_order_unlocked
+    # can re-check it there, the way the credit branch re-checks its right and leg count. "" means
+    # "no structure was declared" (place_trade.py builds an order with no TradeIdea behind it at
+    # all) and is NOT an allow-list failure; every route that HAS a structure is gated upstream.
+    structure: str = ""
 
 
 def order_summary(r: ResolvedOrder) -> str:
+    if is_credit(r):
+        # SELL wording is deliberate: the human must never see "BUY" on an order that sells.
+        return (f"SELL {r.qty}x {r.underlying} {r.expiry} {r.strike:g}P cash-secured put "
+                f"@ ~${r.limit:.2f} credit (marketable limit at the fresh NBBO bid)  "
+                f"(collateral ${capital_committed(r):,.0f}, credit "
+                f"${_fnum(r.net_credit_usd, 0.0) or 0.0:,.0f}, max loss "
+                f"${capital_at_risk(r):,.0f} if it goes to zero)")
     if r.short_contract is not None:
         width = abs(r.short_strike - r.strike)
         return (f"BUY {r.qty}x {r.underlying} {r.expiry} {r.strike:g}/{r.short_strike:g}{r.right} "
@@ -167,14 +478,19 @@ def order_summary(r: ResolvedOrder) -> str:
 
 def contract_snapshot(r: ResolvedOrder) -> dict:
     """JSON-safe exact terms approved/submitted for one decision revision."""
-    return {
+    snap = {
         "underlying": r.underlying, "right": r.right, "expiry": r.expiry,
         "long_con_id": getattr(r.contract, "conId", None), "long_strike": r.strike,
         "short_con_id": getattr(r.short_contract, "conId", None),
         "short_strike": (r.short_strike or None), "quantity": r.qty,
-        "limit": r.limit, "max_loss_usd": round(r.limit * 100 * r.qty, 2),
+        "limit": r.limit, "max_loss_usd": capital_at_risk(r),
         "quote_observed_at": r.quote_observed_at,
     }
+    if is_credit(r):
+        snap.update(side=CREDIT_SIDE, action="SELL", structure=CSP_STRUCTURE,
+                    collateral_usd=capital_committed(r),
+                    net_credit_usd=round(_fnum(r.net_credit_usd, 0.0) or 0.0, 2))
+    return snap
 
 
 def pick_spread_short(candidates, long_strike: float, long_mid: float, right: str,
@@ -296,6 +612,13 @@ class Trader:
         # feeds both regime-aware sizing (entries) and the position manager (exits)
         self._regime = None
         self._price_stats = {}
+        # CREDIT (spec S2, invariant 3): collateral reserved by CSPs submitted EARLIER IN THIS
+        # CYCLE. The live short-position read can lag a just-submitted sell-to-open, so this
+        # accrual is added to the live figure -- a second CSP in the same cycle can never be
+        # sized against a book that has forgotten the first. Double-counting a fill that HAS
+        # already appeared live only OVER-states deployment, which can only refuse. Reset each
+        # run_once.
+        self._cycle_credit_collateral = 0.0
 
     # After this many consecutive exit-cycle failures, stop opening NEW entries.
     _EXIT_FAIL_SUPPRESS_ENTRIES = 3
@@ -421,6 +744,113 @@ class Trader:
             audit(self.audit_path, "open_buy_fold_error", error=str(_oe))
         return out
 
+    async def _deployed_collateral(self) -> Optional[float]:
+        """Collateral ALREADY reserved against the account, in dollars. `None` == UNVERIFIABLE,
+        and every caller must then REFUSE (invariant 3 counts already-deployed collateral; an
+        unreadable book may never be treated as an empty one).
+
+        Sources, summed:
+          (1) LIVE SHORT OPTION POSITIONS off reqPositionsAsync(). IBConnection.get_positions()
+              deliberately filters to LONG options, so a short put is INVISIBLE there -- this
+              path reads the raw broker positions instead. Note the direction of the two
+              possible errors: over-counting refuses a trade (safe), under-counting sells an
+              unsecured put (catastrophic), so anything unparseable returns None.
+          (2) WORKING SELL-TO-OPEN ORDERS (ours, by orderRef) that have not filled yet -- their
+              collateral is committed the moment the order rests, not when it fills.
+          (3) same-cycle accrual (see __init__).
+
+        ASSIGNMENT (invariant 7) is handled by construction, not by a special case: an assigned
+        put stops being a short option position and becomes a STOCK position, so it drops out of
+        (1) automatically -- the cash is spent, the shares are owned, and the reservation is
+        correctly released. Nothing here crashes on, or needs to know about, the assignment."""
+        total = 0.0
+        try:
+            positions = await self.ib_conn.ib.reqPositionsAsync()
+            for pos in positions or []:
+                c = getattr(pos, "contract", None)
+                q = _fnum(getattr(pos, "position", 0), None)
+                if c is None or q is None or q >= 0:
+                    continue                      # long, flat, or unreadable qty -> not a short
+                sec_type = str(getattr(c, "secType", "") or "").upper()
+                if sec_type and sec_type not in ("OPT", "FOP"):
+                    continue                      # assigned STOCK: cash already spent, no reservation
+                right = str(getattr(c, "right", "") or "").upper()[:1]
+                if right == "C":
+                    # A short CALL must not exist in this account. It reserves no cash, so it is
+                    # not added here, but it is a violation of invariant 1 and is surfaced loudly.
+                    audit(self.audit_path, "short_call_position_detected",
+                          symbol=str(getattr(c, "symbol", "")), con_id=getattr(c, "conId", None),
+                          quantity=q, note="INVARIANT 1 VIOLATION: account holds a short call")
+                    continue
+                if right != "P":
+                    continue
+                k = _fnum(getattr(c, "strike", None), None)
+                if k is None or k <= 0:
+                    audit(self.audit_path, "deployed_collateral_unreadable",
+                          con_id=getattr(c, "conId", None), strike=getattr(c, "strike", None),
+                          note="short put with no usable strike -> refusing to value the book")
+                    return None
+                total += k * 100.0 * abs(q)
+        except Exception as e:
+            audit(self.audit_path, "deployed_collateral_error", stage="positions", error=str(e))
+            return None
+        try:
+            trades = await self.ib_conn.ib.reqAllOpenOrdersAsync()
+            terminal = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
+            for t in trades or []:
+                o = getattr(t, "order", None)
+                c = getattr(t, "contract", None)
+                st = getattr(getattr(t, "orderStatus", None), "status", None)
+                if o is None or c is None:
+                    continue
+                if str(getattr(o, "action", "") or "").upper() != "SELL" or st in terminal:
+                    continue
+                # only OUR entry orders reserve collateral; a resting SELL-to-CLOSE frees it.
+                if not str(getattr(o, "orderRef", "") or "").startswith("alfred-entry:"):
+                    continue
+                if str(getattr(c, "right", "") or "").upper()[:1] != "P":
+                    continue
+                k = _fnum(getattr(c, "strike", None), None)
+                qty = _fnum(getattr(o, "totalQuantity", 0), None)
+                if k is None or k <= 0 or qty is None or qty <= 0:
+                    audit(self.audit_path, "deployed_collateral_unreadable", stage="working_order",
+                          strike=getattr(c, "strike", None),
+                          qty=getattr(o, "totalQuantity", None))
+                    return None
+                total += k * 100.0 * abs(qty)
+        except Exception as e:
+            audit(self.audit_path, "deployed_collateral_error", stage="open_orders", error=str(e))
+            return None
+        return round(total + max(0.0, float(getattr(self, "_cycle_credit_collateral", 0.0) or 0.0)), 2)
+
+    async def _credit_capacity(self, r: ResolvedOrder, *, pot=None):
+        """INVARIANT 2 + 3, evaluated against LIVE broker state. Returns (SafetyResult, detail).
+
+        `pot` may be passed when the caller already holds a fresh snapshot; otherwise a new one
+        is read here -- which is what makes the submit-time call a genuine RE-verification rather
+        than a replay of the proposal-time numbers. Any failure to read live state becomes a
+        refusal, never an approval."""
+        detail = {"required": None, "deployed": None, "net_liq": None, "available_funds": None}
+        req = required_collateral(getattr(r, "strike", 0.0), getattr(r, "qty", 0))
+        detail["required"] = req
+        try:
+            snap = pot if pot is not None else await get_pot_snapshot(self.ib_conn.ib)
+        except Exception as e:
+            return entry_safety.SafetyResult(
+                False, (f"live account snapshot unavailable for collateral check: {e}",)), detail
+        acct = entry_safety.account_snapshot_valid(snap)
+        if not acct.allowed:
+            return entry_safety.SafetyResult(False, acct.reasons), detail
+        detail["net_liq"] = _fnum(getattr(snap, "net_liq", None), None)
+        detail["available_funds"] = _fnum(getattr(snap, "available_funds", None), None)
+        deployed = await self._deployed_collateral()
+        detail["deployed"] = deployed
+        result = collateral_capacity(
+            required=req, deployed=deployed,
+            net_liq=detail["net_liq"], available_funds=detail["available_funds"],
+            max_pct=CREDIT_MAX_COLLATERAL_PCT)
+        return result, detail
+
     async def _underlyings_with_close_in_flight(self) -> Set[str]:
         """Uppercased underlyings that currently have an IN-FLIGHT or RESTING close (SELL-to-close)
         working. Used by GUARDRAIL 2 to DEFER a NEW entry into a name whose exit is still settling,
@@ -530,6 +960,8 @@ class Trader:
         # model server, DEFER this tick's exit-management model call so we don't collide/queue
         # behind it. Static stops/targets still run; the model tuning is picked up next tick.
         defer_model = slate_lock.slate_active()
+        # CREDIT: same-cycle collateral accrual starts empty every cycle (see __init__).
+        self._cycle_credit_collateral = 0.0
         pot = await get_pot_snapshot(self.ib_conn.ib)
         today = _trading_day()   # US/Eastern trading day (P3.9): rolls between sessions, not mid-RTH
         baselines = self._load_baselines()
@@ -656,10 +1088,18 @@ class Trader:
         # deployed-premium (<=40% net-liq) and portfolio-decay (<=4%/day) caps need DTE,
         # which OpenPosition doesn't carry. One extra positions fetch, only when there are ideas.
         _open_book = []
+        _budget_items = {}
+        _budget_snapshot_error = None
+        self._same_cycle_budget_items = {}
         if ideas:
             try:
-                _open_book = construction.open_book(await self.ib_conn.get_positions(), self.journal_path)
+                _raw_budget_positions = await self.ib_conn.get_positions()
+                _working_orders = await self.ib_conn.ib.reqAllOpenOrdersAsync()
+                _budget_items = construction.open_book_items(
+                    _raw_budget_positions, self.journal_path, _working_orders)
+                _open_book = list(_budget_items.values())
             except Exception as e:
+                _budget_snapshot_error = str(e)
                 audit(self.audit_path, "open_book_error", error=str(e))
 
         _ddir = trade_capture.dataset_dir(self.journal_path)
@@ -724,6 +1164,37 @@ class Trader:
         _closing_names = await self._underlyings_with_close_in_flight() if ideas else set()
 
         for idea in ideas:
+            if _budget_snapshot_error is not None:
+                _cap_rej("budget_snapshot", "working BUY/deployment snapshot unavailable; entry blocked")
+                continue
+            # INVARIANT 1, enforcement point #1 (of three: here, _resolve_credit_order, and
+            # _submit_order_unlocked). A short structure that is not a cash-secured put is killed
+            # at the very top of the entry loop -- before the risk gate, before any contract is
+            # qualified, before any order object can exist.
+            _ok_credit, _why_credit = credit_structure_ok(idea)
+            if not _ok_credit:
+                audit(self.audit_path, "credit_structure_rejected", underlying=idea.underlying,
+                      structure=getattr(idea, "structure", None),
+                      side=getattr(idea, "side", None), reason=_why_credit)
+                _cap_rej("credit_structure", _why_credit)
+                approval.post_proposal(self.slack_token, self.slack_channel,
+                    f":no_entry: REFUSED *{idea.underlying}* — {_why_credit}")
+                continue
+            # DEBIT STRUCTURE GATE, enforcement point #1 (of three: here, _resolve_order, and
+            # _submit_order_unlocked). Runs at the same place, and on the same terms, as the credit
+            # check above: an idea whose structure is not on the allow-list -- or whose structure
+            # contradicts its direction -- is killed before the risk gate and before any contract
+            # is qualified. This catches every route that builds a TradeIdea, including the three
+            # that never touch the strategist's parser.
+            _ok_debit, _why_debit = debit_structure_ok(idea)
+            if not _ok_debit:
+                audit(self.audit_path, "debit_structure_rejected", underlying=idea.underlying,
+                      structure=getattr(idea, "structure", None),
+                      direction=getattr(idea, "direction", None), reason=_why_debit)
+                _cap_rej("debit_structure", _why_debit)
+                approval.post_proposal(self.slack_token, self.slack_channel,
+                    f":no_entry: REFUSED *{idea.underlying}* — {_why_debit}")
+                continue
             # GUARDRAIL 2: DEFER an entry whose underlying has an in-flight/resting close in progress.
             if idea.underlying.upper() in _closing_names:
                 audit(self.audit_path, "entry_deferred_close_in_flight", underlying=idea.underlying)
@@ -753,6 +1224,7 @@ class Trader:
                 _cap_rej("resolve_failed", "no usable contract (construction/chain)", gate=plan.gate)
                 continue
             resolved.conviction = getattr(idea, "conviction", -1.0)  # carry conviction into the journal
+            resolved.intended_hold_days = getattr(idea, "intended_hold_days", None)
             try:  # carry the entry thesis into the journal (non-blocking)
                 resolved.thesis = str(getattr(idea, "thesis", "") or "")
             except Exception as _te:
@@ -802,16 +1274,27 @@ class Trader:
                         f":no_entry: Skipped RELOAD *{idea.underlying}* {order_summary(resolved)} — "
                         f"anti-churn: {_rf_reason}")
                     continue
-            _max_prem = construction.max_premium_budget(pot.net_liq, self.construction)
-            if _max_prem > 0 and resolved.limit * 100 * resolved.qty > _max_prem + 1e-6:
-                _newq = int(_max_prem // (resolved.limit * 100))
-                if _newq >= 1:
-                    audit(self.audit_path, "premium_downsized", underlying=idea.underlying,
-                          from_qty=resolved.qty, to_qty=_newq, premium_cap=round(_max_prem))
-                    resolved.qty = _newq
+            _is_credit = is_credit(resolved)
+            if not _is_credit:
+                _max_prem = construction.max_premium_budget(pot.net_liq, self.construction)
+                if _max_prem > 0 and resolved.limit * 100 * resolved.qty > _max_prem + 1e-6:
+                    _newq = int(_max_prem // (resolved.limit * 100))
+                    if _newq >= 1:
+                        audit(self.audit_path, "premium_downsized", underlying=idea.underlying,
+                              from_qty=resolved.qty, to_qty=_newq, premium_cap=round(_max_prem))
+                        resolved.qty = _newq
+            # BUDGET GATES: check_budget measures LONG PREMIUM -- premium paid, total deployed
+            # premium, and theta DECAY (debit/DTE). A cash-secured put pays no premium and COLLECTS
+            # theta, so passing its collateral in would both double-count against the debit book's
+            # 40% cap and produce a nonsense decay figure that rejects every CSP outright. Credit
+            # therefore contributes 0 premium / 0 DTE here -- the open book is still evaluated
+            # unchanged -- and its capital is bound instead by the RISK GATE (per-trade cap,
+            # buying power, concurrent, breaker, single-name + sector caps, all measured on the
+            # FULL collateral in plan_idea) plus the 80%-of-net-liq collateral cap below.
+            _budget_cost = 0.0 if _is_credit else resolved.limit * 100 * resolved.qty
+            _budget_dte = 0 if _is_credit else resolved.dte
             ok_budget, budget_reasons = construction.check_budget(
-                resolved.limit * 100 * resolved.qty, resolved.dte, pot.net_liq,
-                _open_book, self.construction)
+                _budget_cost, _budget_dte, pot.net_liq, _open_book, self.construction)
             if not ok_budget:
                 audit(self.audit_path, "budget_rejected", underlying=idea.underlying,
                       order=order_summary(resolved), reasons=budget_reasons)
@@ -823,6 +1306,24 @@ class Trader:
                     f":no_entry: Skipped *{idea.underlying}* {order_summary(resolved)} — budget gate: "
                     + "; ".join(budget_reasons))
                 continue
+
+            # COLLATERAL RESERVATION (spec S2, invariants 2 + 3) -- PROPOSAL-TIME check. This is
+            # the FIRST of two: refusing here means an unaffordable put is never even offered to
+            # the human. It is NOT the binding one -- _submit_order_unlocked re-verifies against
+            # live account + short-position state immediately before placeOrder, because cash can
+            # be spent between approval and submit. A refusal is a correct outcome.
+            if _is_credit:
+                _cap_ok, _cap_detail = await self._credit_capacity(resolved, pot=pot)
+                audit(self.audit_path, "credit_collateral_check", stage="proposal",
+                      underlying=idea.underlying, allowed=_cap_ok.allowed,
+                      reasons=list(_cap_ok.reasons), **_cap_detail)
+                if not _cap_ok.allowed:
+                    _why_cap = "; ".join(_cap_ok.reasons)
+                    _cap_rej("credit_collateral", _why_cap, resolved=resolved, gate=plan.gate)
+                    approval.post_proposal(self.slack_token, self.slack_channel,
+                        f":no_entry: Skipped *{idea.underlying}* {order_summary(resolved)} — "
+                        f"collateral gate: {_why_cap}")
+                    continue
 
             # EARNINGS BLACKOUT (2026-07-03 gate A5): a DEBIT held THROUGH an earnings print is an
             # IV-crush loser by construction (IV collapses post-print; the long premium bleeds even
@@ -905,7 +1406,9 @@ class Trader:
             # or per-day ceiling BEFORE asking the human, so an over-cap idea is simply not offered.
             # resolved.qty/limit are final here (premium downsizing already applied). None => disabled.
             _throttle = None
-            _cost_throttle = resolved.limit * 100 * resolved.qty
+            # capital_committed == the debit paid, or (credit) the FULL reserved collateral -- so a
+            # CSP consumes the daily notional ceiling in proportion to the cash it locks up.
+            _cost_throttle = capital_committed(resolved)
             _od_today, _nd_today = _day_open_counts()
             if self.max_orders_per_cycle is not None and _orders_this_cycle >= self.max_orders_per_cycle:
                 _throttle = (f"per-cycle order cap reached "
@@ -930,7 +1433,8 @@ class Trader:
                 trade_capture.capture_decision(
                     _ddir, source="trader", symbol=idea.underlying,
                     right=resolved.right, strike=resolved.strike, expiry=resolved.expiry,
-                    structure=("spread" if resolved.short_contract is not None else "single"),
+                    structure=(CSP_STRUCTURE if is_credit(resolved) else
+                               ("spread" if resolved.short_contract is not None else "single")),
                     con_id=getattr(resolved.contract, "conId", None), chosen_idea=idea,
                     candidates=ideas, raw_strategist=_raw_strategist, cot=_cot,
                     gate=plan.gate, regime=self._regime, market_context=context,
@@ -974,7 +1478,9 @@ class Trader:
             # which structurally rejected every cheap defined-risk debit spread (e.g. ORCL
             # 162.5/160P @ $1.25 = $125 risk read as ~$32k). Measure the real max loss instead;
             # available_funds already bounds it to the pot. Skip BEFORE asking the human.
-            _est_gross = resolved.limit * 100 * resolved.qty  # max loss / net debit = capital at risk
+            # capital_at_risk == the net debit, or (credit) collateral - credit received. Same
+            # ceiling, same meaning: the most this order can lose.
+            _est_gross = capital_at_risk(resolved)
             if pot.net_liq > 0 and _est_gross > 0.95 * 30 * pot.net_liq:
                 audit(self.audit_path, "gross_rejected", underlying=idea.underlying,
                       order=order_summary(resolved), est_gross=round(_est_gross), cap=round(30 * pot.net_liq))
@@ -1022,11 +1528,18 @@ class Trader:
                     f":no_entry: Approved *{idea.underlying}* was NOT submitted — final hard gate: "
                     + "; ".join(_final_reasons or ("fresh order unavailable",)))
                 continue
-            _changes = entry_safety.material_changes(resolved, fresh)
+            # CREDIT: a SELL-to-open is re-priced off the BID (and its reserved collateral must
+            # not have moved), so it gets the mirror-image comparison. Debit path unchanged.
+            _changes = (credit_material_changes(resolved, fresh) if is_credit(resolved)
+                        else entry_safety.material_changes(resolved, fresh))
             if _changes:
                 _remsg = (f":repeat: *Reapproval required — {idea.underlying}*\n"
                            f"Refreshed order: `{order_summary(fresh)}`\n"
-                           f"Executable BUY limit: *${entry_safety.executable_price(fresh):.2f}*\n"
+                           + (f"Executable SELL credit: *${credit_executable_price(fresh):.2f}* "
+                              f"(collateral ${capital_committed(fresh):,.0f})\n"
+                              if is_credit(fresh) else
+                              f"Executable BUY limit: *${entry_safety.executable_price(fresh):.2f}*\n")
+                           +
                            f"Changed: {'; '.join(_changes)}\n"
                            f":point_down: Approve again within {_approval_ttl // 60 or 1} minutes.\n"
                            f"_Decision ID: `{resolved.decision_id}`, revision 1_")
@@ -1089,7 +1602,8 @@ class Trader:
                         trade_capture.capture_decision(
                             _ddir, source="trader", symbol=idea.underlying,
                             right=resolved.right, strike=resolved.strike, expiry=resolved.expiry,
-                            structure=("spread" if resolved.short_contract is not None else "single"),
+                            structure=(CSP_STRUCTURE if is_credit(resolved) else
+                               ("spread" if resolved.short_contract is not None else "single")),
                             con_id=getattr(resolved.contract, "conId", None),
                             chosen_idea=idea, candidates=ideas, raw_strategist=_raw_strategist, cot=_cot,
                             gate=plan.gate, regime=self._regime, market_context=context,
@@ -1113,16 +1627,34 @@ class Trader:
                         print(f"[WARN] capture_decision failed (continuing): {_dce}")
                     # GUARDRAIL 1: append to the FRESH entry book so later ideas THIS cycle see this
                     # fill (intra-cycle sequential gating preserved on the post-exit book).
-                    _resolved_cost = round(resolved.limit * 100 * resolved.qty, 2)
+                    _resolved_cost = capital_committed(resolved)
                     entry_positions.append(OpenPosition(idea.underlying, _resolved_cost, idea.is_index))
+                    if is_credit(resolved):
+                        # CREDIT: accrue the reserved collateral so a SECOND cash-secured put this
+                        # cycle is measured against a book that already contains this one (the live
+                        # short-position read can lag a just-submitted order). It is deliberately
+                        # NOT added to _budget_items: that book is the LONG-PREMIUM deployment /
+                        # theta-decay ledger, and a CSP's collateral is neither.
+                        self._cycle_credit_collateral = round(
+                            float(getattr(self, "_cycle_credit_collateral", 0.0) or 0.0)
+                            + _resolved_cost, 2)
+                        audit(self.audit_path, "credit_collateral_reserved",
+                              underlying=idea.underlying, decision_id=resolved.decision_id,
+                              collateral=_resolved_cost,
+                              cycle_total=self._cycle_credit_collateral)
+                    else:
+                        _budget_key = f"decision:{resolved.decision_id}"
+                        _budget_value = (_resolved_cost, int(resolved.dte or 0))
+                        _budget_items[_budget_key] = _budget_value
+                        self._same_cycle_budget_items[_budget_key] = _budget_value
+                        _open_book = list(_budget_items.values())
                     # ENTRY THROTTLE accrual (2026-07-03 gap-fix): count this submitted entry against
                     # the per-cycle counter and the persisted per-day opened order/notional aggregates
                     # so subsequent ideas (this cycle and later cycles today) see the updated ceiling.
                     _orders_this_cycle += 1
                     try:
                         if _sm is not None:
-                            _sm.state.update_daily_open_stats(
-                                today, 1, round(resolved.limit * 100 * resolved.qty, 2))
+                            _sm.state.update_daily_open_stats(today, 1, _resolved_cost)
                             _sm.save()
                     except Exception as _ue:
                         print(f"[WARN] entry daily-stats update failed (continuing): {_ue}")
@@ -1151,6 +1683,7 @@ class Trader:
             if not gate.approved:
                 reasons.extend(gate.reasons)
             raw_positions = await self.ib_conn.get_positions()
+            working_orders = await self.ib_conn.ib.reqAllOpenOrdersAsync()
             # Slow/error-prone earnings lookup happens before the final contract request so the
             # NBBO timestamp remains tight at the money boundary.
             days = await asyncio.to_thread(research.days_to_earnings, idea.underlying)
@@ -1164,15 +1697,41 @@ class Trader:
                 fresh.decision_revision = original.decision_revision
                 fresh.model_identity = original.model_identity
                 fresh.conviction = original.conviction
+                fresh.intended_hold_days = getattr(original, "intended_hold_days", None)
                 fresh.thesis = original.thesis
                 fresh.tp_pct = original.tp_pct
                 fresh.sl_pct = original.sl_pct
                 fresh.technical_card = getattr(original, "technical_card", None)
                 reasons.extend(entry_safety.nbbo_valid(fresh).reasons)
+                # STRUCTURE: a refreshed DEBIT order must still carry a permitted structure that
+                # agrees with its direction. A no-op for credit ideas (their gate is just below).
+                _ok_rstruct, _why_rstruct = debit_structure_ok(idea)
+                if not _ok_rstruct:
+                    reasons.append(_why_rstruct)
+                # INVARIANT 1: a refreshed order must still be the cash-secured put that was
+                # approved -- never a call, never a multi-leg short.
+                if is_credit(fresh):
+                    ok_fresh, why_fresh = credit_structure_ok(idea)
+                    if not ok_fresh:
+                        reasons.append(why_fresh)
+                    if str(fresh.right).upper()[:1] != "P" or fresh.short_contract is not None:
+                        reasons.append("NAKED-SHORT REFUSED: refreshed credit order is not a "
+                                       "single-leg cash-secured put")
+                    # INVARIANTS 2+3 re-verified post-approval, against this fresh account read.
+                    cap_ok, cap_detail = await self._credit_capacity(fresh, pot=pot)
+                    if not cap_ok.allowed:
+                        reasons.extend(cap_ok.reasons)
+                budget_items = construction.open_book_items(
+                    raw_positions, self.journal_path, working_orders)
+                budget_items.update(getattr(self, "_same_cycle_budget_items", {}) or {})
+                # see the check_budget note in run_once: a CSP contributes no long premium and no
+                # decay, so it is measured 0/0 here too (its capital is bound by the risk gate on
+                # full collateral + the 80% collateral cap above).
                 ok_budget, budget_reasons = construction.check_budget(
-                    entry_safety.executable_price(fresh) * 100 * fresh.qty,
-                    fresh.dte, pot.net_liq,
-                    construction.open_book(raw_positions, self.journal_path), self.construction)
+                    0.0 if is_credit(fresh)
+                    else entry_safety.executable_price(fresh) * 100 * fresh.qty,
+                    0 if is_credit(fresh) else fresh.dte, pot.net_liq,
+                    list(budget_items.values()), self.construction)
                 if not ok_budget:
                     reasons.extend(budget_reasons)
                 if days is not None:
@@ -1222,12 +1781,161 @@ class Trader:
             # dynamic tags read by the friction gate + Slack banner (dataclass has no slots).
             idea.is_reload = True
             idea.reload_conviction = conv
+            # BYPASS 2 CLOSED (2026-07-26): this constructs a TradeIdea directly, so the
+            # strategist's allow-list never saw it. The mapping above only ever emits
+            # "debit spread" or "long option" -- both permitted, and neither names an option
+            # right -- so NOTHING that is correct today changes. The gate is here so a later edit
+            # to that mapping, or a ticket field that starts reaching it, cannot reintroduce a
+            # mislabelled idea. A bad ticket is DROPPED and audited, never rewritten to a default.
+            _ok_reload, _why_reload = debit_structure_ok(idea)
+            if not _ok_reload:
+                audit(self.audit_path, "reload_structure_rejected", underlying=idea.underlying,
+                      structure=idea.structure, direction=idea.direction, reason=_why_reload)
+                continue
             ideas.append(idea)
         return ideas
+
+    async def _resolve_credit_order(self, idea: TradeIdea,
+                                    per_trade_cap: float) -> Optional[ResolvedOrder]:
+        """Resolve a CASH-SECURED PUT (spec S2). Returns a ResolvedOrder (nothing placed) or None.
+
+        Deliberately NOT a copy of the debit resolver: a CSP is defined by its STRIKE (the idea
+        supplies it), not by a delta search, so there is no strike hunting, no spread short-leg
+        selection, and no lottery-long check to get wrong. Refusal returns None -- a correct
+        outcome, audited, never an exception."""
+        from exitmgr.ibkr import Option, Stock, pick_chain, underlying_price
+        from exitmgr.market import usable_price
+        # INVARIANT 1, enforcement point #1 (there are three): a short that is not a cash-secured
+        # put never gets as far as qualifying a contract.
+        ok_struct, why_struct = credit_structure_ok(idea)
+        if not ok_struct:
+            audit(self.audit_path, "credit_structure_rejected",
+                  underlying=idea.underlying, structure=getattr(idea, "structure", None),
+                  side=getattr(idea, "side", None), reason=why_struct)
+            return None
+        ib = self.ib_conn.ib
+        cons = self.construction
+        strike = float(getattr(idea, "strike"))
+        stk = (await ib.qualifyContractsAsync(Stock(idea.underlying, "SMART", "USD")))[0]
+        params = await ib.reqSecDefOptParamsAsync(idea.underlying, "", "STK", stk.conId)
+        if not params:
+            return None
+        p = pick_chain(params, idea.underlying)
+        if p is None:
+            return None
+        # STRUCTURE-AWARE DTE FLOOR (spec S3): a CSP COLLECTS theta, so it gets its own 3-45 DTE
+        # write window instead of the 25-DTE long-premium floor. The bounds are NOT chosen here --
+        # pick_expiry_for_side is construction.py's sanctioned dispatcher and derives them from
+        # `side`, which is what makes it structurally impossible for a debit idea to be handed the
+        # credit floor (the debit branch of _resolve_order calls the same dispatcher with
+        # side="debit"). CREDIT_MIN/MAX_DTE_DEFAULT below are only for the refusal messages.
+        _bounds = construction.dte_bounds_for_side(CREDIT_SIDE, cons)
+        credit_min, credit_max = int(_bounds.min_dte), int(_bounds.max_dte or CREDIT_MAX_DTE_DEFAULT)
+        expiry, chosen_dte, dte_adjusted = construction.pick_expiry_for_side(
+            p.expirations, idea.target_dte, side=CREDIT_SIDE, cons=cons)
+        if expiry is None:
+            audit(self.audit_path, "construction_rejected", underlying=idea.underlying,
+                  reason=f"no expiry inside the {credit_min}-{credit_max} DTE credit window")
+            return None
+        if chosen_dte is not None and int(chosen_dte) > credit_max:
+            # the CEILING is a hard refusal, not an adjustment: a 200-DTE short put is a
+            # different (much larger, much longer-dated) risk than the one that was underwritten.
+            audit(self.audit_path, "construction_rejected", underlying=idea.underlying,
+                  reason=f"nearest credit expiry {chosen_dte} DTE exceeds the "
+                         f"{credit_max}-DTE credit ceiling")
+            return None
+        if dte_adjusted:
+            audit(self.audit_path, "dte_adjusted", underlying=idea.underlying, side=CREDIT_SIDE,
+                  requested_dte=idea.target_dte, adjusted_dte=chosen_dte, min_dte=credit_min)
+        spot = await underlying_price(ib, stk)
+        # Qualify the option AT THE IDEA'S STRIKE -- exactly one contract, no substitution.
+        qualified = await ib.qualifyContractsAsync(
+            Option(idea.underlying, expiry, strike, "P", "SMART"))
+        contract = next((c for c in (qualified or []) if getattr(c, "conId", None)), None)
+        if contract is None:
+            audit(self.audit_path, "construction_rejected", underlying=idea.underlying,
+                  reason=f"could not qualify {idea.underlying} {expiry} {strike:g}P")
+            return None
+        if abs(float(getattr(contract, "strike", 0.0) or 0.0) - strike) > 1e-6 \
+                or str(getattr(contract, "right", "") or "").upper()[:1] != "P":
+            # a substituted contract is a different trade than the one underwritten -> refuse.
+            audit(self.audit_path, "construction_rejected", underlying=idea.underlying,
+                  reason="qualified contract does not match the requested put strike")
+            return None
+        tickers = await ib.reqTickersAsync(contract)
+        tk = next(iter(tickers or []), None)
+        if tk is None:
+            return None
+        bid = _fnum(getattr(tk, "bid", None), None)
+        ask = _fnum(getattr(tk, "ask", None), None)
+        if not (usable_price(bid) and usable_price(ask)):
+            # No two-sided quote -> no executable credit. Refuse rather than sell into the dark.
+            audit(self.audit_path, "construction_rejected", underlying=idea.underlying,
+                  reason="no two-sided NBBO on the put -- cannot price a sell-to-open")
+            return None
+        # We SELL, so the executable price is the BID; sizing/credit are computed off it and the
+        # final NBBO gate re-checks it immediately before placeOrder.
+        credit_per_share = round(float(bid), 2)
+        if credit_per_share <= 0:
+            return None
+        # SIZE TO THE RISK GATE'S $ CAP using the SAME pure helper the debit path uses -- the unit
+        # cost of a CSP is its collateral (strike*100), so one contract over the per-trade cap is
+        # HARD-REJECTED rather than clamped, exactly as for a debit.
+        qty = size_within_cap(strike * 100.0,
+                              _fnum(getattr(idea, "collateral_usd", 0.0), 0.0) or 0.0,
+                              per_trade_cap)
+        if qty is None:
+            audit(self.audit_path, "construction_rejected", underlying=idea.underlying,
+                  reason=f"one cash-secured put (collateral ${strike*100:,.0f}) exceeds the "
+                         f"per-trade cap ${per_trade_cap:,.0f}")
+            return None
+        collateral = required_collateral(strike, qty)
+        if collateral is None:
+            return None
+        net_credit = round(credit_per_share * 100.0 * qty, 2)
+        max_loss = round(collateral - net_credit, 2)
+        if max_loss <= 0:
+            return None
+        g = getattr(tk, "modelGreeks", None) or getattr(tk, "lastGreeks", None)
+
+        def _f(x):
+            v = _fnum(x, 0.0)
+            return v if v is not None else 0.0
+        _d, _th = _f(getattr(g, "delta", None)) if g else 0.0, _f(getattr(g, "theta", None)) if g else 0.0
+        _ga, _ve = _f(getattr(g, "gamma", None)) if g else 0.0, _f(getattr(g, "vega", None)) if g else 0.0
+        _iv = _f(getattr(g, "impliedVol", None)) if g else 0.0
+        _mid = (float(bid) + float(ask)) / 2
+        return ResolvedOrder(
+            idea.underlying, "P", expiry, strike, qty, credit_per_share, contract,
+            spot=float(spot or 0.0), entry_delta=abs(_d), entry_iv=_iv,
+            dte=int(chosen_dte or 0), dte_adjusted=bool(dte_adjusted),
+            quote_observed_at=time.monotonic(),
+            entry_gamma=_ga, entry_theta=_th, entry_vega=_ve,
+            entry_bid=float(bid), entry_ask=float(ask),
+            entry_spread_pct=(round((float(ask) - float(bid)) / _mid * 100, 2) if _mid > 0 else 0.0),
+            # short put: net greeks are the NEGATIVE of the leg's (we are short it)
+            net_delta=-abs(_d), net_theta=-_th, net_gamma=-_ga, net_vega=-_ve,
+            side=CREDIT_SIDE, collateral_usd=collateral, net_credit_usd=net_credit,
+            credit_max_loss_usd=max_loss)
 
     async def _resolve_order(self, idea: TradeIdea, per_trade_cap: float) -> Optional[ResolvedOrder]:
         """Select the concrete option contract from target DTE/delta and size it. Returns a
         ResolvedOrder (no order placed yet) or None if nothing usable. Validate on first live run."""
+        # CREDIT (spec S2): one dispatch point, so the credit branch is reached through the SAME
+        # method the proposal path AND the post-approval refresh path both call. There is no
+        # second pipeline.
+        if is_credit(idea):
+            return await self._resolve_credit_order(idea, per_trade_cap)
+        # DEBIT STRUCTURE GATE, enforcement point #2 -- the mirror of the credit_structure_ok()
+        # call at the top of _resolve_credit_order. Every debit order in this process is built
+        # here, so an idea that reached construction by some route the entry loop does not run
+        # (a future caller, a direct unit invocation) still cannot produce a contract.
+        _ok_struct, _why_struct = debit_structure_ok(idea)
+        if not _ok_struct:
+            audit(self.audit_path, "debit_structure_rejected", underlying=idea.underlying,
+                  structure=getattr(idea, "structure", None),
+                  direction=getattr(idea, "direction", None), reason=_why_struct)
+            return None
         from exitmgr.ibkr import Option, Stock, pick_chain, strikes_near, underlying_price
         from exitmgr.market import usable_price
         ib = self.ib_conn.ib
@@ -1244,8 +1952,12 @@ class Trader:
         # theta. Nearest expiry to target among those >= min_dte; a too-short model target is
         # ADJUSTED into the 25-45 band (annotated on the journal), rejected only if no valid
         # expiry exists at all.
-        expiry, chosen_dte, dte_adjusted = construction.pick_expiry(
-            p.expirations, idea.target_dte, cons.min_dte, cons.prefer_dte_max)
+        # SANCTIONED ENTRY POINT (spec S3): the DEBIT side dispatches through the same function the
+        # credit side does, with side="debit" -- which resolves to (cons.min_dte, prefer_dte_max,
+        # NO hard ceiling), i.e. byte-identical to the previous explicit call. Routing both sides
+        # through one dispatcher is what guarantees the credit floor is unreachable from here.
+        expiry, chosen_dte, dte_adjusted = construction.pick_expiry_for_side(
+            p.expirations, idea.target_dte, side="debit", cons=cons)
         if expiry is None:
             audit(self.audit_path, "construction_rejected", underlying=idea.underlying,
                   reason=f"no expiry >= {cons.min_dte} DTE available")
@@ -1375,6 +2087,7 @@ class Trader:
             return ResolvedOrder(idea.underlying, right, expiry, float(contract.strike),
                                  qty, net, contract,
                                  short_strike=short_strike, short_contract=short_contract,
+                                 structure=str(getattr(idea, "structure", "") or ""),
                                  **enrich)
 
         # size to the per-trade cap (never exceed the gate's $ cap); HARD-REJECT if even one
@@ -1385,7 +2098,8 @@ class Trader:
                   reason=f"one contract (${mid*100:,.0f}) exceeds per-trade cap ${per_trade_cap:,.0f}")
             return None
         return ResolvedOrder(idea.underlying, right, expiry, float(contract.strike),
-                             qty, round(mid, 2), contract, **enrich)
+                             qty, round(mid, 2), contract,
+                             structure=str(getattr(idea, "structure", "") or ""), **enrich)
 
     async def _submit_order(self, r: ResolvedOrder):
         """Serialize BUY placement against the fast protective-exit mutation loop."""
@@ -1407,6 +2121,68 @@ class Trader:
         quote_gate = entry_safety.nbbo_valid(r)
         if not quote_gate.allowed:
             raise RuntimeError("fresh NBBO blocks submit: " + "; ".join(quote_gate.reasons))
+        # ---------------------------------------------------------------- CREDIT: SELL PUT to open
+        # This is the ONLY place in the system that can emit a sell-to-OPEN, and it is guarded by
+        # invariants 1 and 2 re-checked here, at the money boundary, against LIVE broker state --
+        # not replayed from the proposal. Everything above this block (halt markers, fresh NBBO)
+        # has already run for this order exactly as it does for a debit.
+        if is_credit(r):
+            # INVARIANT 1, enforcement point #3: the contract about to be sold must be a single
+            # PUT. A call, a spread leg, or a malformed order raises rather than trading.
+            if str(r.right).upper()[:1] != "P":
+                raise RuntimeError(
+                    f"NAKED-SHORT REFUSED at submit: cannot sell a {r.right!r} to open -- only a "
+                    f"cash-secured put may ever be sold")
+            if r.short_contract is not None or (r.short_strike or 0):
+                raise RuntimeError(
+                    "NAKED-SHORT REFUSED at submit: a credit order must be a single-leg "
+                    "cash-secured put, not a multi-leg short structure")
+            if int(r.qty) < 1:
+                raise RuntimeError("credit order has no positive quantity")
+            # INVARIANT 2, enforced HERE (submit time) against a fresh account read + a fresh
+            # short-position/working-order read. A proposal-time pass is NOT sufficient: cash can
+            # be spent by an exit, an assignment, or another entry between approval and submit.
+            capacity, detail = await self._credit_capacity(r)
+            audit(self.audit_path, "credit_collateral_check", stage="submit",
+                  underlying=r.underlying, decision_id=getattr(r, "decision_id", None),
+                  allowed=capacity.allowed, reasons=list(capacity.reasons), **detail)
+            if not capacity.allowed:
+                raise RuntimeError("collateral gate blocks submit: " + "; ".join(capacity.reasons))
+            if abs(float(detail["required"] or 0.0) - capital_committed(r)) > 0.01:
+                raise RuntimeError(
+                    f"collateral mismatch: recomputed ${detail['required']:,.2f} != approved "
+                    f"${capital_committed(r):,.2f}")
+            _lmt_credit = credit_executable_price(r)   # we SELL, so we cross at the bid
+            if not (_lmt_credit > 0):
+                raise RuntimeError("credit order has no positive executable credit")
+            order = Order(action="SELL", orderType="LMT", lmtPrice=_lmt_credit,
+                          totalQuantity=r.qty, tif="DAY")
+            order.orderRef = entry_safety.decision_order_ref(r.decision_id)
+            from exitmgr.order_lock import order_mutation_lock
+            with order_mutation_lock():
+                trade = self.ib_conn.ib.placeOrder(r.contract, order)
+            return await self._await_and_journal(trade, r)
+        # -------------------------------------------------------------- DEBIT: BUY to open
+        # DEBIT STRUCTURE GATE, enforcement point #3 -- the debit mirror of the invariant-1
+        # re-check the credit branch performs immediately above, at the money boundary. Every
+        # route that builds a TradeIdea is gated upstream; this stands here so that a route
+        # invented LATER is still caught, with no order emitted and nothing journalled. It
+        # raises rather than returning, because a submit that must not happen is not a
+        # "no trade today" -- it is a bug that must be visible.
+        if r.structure:
+            try:
+                _require_allowed_structure("debit", r.structure)
+            except ValueError as _struct_exc:
+                raise RuntimeError(
+                    "STRUCTURE REFUSED at submit: %s (permitted: %s)"
+                    % (_struct_exc, ", ".join(sorted(DEBIT_STRUCTURES))))
+            _implied_right = _structure_implied_right(r.structure)
+            if _implied_right and _implied_right != str(r.right).upper()[:1]:
+                raise RuntimeError(
+                    "STRUCTURE REFUSED at submit: this order buys a %r but its structure %r names "
+                    "a %s -- filling it would journal the position under a name describing a "
+                    "different trade" % (r.right, r.structure,
+                                         "call" if _implied_right == "C" else "put"))
         # Submission is bound to the final, two-sided reqTickersAsync observation.  Using a stale
         # mid + percentage buffer can still rest below a wide ask; crossing at the observed ask is
         # both executable and capped.  Callers must run nbbo_valid immediately beforehand.
@@ -1425,6 +2201,11 @@ class Trader:
             from exitmgr.order_lock import order_mutation_lock
             with order_mutation_lock():
                 trade = self.ib_conn.ib.placeOrder(r.contract, order)
+        return await self._await_and_journal(trade, r)
+
+    async def _await_and_journal(self, trade, r: ResolvedOrder):
+        """Wait for a decisive IBKR status, then journal unless the order was rejected. Shared
+        verbatim by the debit and credit branches -- there is ONE fill/journal path, not two."""
         live = {"Filled", "Submitted", "PreSubmitted"}
         dead = {"Cancelled", "ApiCancelled", "Inactive"}
         for _ in range(24):  # up to ~12s for IBKR to ACK or REJECT
@@ -1488,6 +2269,7 @@ class Trader:
             "profit_target_pct": (getattr(r, "tp_pct", 0.0) or None),  # clamped 25-35 band
             "stop_pct": (getattr(r, "sl_pct", 0.0) or None),           # clamped, default 30
             "conviction": getattr(r, "conviction", -1.0),
+            "intended_hold_days": getattr(r, "intended_hold_days", None),
             "thesis": getattr(r, "thesis", ""),
             "decision_id": getattr(r, "decision_id", None),
             "decision_revision": getattr(r, "decision_revision", 0),
@@ -1517,6 +2299,24 @@ class Trader:
             "net_gamma": (getattr(r, "net_gamma", 0.0) or None),
             "net_vega": (getattr(r, "net_vega", 0.0) or None),
         }
+        if is_credit(r):
+            # CREDIT LIMB (spec S2): the exit manager must be able to tell a SHORT put apart from
+            # a long one -- the position is negative, the "debit" is not a cost, and assignment
+            # (invariant 7) is a normal terminal state rather than a failure. `debit` deliberately
+            # carries MAX LOSS (collateral - credit): every legacy consumer reads `debit` as the
+            # capital at risk, so the conservative figure is the correct one to publish there.
+            rec.update({
+                "side": CREDIT_SIDE,
+                "structure": CSP_STRUCTURE,
+                "action": "SELL",
+                "quantity": -abs(int(r.qty)),          # SHORT: negative, as the broker reports it
+                "contracts": abs(int(r.qty)),
+                "collateral_usd": capital_committed(r),
+                "net_credit_usd": round(_fnum(r.net_credit_usd, 0.0) or 0.0, 2),
+                "max_loss_usd": capital_at_risk(r),
+                "debit": capital_at_risk(r),
+                "assignment_possible": True,           # accepted outcome, never an error
+            })
         if fill:
             rec.update(fill)
         if r.short_contract is not None:

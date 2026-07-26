@@ -290,7 +290,7 @@ def position_blurb(it):
 # thesis verdict: eroded/holds + reason + action) -- NO second LLM call. One
 # row per reviewed position, keyed by con_id (reliable join) + symbol + date.
 #
-# NOTE (needs Trevor's eyes): morning_review runs on OPEN positions, so the
+# NOTE (needs the operator's eyes): morning_review runs on OPEN positions, so the
 # real close date is unknown here. We stamp `date` = review date (today, ET).
 # load_review's con_id path ignores date, so the join is robust; its symbol
 # path only matches when the caller's date equals this review date. con_id is

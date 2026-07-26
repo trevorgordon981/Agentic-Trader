@@ -33,7 +33,7 @@ class RiskLimits:
                                            # pot per single trade, soft/regime-scalable)
     max_trade_pct_hard: float = 0.25       # ABSOLUTE ceiling: no single trade may EVER exceed this
                                            # % of NetLiq -- binds on every path incl. confident +
-                                           # regime size-up (Trevor 2026-06-22 risk-gate hardening)
+                                           # regime size-up (the operator 2026-06-22 risk-gate hardening)
     max_concurrent: int = 4                # dataclass default; LIVE config sets 8 open positions
     daily_halt_pct: float = 0.08           # dataclass default; LIVE config sets 0.20 -- halt NEW
                                            # entries when the pot is down >=20% on the day
@@ -47,7 +47,7 @@ class RiskLimits:
                                            # soft-sized correlated names coexist but blocks a third
                                            # concentrating the same macro bet. Tune in config.yaml.
     sector_map: Dict[str, str] = field(default_factory=dict)  # UPPERCASE symbol -> sector/cluster
-                                           # id. STATIC, Trevor-editable map from config.yaml -- the
+                                           # id. STATIC, the operator-editable map from config.yaml -- the
                                            # pragmatic no-network source (a live correlation/beta feed
                                            # is a future upgrade). Unmapped symbols key to their own
                                            # name => no clustering (behaves like today). EMPTY map =>
@@ -61,7 +61,7 @@ class RiskLimits:
     allow_any_name: bool = False           # model may propose names beyond approved_names
                                            # (all other caps + per-entry approval still bind)
     confident_full_size: bool = False      # if a high-conviction idea may use the WHOLE pot,
-                                           # bypassing the % size caps (Trevor's call 2026-06-12)
+                                           # bypassing the % size caps (the operator's call 2026-06-12)
     cap_bypass_min_conviction: int = 6     # conviction >= this may EXCEED the soft base cap (25% live) toward the
                                            # hard ceiling). Raised 2026-06-22 from 4 -> 6: low-conviction
                                            # ideas (3-5) can NOT exceed the base cap. Still bounded by
@@ -322,7 +322,7 @@ def evaluate_trade(
     # 6b. aggregate SECTOR / correlated-cluster exposure cap (max_sector_agg_pct, default 25% of
     #     pot). Mirrors the single-name-agg cap (#6) exactly, but groups CORRELATED names into one
     #     macro bet (e.g. NVDA + AMD + MU sail through #6 as three names while being one semis bet).
-    #     The grouping comes from a STATIC, Trevor-editable sector_map (symbol -> cluster) in
+    #     The grouping comes from a STATIC, the operator-editable sector_map (symbol -> cluster) in
     #     config.yaml -- the pragmatic no-network source; a live correlation/beta feed is a future
     #     upgrade. Unmapped symbols key to their own name (no clustering => same as today), and an
     #     EMPTY sector_map (or a non-positive cap) makes this whole check a no-op so old configs are

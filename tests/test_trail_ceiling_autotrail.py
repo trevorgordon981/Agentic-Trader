@@ -4,9 +4,18 @@ Part 1 -- a MODEL-armed trail must keep the fixed pot-tier take-profit CEILING s
 SUBSEQUENT cycles (incl. plain 'hold'), so the ceiling can't snap back and force-close (clip) the
 runner the trail was meant to let RUN. The armed state is PERSISTED per position.
 
-Part 2 -- a winner whose PEAK gain clears auto_trail.activation_gain_pct auto-arms a WIDE trailing
-stop EVEN IF the model never says arm_trail and EVEN IF the global rules.trailing toggle is off, so
-gains are locked automatically. It never suppresses the ceiling and NEVER touches the stop.
+Part 2 -- a winner whose post-arm peak gain clears auto_trail.activation_gain_pct gets a WIDE
+trailing stop EVEN IF the model never says arm_trail and EVEN IF the global rules.trailing toggle is
+off, so gains are locked automatically. It never suppresses the ceiling and NEVER touches the stop.
+
+2026-07-26 (Sol audit R5 R1) -- TWO THINGS MOVED UNDERNEATH THIS FILE:
+  * `state.trail_armed` was the MODEL-CONFIGURED flag misnamed as an armed bit. It is now
+    `state.trail_configured`; it still drives the ceiling suppression (Part 1) and still arms
+    nothing. `_reconcile_ceiling_backstop(..., armed=)` remains as the alias for `configured=`.
+  * auto-trail (Part 2) may no longer arm off the monotonic LIFETIME peak -- that was a second,
+    unconfirmed arming path. It is a no-op until the position is confirmed-armed (two consecutive
+    qualifying CLOSES) and measures its activation from `peak_since_arm`. These tests therefore
+    pass the confirmed state explicitly; the contract itself lives in tests/test_confirmed_trail.py.
 """
 import os
 from dataclasses import replace
@@ -36,26 +45,26 @@ ED, QTY = 500.0, 1
 
 # ----------------------------- PART 1 -----------------------------
 class TestCeilingSuppressionPersists:
-    def test_arm_trail_persists_armed_flag(self, tmp_path):
+    def test_arm_trail_persists_configured_flag(self, tmp_path):
         m = _mgr(tmp_path)
         _, forced = m._apply_decision(m.config.rules, {"action": "arm_trail"},
                                       7.0, ED, QTY, 111, "X")
         assert forced is None
-        assert m.state_manager.state.trail_armed.get("111") is True
+        assert m.state_manager.state.trail_configured.get("111") is True
 
-    def test_armed_flag_survives_save_load(self, tmp_path):
+    def test_configured_flag_survives_save_load(self, tmp_path):
         m = _mgr(tmp_path)
         m._apply_decision(m.config.rules, {"action": "arm_trail"}, 7.0, ED, QTY, 111, "X")
         m.state_manager.save()
         reloaded = StateManager(m.config.state.path)
-        assert reloaded.state.trail_armed.get("111") is True
+        assert reloaded.state.trail_configured.get("111") is True
 
     def test_ceiling_stays_suppressed_on_subsequent_hold_when_armed(self, tmp_path):
         m = _mgr(tmp_path)
         # cycle N: model arms a trail (persists the flag)
         m._apply_decision(m.config.rules, {"action": "arm_trail"}, 7.0, ED, QTY, 111, "X")
         # cycle N+1: model returns plain 'hold' -- ceiling must STILL be suppressed via persisted flag
-        armed = "111" in m.state_manager.state.trail_armed
+        armed = "111" in m.state_manager.state.trail_configured
         out = m._reconcile_ceiling_backstop(m.config.rules, {"action": "hold"}, armed=armed)
         assert out.profit_target_pct is None  # suppressed across the hold cycle (the bug fix)
 
@@ -64,7 +73,7 @@ class TestCeilingSuppressionPersists:
         30% profit_target ceiling; the (armed) trailing stop governs instead."""
         m = _mgr(tmp_path)
         m._apply_decision(m.config.rules, {"action": "arm_trail"}, 7.0, ED, QTY, 111, "X")
-        armed = "111" in m.state_manager.state.trail_armed
+        armed = "111" in m.state_manager.state.trail_configured
         rules = m._reconcile_ceiling_backstop(m.config.rules, {"action": "hold"}, armed=armed)
         # price 7.00 (+40%) sits ABOVE the +30% ceiling but the trail is nowhere near giving back:
         trig = evaluate_position(con_id=111, symbol="X", quantity=QTY, entry_debit=ED,
@@ -73,7 +82,7 @@ class TestCeilingSuppressionPersists:
 
     def test_ceiling_fires_when_no_trail_armed(self, tmp_path):
         m = _mgr(tmp_path)
-        armed = "222" in m.state_manager.state.trail_armed  # never armed -> False
+        armed = "222" in m.state_manager.state.trail_configured  # never configured -> False
         out = m._reconcile_ceiling_backstop(m.config.rules, {"action": "hold"}, armed=armed)
         assert out.profit_target_pct == 30.0  # backstop intact
         # and a +40% winner is force-closed at the profit_target ceiling
@@ -81,11 +90,11 @@ class TestCeilingSuppressionPersists:
                                  current_price=7.0, days_to_expiry=20, peak_price=7.0, rules=out)
         assert trig is not None and trig.trigger_type == "profit_target"
 
-    def test_prune_clears_armed_flag_on_close(self, tmp_path):
+    def test_prune_clears_configured_flag_on_close(self, tmp_path):
         m = _mgr(tmp_path)
         m._apply_decision(m.config.rules, {"action": "arm_trail"}, 7.0, ED, QTY, 111, "X")
         m.state_manager.state.prune_tracking(active_con_ids=[999])  # 111 no longer active
-        assert "111" not in m.state_manager.state.trail_armed
+        assert "111" not in m.state_manager.state.trail_configured
 
     def test_stop_never_altered_by_ceiling_suppression(self, tmp_path):
         m = _mgr(tmp_path)
@@ -107,7 +116,8 @@ class TestAutoTrailSafetyFloor:
         # global trail OFF -- auto-trail must still guarantee protection
         base = replace(m.config.rules, trailing=TrailingConfig(enabled=False))
         out, armed = m._apply_auto_trail(base, self.AUTO, peak_price=7.0,  # +40% peak
-                                         entry_debit=ED, quantity=QTY)
+                                         entry_debit=ED, quantity=QTY,
+                                         armed=True, peak_since_arm=7.0)
         assert armed is True
         assert out.trailing.enabled is True
         assert out.trailing.giveback_fraction == 0.5  # wide floor from auto_trail
@@ -116,7 +126,8 @@ class TestAutoTrailSafetyFloor:
         m = _mgr(tmp_path)
         base = replace(m.config.rules, trailing=TrailingConfig(enabled=False))
         out, armed = m._apply_auto_trail(base, self.AUTO, peak_price=6.0,  # +20% peak < +25%
-                                         entry_debit=ED, quantity=QTY)
+                                         entry_debit=ED, quantity=QTY,
+                                         armed=True, peak_since_arm=6.0)
         assert armed is False
         assert out is base  # untouched
 
@@ -124,7 +135,8 @@ class TestAutoTrailSafetyFloor:
         m = _mgr(tmp_path)
         off = AutoTrailConfig(enabled=False)
         base = replace(m.config.rules, trailing=TrailingConfig(enabled=False))
-        out, armed = m._apply_auto_trail(base, off, peak_price=9.0, entry_debit=ED, quantity=QTY)
+        out, armed = m._apply_auto_trail(base, off, peak_price=9.0, entry_debit=ED, quantity=QTY,
+                                         armed=True, peak_since_arm=9.0)
         assert armed is False
         assert out is base
 
@@ -135,7 +147,8 @@ class TestAutoTrailSafetyFloor:
                        trailing=TrailingConfig(enabled=True, activation_gain_pct=20.0,
                                                giveback_fraction=0.6))
         out, armed = m._apply_auto_trail(base, self.AUTO, peak_price=7.0,
-                                         entry_debit=ED, quantity=QTY)
+                                         entry_debit=ED, quantity=QTY,
+                                         armed=True, peak_since_arm=7.0)
         assert armed is True
         assert out.trailing.giveback_fraction == 0.6  # kept the roomier giveback
         assert out.trailing.activation_gain_pct == 20.0  # never raised the activation
@@ -143,23 +156,26 @@ class TestAutoTrailSafetyFloor:
     def test_auto_trail_locks_a_gain_above_cost_basis(self, tmp_path):
         m = _mgr(tmp_path)
         base = replace(m.config.rules, trailing=TrailingConfig(enabled=False))
-        out, _ = m._apply_auto_trail(base, self.AUTO, peak_price=7.0, entry_debit=ED, quantity=QTY)
+        out, _ = m._apply_auto_trail(base, self.AUTO, peak_price=7.0, entry_debit=ED, quantity=QTY,
+                                     armed=True, peak_since_arm=7.0)
         # peak 7.00 (+40%), giveback 0.5 -> protected floor = 7 - 0.5*(7-5) = 6.00 (+20% locked)
         trig = evaluate_position(con_id=1, symbol="X", quantity=QTY, entry_debit=ED,
-                                 current_price=5.90, days_to_expiry=20, peak_price=7.0, rules=out)
+                                 current_price=5.90, days_to_expiry=20, peak_price=7.0, rules=out,
+                                 trail_armed=True, peak_since_arm=7.0)
         assert trig is not None and trig.trigger_type == "trailing_stop"
         assert trig.pnl_pct > 0  # exits protecting a gain, NOT a round-trip to breakeven
 
     def test_trail_ratchets_up_with_peak(self, tmp_path):
         m = _mgr(tmp_path)
         base = replace(m.config.rules, trailing=TrailingConfig(enabled=False))
-        out, _ = m._apply_auto_trail(base, self.AUTO, peak_price=9.0, entry_debit=ED, quantity=QTY)
+        out, _ = m._apply_auto_trail(base, self.AUTO, peak_price=9.0, entry_debit=ED, quantity=QTY,
+                                     armed=True, peak_since_arm=9.0)
         # higher peak 9.00 -> floor = 9 - 0.5*(9-5) = 7.00 (+40% locked), strictly above the +20%
         # floor of the lower-peak case -> the protected floor only ratchets UP
-        low = evaluate_trailing_stop(6.99, ED, QTY, peak_price=7.0,
-                                     activation_gain_pct=25.0, giveback_fraction=0.5)
-        high = evaluate_trailing_stop(6.99, ED, QTY, peak_price=9.0,
-                                      activation_gain_pct=25.0, giveback_fraction=0.5)
+        low = evaluate_trailing_stop(6.99, ED, QTY, peak_since_arm=7.0,
+                                     activation_gain_pct=25.0, giveback_fraction=0.5, armed=True)
+        high = evaluate_trailing_stop(6.99, ED, QTY, peak_since_arm=9.0,
+                                      activation_gain_pct=25.0, giveback_fraction=0.5, armed=True)
         # at price 6.99: below the 7.00 floor of the higher peak (fires) but above 6.00 (does not)
         assert low is None and high is not None
 
@@ -181,6 +197,7 @@ class TestAutoTrailSafetyFloor:
         the model's arm_trail job). The ceiling must remain to bank the winner at its target."""
         m = _mgr(tmp_path)
         base = replace(m.config.rules, trailing=TrailingConfig(enabled=False))
-        out, armed = m._apply_auto_trail(base, self.AUTO, peak_price=7.0, entry_debit=ED, quantity=QTY)
+        out, armed = m._apply_auto_trail(base, self.AUTO, peak_price=7.0, entry_debit=ED, quantity=QTY,
+                                         armed=True, peak_since_arm=7.0)
         assert armed is True
         assert out.profit_target_pct == 30.0  # ceiling untouched by auto-trail

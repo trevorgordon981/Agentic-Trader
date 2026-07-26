@@ -48,6 +48,7 @@ def test_plan_idea_needs_approval_when_valid():
 def _trader(tmp_path, **over):
     ibc = MagicMock()
     ibc.ib = MagicMock()
+    ibc.ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
     ibc.get_positions = AsyncMock(return_value={})
     em = MagicMock(); em.run_cycle = AsyncMock()
     t = Trader(ib_conn=ibc, exit_manager=em, limits=LIM, approved_names=set(),

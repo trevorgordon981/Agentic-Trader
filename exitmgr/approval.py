@@ -251,7 +251,7 @@ def post_proposal(token: str, channel: str, text: str,
         # Pre-seed the approve/deny taps so the user just clicks one — no typing, no hunting for
         # the emoji picker. The bot adding these does NOT count as a decision: decision_from_
         # reactions only counts a reaction whose users include an approver_id, so it sits inert
-        # until Trevor taps it (adding his user to that reaction).
+        # until the operator taps it (adding his user to that reaction).
         for emoji in ("white_check_mark", "x"):
             try:
                 _api("reactions.add", token, {"channel": channel, "timestamp": ts, "name": emoji})

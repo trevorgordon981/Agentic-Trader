@@ -27,7 +27,7 @@ caps:
   # `< $2,500` floor row. Clear/empty this list => full NO-OP = today's flat +30% behavior.
   # ACCEPTED INVERTED REWARD:RISK ON SMALL POTS (INTENTIONAL -- do NOT "fix" this): on pots under
   # ~$5,000 the default take-profit (tp_pct 0.20-0.22) sits BELOW the -30% protective stop, i.e.
-  # reward < risk by design. Trevor's deliberate call: bank profits fast to climb out of down days
+  # reward < risk by design. the operator's deliberate call: bank profits fast to climb out of down days
   # while the stop still holds firm at -30%. This is NOT a bug and must NOT trigger a post-clamp R:R
   # re-check or any widening of the small-pot tp rows / tightening of the stop. (Mirrored by code
   # comments in exitmgr/construction.py clamp_tp_sl and exitmgr/risk.py's reward:risk gate.)
@@ -57,7 +57,7 @@ rules:
   # `tune_exit_floor.py --write`. (SEAM: to reach a LIVE OrderManager, manager.py must also pass
   # exit_slippage_floor=cfg.rules.exit_slippage_floor -- flagged, not yet wired.)
   exit_slippage_floor: 0.50
-  # SCALE-OUT + TRAILING (2026-07-02 #1-ROI audit fix, Finding 1). Turned ON per Trevor's
+  # SCALE-OUT + TRAILING (2026-07-02 #1-ROI audit fix, Finding 1). Turned ON per the operator's
   # greenlight, but every number below is an UNVALIDATED PRIOR -- eyeball before trading
   # resumes (exits cannot be data-validated until the live MFE/MAE logging accrues).
   # Mechanism: bank half the position at +20% (the band the book historically round-trips
@@ -69,8 +69,21 @@ rules:
     trim_fraction: 0.5        # PRIOR: take 50% off, let 50% run (needs qty>=2 to leave a runner)
   trailing:
     enabled: true             # PRIOR: was false -- now ON
-    activation_gain_pct: 20.0 # PRIOR: arm the trail at the scale-out level (+20%)
-    giveback_fraction: 0.4    # PRIOR: exit if runner gives back >40% of its PEAK gain-above-entry
+    # 2026-07-26 RESTORED TO 20.0 (Sol audit R5 section R1, ruling path (a)).
+    # the operator asked for arming at +15% ("make sure the trailing stop gets triggered once a position
+    # gets to 15% up") but he chose that number TOGETHER WITH multi-session confirmation. The
+    # confirmation mechanism did not exist yet, so 15.0 on disk was early arming WITHOUT the
+    # safety that justified it.
+    # MEASURED CAVEAT -- a 365-DTE 0.60-delta option has elasticity ~2.0-2.8x its underlying, so
+    # its own 1-sigma DAILY move is ~10-12%. Armed at +15% with giveback 0.4 the protected floor
+    # sits only 5.2% below the peak -- roughly 0.5 of a daily sigma, i.e. INSIDE one average day
+    # of option noise. The raw tick-based trail at +15% fires on noise, not on a thesis change.
+    # THIS RETURNS TO 15.0 IN THE SAME REVIEWED CHANGE THAT ENABLES CONFIRMATION -- i.e. only once
+    # the two-consecutive-qualifying-CLOSES contract (state.record_session_close /
+    # State.is_trail_armed) is live, proven, and switched on for the live book. Do not lower it
+    # on its own. See RULING_TAKE_PROFIT.md + SOL_AUDIT_R5.md section R1.
+    activation_gain_pct: 20.0 # RESTORED from 15.0 (was 20.0 originally)
+    giveback_fraction: 0.4    # exit if runner gives back >40% of its PEAK gain-above-entry
                               #   (keeps >=60% of the realized peak gain)
   # GAIN-PROTECTING AUTO-TRAIL SAFETY FLOOR (2026-07-03 Part 2). A WIDE trailing stop that
   # AUTO-ARMS on ANY winner once its PEAK gain clears activation_gain_pct -- even if the model
@@ -89,13 +102,35 @@ construction:
   # 2026-07-01 trade-construction rulebook (evidence: journal audit 6/12-7/1). Tune HERE,
   # not in code -- consumed by exitmgr/construction.py via daily_recommend + exitmgr/trader.
   min_dte: 25                # DTE floor at entry; shorter model ideas get ADJUSTED up (journal-annotated)
-  prefer_dte_max: 45         # preferred entry window is 25-45 DTE
+  # 2026-07-26 (the operator): raised 170 -> 800. construction.py:48 computes
+  #   eff_target = min(max(tgt, min_dte), max(prefer_dte_max, min_dte))
+  # so prefer_dte_max is a HARD CEILING on the model's requested DTE. At 170 EVERY long-dated
+  # request collapsed: 365->170, 497->170, 638->170, 795->170 -- i.e. production silently deleted
+  # the 365-DTE doctrine and bought ~170-DTE structures, which is precisely the ~168-DTE theta
+  # bleed the v8 corpus exists to abolish, and it was journalled merely as "adjusted".
+  # 800 clears the longest LEAP the constructor will ever be asked for, so the ceiling stops
+  # overriding intent. NOTE: this does NOT install a 365 floor -- min_dte is still 25, so a model
+  # that ASKS for a short expiry still gets one. Raising min_dte is a separate, larger decision.
+  prefer_dte_max: 800        # was 170 (and 45 before 2026-07-22, which clamped 78.7% of taught legs)
+  # 2026-07-26 STRUCTURE-AWARE DTE FLOOR (CREDIT_PATH_SPEC.md S3; authority SOL_AUDIT_R3.md
+  # S4:117-125). min_dte above is the DEBIT floor and stays 25: the buyer PAYS theta, so a
+  # short-dated long call is the -$1,521 failure mode the doctrine abolishes. A cash-secured
+  # put COLLECTS theta, so it gets its OWN window below -- weeklies are the point of a write.
+  # These two keys are read ONLY on the credit path (construction.dte_bounds_for_side); a debit
+  # idea can never reach credit_min_dte, which is exactly why this is a split and not
+  # `min_dte: 3`. Sol S4 words the write window as 7-45; the frozen spec sets the floor at 3 to
+  # allow true weeklies -- raise this to 7 to run Sol's tighter window.
+  credit_min_dte: 3          # cash-secured puts ONLY: weeklies allowed (NEVER applies to a debit)
+  credit_max_dte: 45         # cash-secured puts ONLY: HARD upper bound (Sol S4) -- a 60-DTE
+                             #   write is refused outright, not rounded to the nearest expiry
   tp_pct: 0.30               # default take-profit = +30% of debit
   tp_min_pct: 0.25           # model-provided TP clamped into [tp_min, tp_max]
   tp_max_pct: 0.35
   sl_pct: -0.30              # default stop = -30% of debit (model stops may be tighter, never looser)
-  max_premium_pct: 0.15      # premium per trade <= 15% of net-liq (downsizes qty first, then rejects)
-  max_deployed_pct: 0.40     # TOTAL deployed premium <= 40% of net-liq (was 82-103% at times)
+  max_premium_pct: 0.25      # premium per trade <= 25% of net-liq (downsizes qty first, then rejects);
+                             #   matches risk.py max_trade_pct 0.25 and the C25 sizing bands
+  max_deployed_pct: 0.40     # TOTAL deployed premium <= 40% of net-liq; coupled to the
+                             #   4%/day portfolio-decay cap at the hard DTE<=10 exit boundary
   max_decay_pct_per_day: 0.01            # (debit/DTE)/net-liq <= 1%/day per trade
   max_portfolio_decay_pct_per_day: 0.04  # portfolio theta-decay total <= 4%/day
   dte_exit_threshold: 10     # exit/roll evaluation at DTE<=10; green/thesis-intact -> managed LIMIT exit
@@ -131,8 +166,22 @@ trading:
   llm_endpoint: http://127.0.0.1:8082/v1/chat/completions
   llm_model: /path/to/model
   manage_positions: true
+  # 2026-07-26: added the affordability-screened universe. At a ~$1,893 account with a 25%%
+  # per-trade cap and a 365-DTE floor, a 1-year 0.60-delta call must cost <= ~$473, i.e.
+  # 0.40*spot*vol*100 <= cap. That admits cheap names (incl. high-vol ones) and excludes
+  # expensive or high-notional ones. Recompute the set when net-liq changes -- the ceiling
+  # is a function of account size, not a fixed price.
   approved_names: [SPY, QQQ, IWM, AAPL, MSFT, NVDA]  # placeholder -- real ~400-name universe scrubbed (strategy)
   allow_model_names: true
+  # ApeWisdom supplies an ephemeral source of candidate TICKERS for the morning slate.
+  # Attention metrics are shown only in the separate discovery post; the trade strategist
+  # receives independent quote/technical/news research and no popularity signal.
+  apewisdom_discovery:
+    enabled: true
+    filter: all-stocks
+    source_limit: 20
+    probe_limit: 12
+    research_limit: 8
   blocked_names:
   - EXAMPLE_TICKER   # placeholder -- original block-list scrubbed
   blocked_sector_keywords:
@@ -224,7 +273,7 @@ trading:
   # gordon-gauntlet/calibration_gate.py (min-sample + discrimination) so thin data can NEVER up-size.
   # conviction(1-10) -> multiplier on the per-trade SOFT size: >1 up-sizes a genuinely-outperforming
   # bucket (bounded so it never exceeds the hard ceiling), <1 down-sizes an underperformer, 1.0 flat.
-  # Left EMPTY until Trevor reviews a proposal AND opts in -- to size real money you ALSO must wire it
+  # Left EMPTY until the operator reviews a proposal AND opts in -- to size real money you ALSO must wire it
   # into run_trader.py's RiskLimits (mirror conviction_size_curve). Empty/absent => full no-op.
   # conviction_size_multipliers: {}
   max_trade_pct: 0.25

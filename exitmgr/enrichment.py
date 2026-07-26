@@ -189,23 +189,47 @@ async def _opt_one_ib(ib, sym):
     spot = await underlying_price(ib, stk)
     today = _dt.date.today()
     exps = sorted(p.expirations)
-    exp = next((e for e in exps if (_dt.datetime.strptime(e, "%Y%m%d").date() - today).days >= 7), exps[0])
-    ks = strikes_near(p.strikes, spot, per_side=5)
-    conts = [Option(sym, exp, k, r, "SMART") for k in ks for r in ("C", "P")]
-    q = [c for c in await ib.qualifyContractsAsync(*conts) if getattr(c, "conId", None)]
-    if not q:
-        return None
-    tks = await ib.reqTickersAsync(*q)
-    cv = pv = 0.0; ivs = []
-    for t in tks:
-        v = t.volume if (t.volume and t.volume == t.volume and t.volume > 0) else 0
-        if t.contract.right == "C":
-            cv += v
-        else:
-            pv += v
-        g = t.modelGreeks or t.lastGreeks
-        if g and g.impliedVol and g.delta is not None and 0.3 < abs(g.delta) < 0.7:
-            ivs.append(g.impliedVol)
+
+    def _dte(e):
+        return (_dt.datetime.strptime(e, "%Y%m%d").date() - today).days
+
+    # NEAR expiry -- unchanged. P/C ratio and option volume are positioning reads and
+    # belong on the front month.
+    exp = next((e for e in exps if _dte(e) >= 7), exps[0])
+    # LONG expiry (2026-07-26). The doctrine trades 365+ DTE, and volatility term structure
+    # means front-month ATM IV is the wrong number to price a LEAP from -- too low in calm
+    # tape, far too high after a shock. We already pay to fetch the chain and then throw it
+    # away; carry a long-dated IV and real strike-level premiums into the brief instead.
+    exp_long = next((e for e in exps if _dte(e) >= 365), None)
+
+    async def _sample(expiry, per_side):
+        """(call_vol, put_vol, ivs, quotes) for one expiry. quotes maps (strike, right) -> mid,
+        two-sided markets only -- a one-sided or crossed book is not a price."""
+        ks = strikes_near(p.strikes, spot, per_side=per_side)
+        conts = [Option(sym, expiry, k, r, "SMART") for k in ks for r in ("C", "P")]
+        q = [c for c in await ib.qualifyContractsAsync(*conts) if getattr(c, "conId", None)]
+        if not q:
+            return 0.0, 0.0, [], {}
+        tks = await ib.reqTickersAsync(*q)
+        cv = pv = 0.0
+        ivs = []
+        quotes = {}
+        for t in tks:
+            v = t.volume if (t.volume and t.volume == t.volume and t.volume > 0) else 0
+            if t.contract.right == "C":
+                cv += v
+            else:
+                pv += v
+            g = t.modelGreeks or t.lastGreeks
+            if g and g.impliedVol and g.delta is not None and 0.3 < abs(g.delta) < 0.7:
+                ivs.append(g.impliedVol)
+            b, a = getattr(t, "bid", None), getattr(t, "ask", None)
+            if all(x is not None and x == x and x > 0 for x in (b, a)) and a >= b:
+                quotes[(float(t.contract.strike), t.contract.right)] = (b + a) / 2.0
+        return cv, pv, ivs, quotes
+
+    cv, pv, ivs, _ = await _sample(exp, 5)
+
     parts = []
     if cv:
         pcr = pv / cv
@@ -214,7 +238,27 @@ async def _opt_one_ib(ib, sym):
     if cv + pv > 0:
         parts.append(f"{exp[4:6]}/{exp[6:]} opt vol {int(cv+pv):,}")
     if ivs:
-        parts.append(f"ATM IV {_st.median(ivs)*100:.0f}%")
+        parts.append(f"ATM IV {_st.median(ivs)*100:.0f}% ({_dte(exp)}d)")
+
+    # Long-dated block. Degrades silently to the previous behaviour when the name has no LEAP
+    # listed or the book is one-sided; wrapped so it can never raise or stall the brief.
+    if exp_long:
+        try:
+            _, _, ivs_l, quotes_l = await _sample(exp_long, 4)
+            dte_l = _dte(exp_long)
+            if ivs_l:
+                parts.append(f"ATM IV {_st.median(ivs_l)*100:.0f}% ({dte_l}d)")
+            if quotes_l:
+                picks = sorted(quotes_l.items(), key=lambda kv: abs(kv[0][0] - spot))[:6]
+                shown = "; ".join(
+                    f"{r} {k:g} ${mid * 100:,.0f}" for (k, r), mid in
+                    sorted(picks, key=lambda kv: (kv[0][1], kv[0][0]))
+                )
+                parts.append(
+                    f"{exp_long[:4]}-{exp_long[4:6]}-{exp_long[6:]} mid/contract ({dte_l}d): {shown}")
+        except Exception:
+            pass
+
     return f"{sym}: " + "; ".join(parts) if parts else None
 
 async def options_flow_ib(ib, names, limit=3):

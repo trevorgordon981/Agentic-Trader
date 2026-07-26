@@ -1,4 +1,4 @@
-"""Gate H2 (2026-07-03): the daily slate -- Trevor's PRIMARY entry path -- now SURFACES a
+"""Gate H2 (2026-07-03): the daily slate -- the operator's PRIMARY entry path -- now SURFACES a
 concentration/correlation warning when adding a candidate would breach the single-name-agg cap
 (risk.py #6) or the sector/correlated-cluster cap (risk.py #6b). It is SURFACE-ONLY: it appends a
 warning note and audits it, but NEVER hard-blocks (the human tap still decides) and NEVER changes

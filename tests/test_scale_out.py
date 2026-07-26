@@ -70,12 +70,12 @@ class TestTrailingProtectsRealizedGains:
         # current 6.30 (+26%) is still above the floor -> hold
         assert evaluate_trailing_stop(
             current_price=6.30, entry_debit=500.0, quantity=1,
-            peak_price=7.0, activation_gain_pct=20.0, giveback_fraction=0.4,
+            peak_since_arm=7.0, activation_gain_pct=20.0, giveback_fraction=0.4, armed=True,
         ) is None
         # current 6.10 (+22%) dropped below the +24% floor -> exit, locking a solid gain
         t = evaluate_trailing_stop(
             current_price=6.10, entry_debit=500.0, quantity=1,
-            peak_price=7.0, activation_gain_pct=20.0, giveback_fraction=0.4,
+            peak_since_arm=7.0, activation_gain_pct=20.0, giveback_fraction=0.4, armed=True,
         )
         assert t is not None
         assert t.trigger_type == "trailing_stop"
@@ -86,7 +86,7 @@ class TestTrailingProtectsRealizedGains:
         # Entry 5.00, peak 5.50 (+10%), activation +20% -> not armed
         assert evaluate_trailing_stop(
             current_price=5.20, entry_debit=500.0, quantity=1,
-            peak_price=5.50, activation_gain_pct=20.0, giveback_fraction=0.4,
+            peak_since_arm=5.50, activation_gain_pct=20.0, giveback_fraction=0.4, armed=True,
         ) is None
 
 
@@ -141,16 +141,23 @@ class TestRoundTripScenario:
 
     def test_step3_runner_trails_out_after_fade(self):
         """After the trim (already_trimmed=True), the runner rides to +40% peak then fades;
-        the trail exits it instead of round-tripping to zero."""
+        the trail exits it instead of round-tripping to zero.
+
+        2026-07-26 (Sol audit R5 R1): the runner must be CONFIRMED-ARMED for the trail to exist at
+        all -- two consecutive sessions CLOSED at/above activation -- so the persisted armed state
+        and its post-arm ratchet are passed explicitly. Without them there is no trailing exit and
+        the -30% stop alone governs; that is the point of the ruling, and it is proven in
+        tests/test_confirmed_trail.py."""
         rules = _rules()
         # Runner is now 2 contracts (half of 4). entry_debit for the runner = half.
         runner_debit = self.ENTRY / 2
-        # Peak 7.00 (+40%). floor = 5 + (7-5)*(1-0.4) = 6.20 (+24%).
+        # Peak-since-arm 7.00 (+40%). floor = 5 + (7-5)*(1-0.4) = 6.20 (+24%).
         # Fade to 6.00 (+20%) -> below floor -> trailing_stop full-closes the runner.
         t = evaluate_position(
             con_id=1, symbol="AAPL", quantity=2, entry_debit=runner_debit,
             current_price=6.00, days_to_expiry=30, peak_price=7.00, rules=rules,
             already_trimmed=True,        # scale-out won't re-fire
+            trail_armed=True, peak_since_arm=7.00,
         )
         assert t is not None
         assert t.trigger_type == "trailing_stop"

@@ -8,11 +8,12 @@ on a $13.62 stock); and 82-103% of the pot was in premium at times.
 
 These are PURE functions (no IBKR, offline-testable) enforcing the rulebook wherever orders
 are constructed (daily_recommend.py + exitmgr/trader.py). Every threshold lives in
-config.yaml under `construction:` (see exitmgr.config.ConstructionConfig) so Trevor tunes
+config.yaml under `construction:` (see exitmgr.config.ConstructionConfig) so the operator tunes
 numbers there, never here.
 """
 import json
 import math
+from collections import namedtuple
 from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -20,34 +21,160 @@ from exitmgr.rules import days_to_expiry
 
 
 # --------------------------------------------------------------- DTE floor (gate A1)
+#
+# STRUCTURE-AWARE DTE DOCTRINE (2026-07-26; CREDIT_PATH_SPEC.md S3, authority SOL_AUDIT_R3.md
+# S4:117-125). ONE global `min_dte` cannot serve two opposite mechanisms:
+#
+#   * DEBIT / long premium -- the buyer PAYS theta, so short-dated is the documented failure
+#     mode (median 17.5 DTE at entry bled 5.9-12.5%/day; -$1,521). Floor stays
+#     `construction.min_dte` (25); `construction.prefer_dte_max` (800 since 2026-07-26) stays a
+#     SOFT target clamp so a 365/497/638/795-DTE request reaches its expiry instead of
+#     collapsing to ~170.
+#   * CREDIT / cash-secured put -- the writer COLLECTS theta, so a weekly is the point, not the
+#     bug. Own window `construction.credit_min_dte` (3) .. `construction.credit_max_dte` (45),
+#     and that ceiling is HARD: a 60-DTE write is out of doctrine, not "close enough".
+#
+# THE INVARIANT THIS SECTION EXISTS TO ENFORCE: **the credit floor must be UNREACHABLE from
+# the debit path.** `min_dte: 3` applied globally would license a 3-DTE LONG CALL -- maximum
+# theta bleed, the exact structure the doctrine abolishes. So:
+#   - `pick_expiry` is a dumb primitive: it takes explicit bounds and reads NO globals;
+#   - `dte_bounds_for_side` is the ONLY place a side picks its numbers. It touches the
+#     `credit_*` keys ONLY when side == "credit", and fails SAFE -- anything unrecognised,
+#     missing or malformed resolves to the STRICT debit doctrine;
+#   - `pick_expiry_for_side` is the sanctioned one-call entry point and deliberately has NO
+#     floor/ceiling argument, so no caller and no argument combination can hand a debit idea
+#     a shorter floor than `min_dte`.
+# Never plumb `credit_min_dte` into a debit call site.
 
-def pick_expiry(expirations, target_dte, min_dte=25, prefer_dte_max=45, today=None):
-    """Choose the entry expiry honoring the min-DTE floor (default 25, prefer 25-45).
+DEBIT_SIDE = "debit"
+CREDIT_SIDE = "credit"
+
+# Fallbacks used ONLY when no ConstructionConfig is supplied (or it predates these keys).
+# They mirror config.yaml `construction:` as of 2026-07-26.
+DEBIT_MIN_DTE_DEFAULT = 25
+DEBIT_PREFER_DTE_MAX_DEFAULT = 800
+CREDIT_MIN_DTE_DEFAULT = 3
+CREDIT_MAX_DTE_DEFAULT = 45
+
+DteBounds = namedtuple("DteBounds", "min_dte prefer_dte_max max_dte")
+
+
+def _int_or(value, fallback):
+    """int(value) or `fallback` for None/garbage. Never raises (a config typo must not crash
+    entry construction, and must never silently widen a floor)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(fallback)
+
+
+def normalize_side(side):
+    """Map a trade's side to "credit" or "debit".
+
+    ONLY the exact token "credit" (any case, surrounding whitespace ignored) is credit.
+    EVERYTHING else -- None, "", "Debit", "csp", a typo, a non-string -- resolves to
+    "debit". That asymmetry is deliberate and load-bearing: a mangled/absent side must fall
+    into the STRICT long-premium doctrine, never into the 3-DTE credit window.
+    """
+    try:
+        s = str(side or "").strip().lower()
+    except Exception:  # pragma: no cover -- defensive: an exotic __str__ must not open the floor
+        return DEBIT_SIDE
+    return CREDIT_SIDE if s == CREDIT_SIDE else DEBIT_SIDE
+
+
+def dte_bounds_for_side(side, cons=None):
+    """Resolve the DTE bounds belonging to a trade's `side`.
+
+    Returns DteBounds(min_dte, prefer_dte_max, max_dte):
+      * DEBIT  -> (cons.min_dte [25], cons.prefer_dte_max [800], None)
+                  max_dte is None = NO hard ceiling; prefer_dte_max stays the SOFT target clamp
+                  it has been since 2026-07-01, so the long-dated clamp fix is untouched.
+      * CREDIT -> (cons.credit_min_dte [3], cons.credit_max_dte [45], cons.credit_max_dte)
+                  the ceiling is HARD -- a write outside the 3-45 window is refused, not
+                  rounded to the nearest available expiry.
+
+    `cons` is a ConstructionConfig (or any object with those attributes); None/missing
+    attributes fall back to the module defaults above. Fails SAFE on garbage: a non-positive
+    or unparseable debit floor reverts to 25 rather than becoming "anything goes", and an
+    inverted credit window degenerates to a single-day window rather than an open ceiling.
+    """
+    if normalize_side(side) == CREDIT_SIDE:
+        lo = max(1, _int_or(getattr(cons, "credit_min_dte", None), CREDIT_MIN_DTE_DEFAULT))
+        hi = _int_or(getattr(cons, "credit_max_dte", None), CREDIT_MAX_DTE_DEFAULT)
+        hi = max(lo, hi)  # inverted config -> degenerate window, never an open ceiling
+        return DteBounds(lo, hi, hi)
+    # DEBIT: the credit_* keys are not read on this path AT ALL. This is the enforcement point.
+    lo = _int_or(getattr(cons, "min_dte", None), DEBIT_MIN_DTE_DEFAULT)
+    if lo <= 0:
+        lo = DEBIT_MIN_DTE_DEFAULT  # a 0/negative floor is a typo, not a licence for 3-DTE longs
+    hi = max(lo, _int_or(getattr(cons, "prefer_dte_max", None), DEBIT_PREFER_DTE_MAX_DEFAULT))
+    return DteBounds(lo, hi, None)
+
+
+def pick_expiry(expirations, target_dte, min_dte=25, prefer_dte_max=45, today=None, max_dte=None):
+    """Choose the entry expiry honoring an EXPLICIT DTE floor/ceiling (no globals read here).
 
     Nearest expiry to the idea's target_dte among expiries with DTE >= min_dte; a target
     below the floor (or above prefer_dte_max) is ADJUSTED into the band rather than
     rejected -- the trade idea is often sound, the model's expiry choice was the problem.
     Returns (expiry_str, dte, adjusted). (None, None, False) when NO expiry clears the
     floor (reject: no reasonable expiry exists).
+
+    `prefer_dte_max` is a SOFT clamp on the TARGET: it pulls an over-long request down, but if
+    every available expiry sits beyond it the nearest one is still returned (unchanged
+    behaviour -- do not make this hard, that is what collapsed 365-DTE requests to ~170).
+    `max_dte` (default None = no ceiling) is the HARD ceiling: expiries beyond it are removed
+    from the candidate set entirely, so an out-of-window expiry can never be selected. The
+    credit path passes credit_max_dte here; the debit path passes None.
+
+    CALLERS SELECTING BY SIDE MUST USE :func:`pick_expiry_for_side`. This primitive obeys
+    whatever bounds it is handed -- it is the side dispatcher, not this function, that
+    guarantees a debit idea can never be given the credit floor.
     """
     t0 = today or datetime.now(timezone.utc).date()
+    floor = _int_or(min_dte, DEBIT_MIN_DTE_DEFAULT)
+    # A malformed ceiling collapses to 0, i.e. NO candidate qualifies -> the trade is refused.
+    # Refusal is the fail-safe direction; silently dropping the ceiling is not.
+    hard_max = None if max_dte is None else _int_or(max_dte, 0)
     cands = []
     for e in expirations or []:
         try:
             d = (datetime.strptime(str(e)[:8], "%Y%m%d").date() - t0).days
         except (ValueError, TypeError):
             continue
-        if d >= int(min_dte):
-            cands.append((str(e), d))
+        if d < floor:
+            continue
+        if hard_max is not None and d > hard_max:
+            continue  # HARD ceiling: out-of-window expiry is not a candidate at all
+        cands.append((str(e), d))
     if not cands:
         return None, None, False
     try:
         tgt = int(target_dte or 0)
     except (TypeError, ValueError):
         tgt = 0
-    eff_target = min(max(tgt, int(min_dte)), max(int(prefer_dte_max), int(min_dte)))
+    soft_ceiling = max(_int_or(prefer_dte_max, floor), floor)
+    if hard_max is not None:
+        soft_ceiling = min(soft_ceiling, max(hard_max, floor))
+    eff_target = min(max(tgt, floor), soft_ceiling)
     exp, dte = min(cands, key=lambda x: abs(x[1] - eff_target))
     return exp, dte, (eff_target != tgt)
+
+
+def pick_expiry_for_side(expirations, target_dte, side=None, cons=None, today=None):
+    """Choose an entry expiry under the doctrine that belongs to `side`. SANCTIONED ENTRY POINT.
+
+    side="credit" (a cash-secured put) gets the 3-45 DTE write window; ANYTHING ELSE -- debit,
+    absent, misspelled, None -- gets the strict long-premium floor (min_dte, 25). There is
+    deliberately NO floor/ceiling parameter on this function: the bounds come from
+    :func:`dte_bounds_for_side`, so there is no argument combination by which a debit idea can
+    reach a sub-min_dte expiry. Returns (expiry_str, dte, adjusted), same contract as
+    :func:`pick_expiry`.
+    """
+    b = dte_bounds_for_side(side, cons)
+    return pick_expiry(expirations, target_dte, min_dte=b.min_dte,
+                       prefer_dte_max=b.prefer_dte_max, today=today, max_dte=b.max_dte)
 
 
 # --------------------------------------------------------------- TP/SL clamp (gate A2)
@@ -102,7 +229,7 @@ def clamp_tp_sl(tp_pct, sl_pct, cons):
     ACCEPTED INVERTED REWARD:RISK ON SMALL POTS (INTENTIONAL -- do NOT "fix"): once the pot-tier
     default TP (config caps.tp_tiers, applied by the caller via tp_tier_for_pot) is 0.20-0.25 on a
     sub-$5k pot, the resulting default TP can sit BELOW the 30% stop, so reward < risk by design.
-    Trevor's deliberate call: bank fast to climb out of down days while the stop still holds at 30%.
+    the operator's deliberate call: bank fast to climb out of down days while the stop still holds at 30%.
     Intentionally NO post-clamp R:R re-check here -- this clamp must not reject or re-widen a trade
     just because the accepted small-pot TP is below the stop. (See also config.yaml caps.tp_tiers.)
     """
@@ -270,14 +397,16 @@ def check_budget(debit_usd, dte, net_liq, open_book, cons):
     return (not reasons), reasons
 
 
-def open_book(positions, journal_path):
-    """[(net_debit_usd, dte), ...] for the open long legs -- the deployed-premium/decay book.
+def open_book_items(positions, journal_path, open_orders=None):
+    """Stable-keyed deployed-premium/decay book for filled positions and working BUYs.
 
     positions: {con_id: PositionData} from IBConnection.get_positions() (long legs only;
     spread short legs are already excluded there). The journaled NET debit (max loss) is
     preferred, keyed by the long leg's contract_id, newest entry wins -- same convention as
-    trader._load_journal_debits. Fallback: gross long-leg value (conservative)."""
+    trader._load_journal_debits. ``open_orders`` is reqAllOpenOrdersAsync() output; active BUYs
+    are keyed by immutable decision/order identity so a partial fill cannot be double-counted."""
     rows = {}
+    rows_by_ref = {}
     p = Path(journal_path)
     if p.exists():
         for line in p.read_text().splitlines():
@@ -294,20 +423,59 @@ def open_book(positions, journal_path):
             if cid is None or d is None:
                 continue
             try:
-                rows[int(cid)] = (float(d), e.get("expiry"))
+                row = (float(d), e.get("expiry"), e.get("decision_id"), int(cid))
+                rows[int(cid)] = row
+                if e.get("order_ref"):
+                    rows_by_ref[str(e["order_ref"])] = row
             except (TypeError, ValueError):
                 continue
-    book = []
+    items = {}
     for cid, pos in (positions or {}).items():
         r = rows.get(int(cid))
         if r is not None:
-            debit, exp = r
+            debit, exp, decision_id, _ = r
             dte = days_to_expiry(exp)
+            key = f"decision:{decision_id}" if decision_id else f"position:{int(cid)}"
         else:
             debit = abs(getattr(pos, "avg_cost", 0.0)) * 100 * abs(getattr(pos, "quantity", 0))
             dte = days_to_expiry(getattr(pos, "expiry", ""))
-        book.append((float(debit), dte if (dte and dte > 0) else 0))  # 0 = unknown horizon
-    return book
+            key = f"position:{int(cid)}"
+        items[key] = (float(debit), dte if (dte and dte > 0) else 0)
+
+    terminal = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
+    for trade in open_orders or []:
+        order = getattr(trade, "order", None)
+        contract = getattr(trade, "contract", None)
+        status = getattr(getattr(trade, "orderStatus", None), "status", None)
+        if order is None or contract is None or str(getattr(order, "action", "")).upper() != "BUY":
+            continue
+        if status in terminal:
+            continue
+        ref = str(getattr(order, "orderRef", "") or "")
+        row = rows_by_ref.get(ref)
+        if row is not None:
+            debit, exp, decision_id, long_cid = row
+            key = f"decision:{decision_id}" if decision_id else f"position:{long_cid}"
+            dte = days_to_expiry(exp)
+        else:
+            price = getattr(order, "lmtPrice", 0) or 0
+            remaining = getattr(getattr(trade, "orderStatus", None), "remaining", None)
+            qty = remaining if isinstance(remaining, (int, float)) and remaining > 0 \
+                else (getattr(order, "totalQuantity", 0) or 0)
+            try:
+                debit = float(price) * 100 * float(qty)
+            except (TypeError, ValueError):
+                debit = 0.0
+            dte = days_to_expiry(getattr(contract, "lastTradeDateOrContractMonth", ""))
+            oid = getattr(order, "permId", None) or getattr(order, "orderId", None) or ref
+            key = f"order:{oid}"
+        items[key] = (float(debit), dte if (dte and dte > 0) else 0)
+    return items
+
+
+def open_book(positions, journal_path, open_orders=None):
+    """Backward-compatible list view of :func:`open_book_items`."""
+    return list(open_book_items(positions, journal_path, open_orders).values())
 
 
 # --------------------------------------------------------------- earnings blackout (gate A5)

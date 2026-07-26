@@ -117,7 +117,13 @@ class TestTimeStop:
 
 
 class TestTrailingStop:
-    """Tests for trailing stop rule."""
+    """Tests for trailing stop rule.
+
+    2026-07-26 (Sol audit R5 R1): arming is no longer inferred from a monotonic lifetime peak --
+    it is the caller's persisted two-consecutive-qualifying-CLOSES state. These cases exercise the
+    FLOOR ARITHMETIC, which is unchanged, so they now pass that state explicitly (armed=True,
+    peak_since_arm=...). tests/test_confirmed_trail.py owns the arming contract itself.
+    """
 
     def test_trailing_not_activated(self):
         """Trailing stop should not trigger before activation."""
@@ -126,9 +132,10 @@ class TestTrailingStop:
             current_price=6.0,
             entry_debit=500.0,
             quantity=1,
-            peak_price=6.0,
+            peak_since_arm=6.0,
             activation_gain_pct=50.0,
             giveback_fraction=0.5,
+            armed=True,
         )
         assert trigger is None
 
@@ -142,9 +149,10 @@ class TestTrailingStop:
             current_price=9.0,
             entry_debit=500.0,
             quantity=1,
-            peak_price=10.0,
+            peak_since_arm=10.0,
             activation_gain_pct=50.0,
             giveback_fraction=0.5,
+            armed=True,
         )
         assert trigger is None
 
@@ -156,9 +164,10 @@ class TestTrailingStop:
             current_price=7.0,
             entry_debit=500.0,
             quantity=1,
-            peak_price=10.0,
+            peak_since_arm=10.0,
             activation_gain_pct=50.0,
             giveback_fraction=0.5,
+            armed=True,
         )
         assert trigger is not None
         assert trigger.trigger_type == "trailing_stop"

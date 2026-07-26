@@ -1,6 +1,6 @@
 """Take-profit-and-reload loop (2026-07-03).
 
-Encodes Trevor's serial-reload exit style as a fill-gated, human-approved SUGGESTION (never an
+Encodes the operator's serial-reload exit style as a fill-gated, human-approved SUGGESTION (never an
 auto-fire). Covered here:
   * reload verb parse (position_manager) -- only on take_profit, backward-compatible.
   * ExitTrigger carries reload metadata; _apply_decision attaches it only to take_profit.
@@ -246,6 +246,7 @@ NVDA_IDEA = TradeIdea("NVDA", False, "bullish", "long call", 7, 0.35, 90.0, 4, "
 
 def _trader(tmp_path, **kw):
     ibc = MagicMock(); ibc.ib = MagicMock()
+    ibc.ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
     em = MagicMock(); em.run_cycle = AsyncMock()
     t = Trader(ib_conn=ibc, exit_manager=em, limits=LIM, approved_names={"NVDA", "AMD"},
                endpoint="http://x", model="m", slack_token="tok", slack_channel="C1",

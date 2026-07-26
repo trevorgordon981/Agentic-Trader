@@ -18,6 +18,10 @@ from exitmgr.connection import IBConnection, PositionData
 # this backward edge cannot close a loop. Replicated in order.py/trader.py; do NOT add a 3rd copy.
 from exitmgr.order import OrderManager, _trading_day, commission_from_trade, compute_entry_basis
 from exitmgr.rules import evaluate_position, ExitTrigger, days_to_expiry
+# `rules_mod` exposes the exchange-session calendar the confirmed-trail contract needs
+# (is_trading_session / is_next_trading_session). Same module already imported above; aliased so
+# the calendar helpers are obviously calendar helpers at the call site.
+from exitmgr import rules as rules_mod
 from exitmgr.position_manager import assess_positions
 from exitmgr import regime as regime_mod
 from exitmgr.state import StateManager
@@ -29,6 +33,33 @@ from exitmgr import trade_capture, dataset_integrity
 # ever runs unstopped. Matches the constructor-default stop (|ConstructionConfig.sl_pct|*100 =
 # 30%). Never loosens an existing stop; the pot-tiered TP ceiling never touches it.
 _STOP_BACKSTOP_PCT = 30.0
+
+
+def _calendar_days_elapsed(entry_ts, now=None):
+    """Source-bound elapsed calendar days, or None when the entry timestamp is unavailable."""
+    if not entry_ts:
+        return None
+    try:
+        entered = datetime.fromisoformat(str(entry_ts).replace("Z", "+00:00"))
+        if entered.tzinfo is None:
+            entered = entered.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        return round(max(0.0, (current - entered).total_seconds() / 86400.0), 3)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _enforce_airtight_stop(rules):
+    """Every ordinary long-debit position has a positive stop no wider than 30% of debit."""
+    from dataclasses import replace
+    try:
+        stop = float(rules.stop_pct)
+    except (TypeError, ValueError):
+        stop = 0.0
+    return replace(rules, stop_pct=(min(stop, _STOP_BACKSTOP_PCT)
+                                    if stop > 0 else _STOP_BACKSTOP_PCT))
 
 
 class ExitManager:
@@ -69,6 +100,23 @@ class ExitManager:
         # Track peak prices for trailing stop (in-memory cache)
         self._peak_prices: Dict[int, float] = {}
 
+        # SHORT VISIBILITY (2026-07-26). A filled cash-secured put has NEGATIVE quantity and was
+        # therefore filtered out of IBConnection.get_positions() entirely -- it existed at the
+        # broker and nowhere in this process. These three books keep it visible WITHOUT letting a
+        # negative quantity leak into the long-only management pipeline (rules.py / order.py /
+        # state.py all assume quantity > 0 and are outside this change's blast radius).
+        #   _short_positions -- live SHORT option positions, quantity < 0, refreshed each cycle.
+        #   _stock_positions -- live STOCK rows, used ONLY to recognise an assignment.
+        #   _credit_con_ids  -- con_ids the journal says we SOLD (side == 'credit' / qty < 0).
+        self._short_positions: Dict[int, PositionData] = {}
+        self._stock_positions: Dict[int, PositionData] = {}
+        self._credit_con_ids: Set[int] = set()
+        # con_ids already alerted about this process, so the unmanaged-short warning is loud
+        # once rather than every 30s.
+        self._short_alerted: Set[int] = set()
+        # Last computed short report (list of dicts); exposed for tests + operator inspection.
+        self._short_report: List[dict] = []
+
         # Load journal entries
         self._journal_entries: Dict[int, dict] = {}
         self._load_journal()
@@ -82,6 +130,10 @@ class ExitManager:
 
         self._journal_entries = {}
         self._spread_short_legs = {}   # short_con_id -> parent long con_id (known spread legs)
+        # SHORT VISIBILITY (2026-07-26): con_ids we SOLD to open (cash-secured puts). Recorded
+        # from the journal so a short can be told from a long WITHOUT trusting the broker book
+        # alone -- and so an ASSIGNED put (which vanishes from the option book) is still known.
+        self._credit_con_ids = set()
         # TERMINAL-STATE (2026-07-03): collect close-tool markers + the ENTRY arc they drop, so a
         # tool-closed trade emits ONE full closed-trade dataset row instead of vanishing (the
         # journal-drop below used to orphan the whole entry+mark-path arc). markers keyed by BOTH
@@ -117,14 +169,30 @@ class ExitManager:
                                 if _arc_je is not None:
                                     _tool_close_arcs.setdefault(_arc_cid, _arc_je)
                                 self._journal_entries.pop(_cid, None)
+                                self._credit_con_ids.discard(_cid)
                                 _parent = self._spread_short_legs.pop(_cid, None)
                                 if _parent is not None:
                                     self._journal_entries.pop(int(_parent), None)
+                                    self._credit_con_ids.discard(int(_parent))
                                 for _scid, _p in list(self._spread_short_legs.items()):
                                     if _p == _cid:
                                         self._spread_short_legs.pop(_scid, None)
                                 continue
                             self._journal_entries[int(con_id)] = entry
+                            # SHORT VISIBILITY: a CREDIT entry is a position we SOLD. The trader
+                            # journals it with side='credit' AND a negative quantity; either is
+                            # sufficient evidence, so a row missing one field is still caught.
+                            # A tool-close marker pops the con_id above, so this can only mark
+                            # rows that are still (believed) open.
+                            try:
+                                _side = str(entry.get("side") or "").lower()
+                                _q = entry.get("quantity")
+                                if _side == "credit" or (_q is not None and int(_q) < 0):
+                                    self._credit_con_ids.add(int(con_id))
+                                else:
+                                    self._credit_con_ids.discard(int(con_id))
+                            except (TypeError, ValueError):
+                                pass
                             # A spread's short leg is a KNOWN position too. Track it so an
                             # over-covered short residual (6/29 double-close) is not flagged
                             # "unexpected" by reconciliation and does not blind the manager.
@@ -446,6 +514,11 @@ class ExitManager:
             dataset_integrity.mark(
                 rec, status=dataset_integrity.CANONICAL,
                 training=_training_canonical, pnl=_pnl_canonical, reason=_reason)
+            try:  # v6 raw-event capture: every realized exit (fail-open)
+                from exitmgr import capture_v6 as _v6
+                _v6.on_exit(exit_rec, je, con_id, mfe=mfe, mae=mae, mark_path=mark_path)
+            except Exception:
+                pass
             with open(self._dataset_path(), "a") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
                 f.flush()
@@ -638,6 +711,145 @@ class ExitManager:
             print(f"[WARN] dataset dedupe scan failed for order_id={order_id}: {e}")
         return False
 
+    # ------------------------------------------------------------------ short/credit helpers
+    # SHORT VISIBILITY (2026-07-26). Everything a SOLD option needs that a bought one does not.
+    # Kept together and pure (no I/O) so the sign logic is testable in isolation -- the sign is
+    # the single highest-risk detail in short handling.
+
+    @staticmethod
+    def _is_credit_row(je: Optional[dict], quantity: Optional[int] = None) -> bool:
+        """True when this position was SOLD to open. Two independent signals, either sufficient:
+        the journal's explicit side='credit' and a negative quantity (broker or journal). Never
+        raises -- an unreadable row is treated as a LONG, which is the pre-existing behaviour."""
+        try:
+            if quantity is not None and int(quantity) < 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        if not isinstance(je, dict):
+            return False
+        if str(je.get("side") or "").lower() == "credit":
+            return True
+        try:
+            q = je.get("quantity")
+            return q is not None and int(q) < 0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _credit_received_usd(je: Optional[dict], contracts: int) -> Optional[float]:
+        """Dollars COLLECTED when the short was opened -- the basis every short P&L is measured
+        against. Prefers the journaled net credit; falls back to the fill price, then the quoted
+        limit, x100 x contracts. Returns None when it cannot be established, and a None basis
+        makes realized P&L None rather than a fabricated number."""
+        if not isinstance(je, dict):
+            return None
+        v = je.get("net_credit_usd")
+        try:
+            if v is not None and float(v) > 0:
+                return round(float(v), 2)
+        except (TypeError, ValueError):
+            pass
+        # collateral - max_loss is the credit, when both are journaled
+        try:
+            coll, ml = je.get("collateral_usd"), je.get("max_loss_usd")
+            if coll is not None and ml is not None:
+                c = round(float(coll) - float(ml), 2)
+                if c > 0:
+                    return c
+        except (TypeError, ValueError):
+            pass
+        for k in ("avg_fill_price", "limit", "entry_price"):
+            try:
+                px = je.get(k)
+                if px is not None and float(px) > 0:
+                    return round(float(px) * 100 * abs(int(contracts or 1)), 2)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def short_pnl(cls, je: Optional[dict], current_price: Optional[float],
+                  contracts: int) -> Dict[str, Optional[float]]:
+        """UNREALIZED P&L for an open SHORT option. The sign is inverted relative to a long:
+        the position gains as the option gets CHEAPER, because the close is a BUY.
+
+            pnl_usd = credit_received - current_price * 100 * contracts
+
+        so a CSP sold for $1.75 now marked $0.50 is +$125 (a GAIN), and the same put marked
+        $3.00 is -$125. `pct_of_credit` is +100 when the option is worthless (kept the whole
+        credit) and goes negative once the buy-back costs more than the credit collected.
+        Returns Nones (never zeros, never a guess) when the mark or the credit is unknown."""
+        out: Dict[str, Optional[float]] = {"pnl_usd": None, "pct_of_credit": None,
+                                           "pct_of_max_loss": None, "credit_usd": None,
+                                           "cost_to_close_usd": None}
+        n = abs(int(contracts or 0)) or 1
+        credit = cls._credit_received_usd(je, n)
+        out["credit_usd"] = credit
+        try:
+            px = float(current_price) if current_price is not None else None
+            if px is not None and px != px:      # NaN
+                px = None
+        except (TypeError, ValueError):
+            px = None
+        if px is None or px < 0:
+            return out
+        cost = round(px * 100 * n, 2)
+        out["cost_to_close_usd"] = cost
+        if credit is None:
+            return out
+        pnl = round(credit - cost, 2)
+        out["pnl_usd"] = pnl
+        out["pct_of_credit"] = round(pnl / credit * 100, 2) if credit else None
+        try:
+            ml = (je or {}).get("max_loss_usd")
+            if ml is None:
+                ml = (je or {}).get("debit")
+            ml = float(ml) if ml is not None else None
+            out["pct_of_max_loss"] = round(pnl / ml * 100, 2) if ml else None
+        except (TypeError, ValueError):
+            out["pct_of_max_loss"] = None
+        return out
+
+    async def _fetch_position_book(self):
+        """ONE reqPositions round-trip, split into three books.
+
+        Returns (longs, shorts, stocks). `longs` is EXACTLY what get_positions() has always
+        returned and is what every pre-existing consumer in this file is still handed -- the
+        short book is a strictly ADDITIVE second channel, never a widening of the first. That
+        split is deliberate: rules.py bails out on `quantity <= 0`, order.py hardcodes SELL and
+        would size a close off a negative quantity, and state.py's peak tracking follows the
+        long-favourable extreme. Feeding a short into those would trade invisibility for
+        corruption, so the short is reported, not managed, until they are made short-aware.
+
+        Falls back to the plain long-only call if the connection/mock does not accept the
+        keyword arguments (older connection object, or a test double with a fixed signature) --
+        a short-visibility failure must never take the exit cycle down."""
+        try:
+            allpos = await self.ib_conn.get_positions(include_short=True, include_stock=True)
+        except TypeError:
+            allpos = await self.ib_conn.get_positions()
+        longs, shorts, stocks = {}, {}, {}
+        for cid, pd in (allpos or {}).items():
+            try:
+                q = int(getattr(pd, "quantity", 0) or 0)
+            except (TypeError, ValueError):
+                q = None          # unreadable -> NOT provably short; see the else-branch below
+            st = str(getattr(pd, "sec_type", "OPT") or "OPT").upper()
+            if st == "STK":
+                stocks[cid] = pd
+            elif q is not None and q < 0:
+                shorts[cid] = pd
+            else:
+                # DEFAULT TO THE LONG BOOK. Only a row that is PROVABLY stock or PROVABLY short
+                # is diverted; everything else lands exactly where get_positions() has always
+                # put it. This is what makes the long path byte-identical even when a caller
+                # hands us a test double whose quantity is not a real number.
+                longs[cid] = pd
+        self._short_positions = shorts
+        self._stock_positions = stocks
+        return longs, shorts, stocks
+
     def _log_exit(self, con_id: int, symbol: str, trigger, exit_price_per_share: Optional[float],
                   quantity: int, reason: str, extra: Optional[dict] = None,
                   entry_debit: Optional[float] = None, je: Optional[dict] = None) -> bool:
@@ -692,14 +904,47 @@ class ExitManager:
             proceeds = None
             realized_pnl = None
             realized_pct = None
-            if exit_price_per_share is not None:
-                try:
-                    proceeds = round(float(exit_price_per_share) * 100 * qty, 2)
-                except (TypeError, ValueError):
-                    proceeds = None
-            if proceeds is not None and entry_debit is not None:
-                realized_pnl = round(proceeds - entry_debit, 2)
-                realized_pct = round(realized_pnl / entry_debit * 100, 2) if entry_debit else None
+            # SHORT / CREDIT P&L (2026-07-26). THE SIGN IS INVERTED FOR A SOLD OPTION and the
+            # long formula below is not merely imprecise on one, it is backwards:
+            #   proceeds  = exit_px * 100 * qty      -> qty is NEGATIVE  -> proceeds negative
+            #   realized  = proceeds - entry_debit   -> entry_debit is the journaled MAX LOSS
+            # so a cash-secured put bought back at $0.10 (a near-perfect win) booked as
+            # -10 - 4850 = -$4,860, i.e. a ~-100% LOSS, on every single credit trade -- and that
+            # number is what feeds outcome/win-loss labelling, tp_hit/sl_hit and the training
+            # corpus. A short is money IN at entry and money OUT at exit:
+            #   realized = credit_received - (close_price * 100 * contracts)
+            # A CSP whose price FELL is therefore a GAIN, which is the whole point.
+            _short = self._is_credit_row(je, qty)
+            if _short:
+                _contracts = abs(qty) or 1
+                _credit = self._credit_received_usd(je, _contracts)
+                _cost = None
+                if exit_price_per_share is not None:
+                    try:
+                        _cost = round(float(exit_price_per_share) * 100 * _contracts, 2)
+                    except (TypeError, ValueError):
+                        _cost = None
+                if _cost is not None:
+                    # `proceeds` keeps its literal meaning -- the CASH FLOW of the closing
+                    # transaction. Buying a short back is cash OUT, so it is negative. It is NOT
+                    # used to derive realized P&L here; realized is computed against the credit.
+                    proceeds = round(-_cost, 2)
+                if _cost is not None and _credit is not None:
+                    realized_pnl = round(_credit - _cost, 2)
+                    # Percent convention for a credit trade is percent OF THE CREDIT captured
+                    # (+100% = expired worthless / kept it all), matching how the credit path's
+                    # profit_target_pct / stop_pct are expressed. The absolute dollar figure in
+                    # realized_pnl is the unambiguous one; both bases are recorded below.
+                    realized_pct = (round(realized_pnl / _credit * 100, 2) if _credit else None)
+            else:
+                if exit_price_per_share is not None:
+                    try:
+                        proceeds = round(float(exit_price_per_share) * 100 * qty, 2)
+                    except (TypeError, ValueError):
+                        proceeds = None
+                if proceeds is not None and entry_debit is not None:
+                    realized_pnl = round(proceeds - entry_debit, 2)
+                    realized_pct = round(realized_pnl / entry_debit * 100, 2) if entry_debit else None
             entry_ts = je.get("ts")
             holding_days = None
             now = datetime.now().astimezone()
@@ -736,6 +981,29 @@ class ExitManager:
                 "holding_days": holding_days,
                 "conviction": self._recover_conviction(je, symbol),
             }
+            if _short:
+                # SELF-DESCRIBING CREDIT ROW: a consumer that does not understand shorts must be
+                # able to SEE that this is one rather than silently read it as a long. quantity
+                # keeps its negative sign (never abs()'d); `contracts` is the magnitude.
+                _contracts = abs(qty) or 1
+                _credit = self._credit_received_usd(je, _contracts)
+                _cost = (round(-proceeds, 2) if proceeds is not None else None)
+                rec.update({
+                    "side": "credit",
+                    "structure": je.get("structure") or "cash secured put",
+                    "is_short": True,
+                    "contracts": _contracts,
+                    "entry_credit_usd": _credit,
+                    "collateral_usd": je.get("collateral_usd"),
+                    "max_loss_usd": (je.get("max_loss_usd")
+                                     if je.get("max_loss_usd") is not None else entry_debit),
+                    "close_cost_usd": _cost,
+                    "realized_pct_of_credit": realized_pct,
+                    "realized_pct_of_max_loss": (
+                        round(realized_pnl / float(entry_debit) * 100, 2)
+                        if (realized_pnl is not None and entry_debit) else None),
+                    "pnl_basis": "credit_received_minus_close_cost",
+                })
             if sp:
                 rec["spread"] = {
                     "short_con_id": sp.get("short_con_id"),
@@ -1036,6 +1304,11 @@ class ExitManager:
             strike = je.get("strike")
             qty = int(je.get("quantity", 1) or 1)
             entry_debit = je.get("debit")
+            # SHORT VISIBILITY (2026-07-26): for a SOLD option the intrinsic is a LIABILITY, not
+            # proceeds, and OTM-at-expiry is the WIN (the whole credit is kept), not a -100%
+            # loss. _log_exit's credit branch does the arithmetic; this only has to label it
+            # honestly and flag the ITM case, which is an ASSIGNMENT rather than an expiry.
+            is_short = self._is_credit_row(je, qty)
 
             def _intrinsic(k):
                 try:
@@ -1062,16 +1335,30 @@ class ExitManager:
             import types as _t
             trig = _t.SimpleNamespace(trigger_type="expired", pnl_pct=0.0,
                                       message="option expired")
+            if is_short:
+                _reasoning = ("expired worthless (OTM) -- full credit kept"
+                              if (value_known and not exit_px)
+                              else ("expired ITM -> ASSIGNED" if (value_known and exit_px)
+                                    else "expired"))
+            else:
+                _reasoning = ("expired worthless (OTM)"
+                              if (value_known and not exit_px) else "expired")
             extra = {
                 "exit_event": "expired",
                 "rule_fired": "expired",
-                "exit_reasoning": ("expired worthless (OTM)"
-                                   if (value_known and not exit_px)
-                                   else "expired"),
+                "exit_reasoning": _reasoning,
                 "dte_at_close": 0,
                 "underlying_price": spot,
                 "mfe_pct": self.state_manager.state.mfe_pct.get(str(con_id)),
             }
+            if is_short:
+                extra["side"] = "credit"
+                # An ITM short put at expiry is assigned, not merely expired: the option row is
+                # replaced by 100*contracts shares. Flagged so the stock is never a mystery.
+                extra["assigned"] = bool(value_known and exit_px)
+                if value_known and exit_px:
+                    extra["assigned_shares"] = 100 * abs(qty or 1)
+                    extra["assigned_strike"] = strike
             if not value_known:
                 # Do NOT assume worthless without the settlement spot: flag it, realized null.
                 extra["expiry_value_unknown"] = True
@@ -1092,16 +1379,21 @@ class ExitManager:
             except Exception:
                 pass
 
-    async def _process_expiries(self, live_positions) -> None:
+    async def _process_expiries(self, live_positions, live_shorts=None) -> None:
         """Detect journaled positions PAST expiry AND gone from live positions and emit an
         'expired' close row for each (best-effort intrinsic value from a spot fetch). Tool-closed
         arcs are already dropped from _journal_entries by _load_journal, so they are never seen
-        here (no double-log). Deduped; never raises into the cycle."""
+        here (no double-log). Deduped; never raises into the cycle.
+
+        `live_shorts` (2026-07-26) is the SHORT option book. It is unioned into the "still open
+        at the broker" test only -- without it a live cash-secured put, which is absent from the
+        long book by construction, would be indistinguishable from one that had already gone."""
         try:
             _on_disk = None
+            _live_short_ids = set((live_shorts or {}).keys())
             for con_id, je in list(self._journal_entries.items()):
                 try:
-                    if con_id in live_positions:
+                    if con_id in live_positions or con_id in _live_short_ids:
                         continue  # still open at the broker
                     dte = days_to_expiry(je.get("expiry"))
                     if dte is None or dte >= 0:
@@ -1124,6 +1416,230 @@ class ExitManager:
                     print(f"[WARN] expiry check failed for con_id={con_id}: {_ie} (continuing)")
         except Exception as e:
             print(f"[WARN] expiry processing errored (continuing): {e}")
+
+    # --------------------------------------------------------- short reporting / assignment
+    def _short_marks(self) -> Dict[int, float]:
+        """Per-con_id mark for the live short book, taken from IBKR's own portfolio snapshot.
+        That call is a LOCAL cache read (no new market-data request, no extra IB traffic) and is
+        the same authoritative source the long path already prefers over streaming quotes. NaN /
+        non-positive marks are omitted rather than trusted -- a NaN silently makes every
+        comparison False, which is how a -47% spread once read +25% and never stopped."""
+        out: Dict[int, float] = {}
+        try:
+            for p in (self.ib_conn.ib.portfolio() or []):
+                try:
+                    cid = int(p.contract.conId)
+                    px = float(p.marketPrice)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if px == px and px >= 0:
+                    out[cid] = px
+        except Exception:
+            return out
+        return out
+
+    async def _report_short_positions(self) -> List[dict]:
+        """Make every live SHORT option position visible, with CORRECTLY SIGNED P&L, once per
+        cycle. This is the deliberate stopping point of the 2026-07-26 change: a filled
+        cash-secured put is now reported, audited and alerted on -- it is NOT yet mechanically
+        exited, because the close path (order.py `_build_close_order`) hardcodes action='SELL'
+        and would size the order off a negative quantity, and rules.py returns None for every
+        stop/target when `quantity <= 0`. Reporting an unmanaged short loudly is honest;
+        routing it into a long-only exit path would be a wrong-side order on real money.
+
+        Never raises into the cycle. Returns the report rows (also stored on self._short_report).
+        """
+        rows: List[dict] = []
+        try:
+            shorts = dict(self._short_positions or {})
+            if not shorts:
+                self._short_report = []
+                return []
+            marks = self._short_marks()
+            for cid, pd in sorted(shorts.items()):
+                je = self._journal_entries.get(int(cid)) or {}
+                contracts = abs(int(getattr(pd, "quantity", 0) or 0)) or 1
+                px = marks.get(int(cid))
+                pnl = self.short_pnl(je, px, contracts)
+                strike = je.get("strike")
+                if strike is None:
+                    strike = getattr(pd, "strike", 0.0) or None
+                collateral = je.get("collateral_usd")
+                if collateral is None and strike:
+                    try:
+                        collateral = round(float(strike) * 100 * contracts, 2)
+                    except (TypeError, ValueError):
+                        collateral = None
+                row = {
+                    "con_id": int(cid),
+                    "symbol": getattr(pd, "symbol", "") or je.get("symbol") or "",
+                    "right": getattr(pd, "right", "") or je.get("right") or "",
+                    # SIGN PRESERVED. A consumer that reads this as a long is wrong, and the
+                    # negative number is what tells it so.
+                    "quantity": int(getattr(pd, "quantity", 0) or 0),
+                    "contracts": contracts,
+                    "strike": strike,
+                    "expiry": getattr(pd, "expiry", "") or je.get("expiry") or "",
+                    "dte": days_to_expiry(getattr(pd, "expiry", "") or je.get("expiry")),
+                    "mark": px,
+                    "collateral_usd": collateral,
+                    "credit_usd": pnl.get("credit_usd"),
+                    "cost_to_close_usd": pnl.get("cost_to_close_usd"),
+                    "unrealized_pnl_usd": pnl.get("pnl_usd"),
+                    "pct_of_credit": pnl.get("pct_of_credit"),
+                    "journaled": bool(je),
+                    "managed": False,
+                    "unmanaged_reason": "short_exit_path_not_implemented",
+                }
+                rows.append(row)
+                _p = row["unrealized_pnl_usd"]
+                _pc = row["pct_of_credit"]
+                _p_s = "n/a" if _p is None else "{:+.2f}".format(_p)
+                _pc_s = "n/a" if _pc is None else "{:+.1f}%".format(_pc)
+                print("[SHORT] {} {}x {}{} exp={} mark={} credit=${} pnl={} ({} of credit) "
+                      "UNMANAGED -- no stop/target is armed on this position".format(
+                          row["symbol"], row["quantity"], row["strike"], row["right"],
+                          row["expiry"], px, row["credit_usd"], _p_s, _pc_s))
+                if int(cid) not in self._short_alerted:
+                    self._short_alerted.add(int(cid))
+                    self._post_short_alert(row)
+        except Exception as e:
+            print(f"[WARN] short-position reporting errored (continuing): {e}")
+        self._short_report = rows
+        return rows
+
+    def _post_short_alert(self, row: dict) -> bool:
+        """One-shot Slack ping the first time a short position is seen this process. Silent
+        no-op without a channel/token (and in every test). Never raises."""
+        try:
+            channel = getattr(self.config, "alerts_channel", "") or ""
+            token = os.environ.get("SLACK_BOT_TOKEN", "")
+            if not (channel and token):
+                return True
+            from exitmgr import approval
+            ts = approval.post_proposal(
+                token, channel,
+                f":warning: *SHORT POSITION VISIBLE — {row.get('symbol')}* "
+                f"{row.get('quantity')}x {row.get('strike')}{row.get('right')} "
+                f"exp {row.get('expiry')}\n"
+                f"_collateral ${row.get('collateral_usd')} / credit ${row.get('credit_usd')} — "
+                f"the exit manager can SEE this position but does NOT yet place its close "
+                f"(no stop, no take-profit). Manage it manually._")
+            return bool(ts)
+        except Exception as e:
+            print(f"[WARN] short-position alert post failed: {e}")
+            return False
+
+    async def _process_short_assignments(self, live_shorts, live_stocks) -> None:
+        """A journaled SHORT that has left the option book before its expiry either was ASSIGNED
+        (the option is replaced by 100*contracts shares) or was bought back outside this process.
+        Both are terminal for the option, and today BOTH were silent: _process_expiries skips
+        anything with dte >= 0, so the journal row simply sat there forever while the resulting
+        stock position was managed by nobody.
+
+        Assignment is only DECLARED on positive evidence -- a matching stock row -- and then a
+        terminal record is emitted so the arc is closed rather than orphaned. Without that
+        evidence the disappearance is reported loudly and the journal row is left alone: a
+        fabricated close row is worse than a flagged unknown. Never raises into the cycle."""
+        try:
+            live_short_ids = set((live_shorts or {}).keys())
+            stock_by_symbol: Dict[str, int] = {}
+            for pd in (live_stocks or {}).values():
+                try:
+                    sym = str(getattr(pd, "symbol", "") or "").upper()
+                    q = int(getattr(pd, "quantity", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if sym:
+                    stock_by_symbol[sym] = stock_by_symbol.get(sym, 0) + q
+            for con_id in sorted(set(self._credit_con_ids or set())):
+                try:
+                    if con_id in live_short_ids:
+                        continue                       # still open at the broker
+                    je = self._journal_entries.get(int(con_id))
+                    if not je:
+                        continue
+                    dte = days_to_expiry(je.get("expiry"))
+                    if dte is not None and dte < 0:
+                        continue                       # expired -> _process_expiries owns it
+                    if con_id in self._terminal_dedupe_set():
+                        continue
+                    if con_id in self._full_close_on_disk():
+                        self._terminal_dedupe_set().add(con_id)
+                        continue
+                    sym = str(je.get("symbol") or "").upper()
+                    contracts = abs(int(je.get("quantity", 1) or 1)) or 1
+                    shares = stock_by_symbol.get(sym, 0)
+                    right = str(je.get("right") or "P").upper()[:1]
+                    # A short PUT assigns into LONG shares; a short CALL (which must not exist in
+                    # this account) assigns into SHORT shares. Require the sign AND at least one
+                    # full lot per contract before calling it an assignment.
+                    assigned = (shares >= 100 * contracts) if right == "P" else (shares <= -100 * contracts)
+                    if not assigned:
+                        print(f"[SHORT] {sym} con_id={con_id} left the option book with "
+                              f"dte={dte} and NO matching stock position (shares={shares}); "
+                              "treating as an EXTERNAL close, NOT assignment -- journal row "
+                              "left intact for the execution capture to reconcile")
+                        continue
+                    spot = None
+                    try:
+                        spot = await self._spot_price(je.get("symbol"))
+                    except Exception:
+                        spot = None
+                    strike = je.get("strike")
+                    intrinsic = None
+                    if spot is not None and strike is not None:
+                        try:
+                            intrinsic = (max(0.0, float(strike) - float(spot)) if right == "P"
+                                         else max(0.0, float(spot) - float(strike)))
+                        except (TypeError, ValueError):
+                            intrinsic = None
+                    import types as _t
+                    trig = _t.SimpleNamespace(trigger_type="assigned", pnl_pct=0.0,
+                                              message="short option assigned")
+                    extra = {
+                        "exit_event": "assigned",
+                        "rule_fired": "assigned",
+                        "exit_reasoning": (f"short {right} assigned -> {shares} shares of {sym}"),
+                        "side": "credit",
+                        "assigned": True,
+                        "assigned_shares": shares,
+                        "assigned_strike": strike,
+                        "dte_at_close": dte,
+                        "underlying_price": spot,
+                    }
+                    if intrinsic is None:
+                        # Do NOT assume a value we could not read.
+                        extra["expiry_value_unknown"] = True
+                        extra["realized_unknown_reason"] = "assignment_value_unknown"
+                    self._log_exit(int(con_id), je.get("symbol"), trig,
+                                   exit_price_per_share=intrinsic,
+                                   quantity=int(je.get("quantity", -contracts) or -contracts),
+                                   reason="assigned", extra=extra,
+                                   entry_debit=je.get("debit"), je=je)
+                    self._terminal_dedupe_set().add(int(con_id))
+                    # Release the option's record-only tracking so state.json does not carry a
+                    # dead contract forever; the STOCK position is now the live exposure.
+                    try:
+                        self.state_manager.state.peak_prices.pop(str(con_id), None)
+                        # ...and the trail confirmation/armed state with it: an assigned option is
+                        # a closed position, and its arm must never be inherited by a re-entry.
+                        self.state_manager.state.clear_trail_state(con_id)
+                    except Exception:
+                        pass
+                    print(f"[TERMINAL-CLOSE] {sym} con_id={con_id} reason=assigned "
+                          f"shares={shares} strike={strike} spot={spot} "
+                          "(ASSIGNMENT recorded; the resulting STOCK position is NOT managed "
+                          "by the exit manager)")
+                    self._post_short_alert({
+                        "symbol": sym, "quantity": je.get("quantity"), "strike": strike,
+                        "right": right, "expiry": je.get("expiry"),
+                        "collateral_usd": je.get("collateral_usd"),
+                        "credit_usd": self._credit_received_usd(je, contracts)})
+                except Exception as _ie:
+                    print(f"[WARN] assignment check failed for con_id={con_id}: {_ie} (continuing)")
+        except Exception as e:
+            print(f"[WARN] short assignment processing errored (continuing): {e}")
 
     @staticmethod
     def _exit_reason(trigger) -> str:
@@ -1287,15 +1803,17 @@ class ExitManager:
 
     def _clear_closed_position(self, con_id) -> None:
         """C3 (2026-07-09): on a CONFIRMED full close, purge ALL per-contract tracking
-        (peak/mfe/mae + their timestamps/mark path, scaled_out, trail_armed) AND drop the journal
-        entry, so a later RE-ENTRY of the SAME conId starts clean. Without this, a stale peak
-        survived (prune keeps live UNION journal) and the fresh position inherited it -> auto-trail
-        armed and fired immediately. Idempotent; persists the state; never raises into the caller."""
+        (peak/mfe/mae + their timestamps/mark path, scaled_out, trail_configured AND the whole trail
+        confirmation record) AND drop the journal entry, so a later RE-ENTRY of the SAME conId starts
+        clean. Without this, a stale peak survived (prune keeps live UNION journal) and the fresh
+        position inherited it -> auto-trail armed and fired immediately. A stale CONFIRMATION would
+        be worse still: the new position would open already-armed off the old one's closes, so
+        clearing it is part of the R1 contract. Idempotent; persists the state; never raises."""
         try:
             k = str(con_id)
             st = self.state_manager.state
             for d in (st.peak_prices, st.mfe_pct, st.mae_pct, st.mfe_ts, st.mae_ts,
-                      st.mark_path, st.scaled_out, st.trail_armed):
+                      st.mark_path, st.scaled_out, st.trail_configured, st.trail_confirmation):
                 d.pop(k, None)
             try:
                 self._journal_entries.pop(int(con_id), None)
@@ -1928,8 +2446,15 @@ class ExitManager:
         print("[INFO] Starting reconciliation...")
 
         # Get live positions and open orders
+        # SHORT VISIBILITY (2026-07-26): ONE fetch, split into books. `live_positions_raw` is the
+        # LONG book -- byte-identical to what this reconcile has always been handed. Shorts are
+        # captured onto self._short_positions as a side effect and deliberately NOT reconciled:
+        # state.reconcile_state compares an in-flight close's remaining_qty against the live
+        # quantity, and mixing a positive close quantity with a negative position quantity makes
+        # every comparison inconsistent -> safe=False -> exits withheld AND all entries halted
+        # account-wide. Shorts have no automated close yet, so there is nothing to reconcile.
         try:
-            live_positions_raw = await self.ib_conn.get_positions()
+            live_positions_raw, _short_raw, _stock_raw = await self._fetch_position_book()
             live_open_orders_raw = await self.ib_conn.get_open_orders(
                 short_leg_con_ids=set(getattr(self, "_spread_short_legs", {}).keys()))
         except Exception as e:
@@ -2034,6 +2559,20 @@ class ExitManager:
             sym = je.get("symbol", p.symbol)
             tstats = (price_stats or {}).get(sym)
             trend = regime_mod.trend_strength(tstats) if tstats else None
+            entry_ts = je.get("fill_ts") or je.get("ts")
+            elapsed = _calendar_days_elapsed(entry_ts)
+            try:
+                intended_hold = int(je.get("intended_hold_days"))
+                if intended_hold <= 0:
+                    intended_hold = None
+            except (TypeError, ValueError):
+                intended_hold = None
+            try:
+                entry_conviction = float(je.get("conviction"))
+                if not 1 <= entry_conviction <= 10:
+                    entry_conviction = None
+            except (TypeError, ValueError):
+                entry_conviction = None
             views.append({
                 "con_id": cid,
                 "symbol": sym,
@@ -2042,9 +2581,30 @@ class ExitManager:
                 "pct_from_peak": from_peak,
                 "trend": trend,  # {"score":-100..100, "label":...} per-underlying, or None
                 "dte": days_to_expiry(getattr(p, "expiry", "")),
+                "entry_timestamp": entry_ts,
+                "calendar_days_elapsed": elapsed,
+                "intended_hold_days": intended_hold,
+                "window_fraction": (round(elapsed / intended_hold, 3)
+                                    if elapsed is not None and intended_hold else None),
+                "entry_conviction": entry_conviction,
                 "profit_target_pct": je.get("profit_target_pct") or self.config.rules.profit_target_pct,
                 "stop_pct": je.get("stop_pct") or self.config.rules.stop_pct,
-                "trail_armed": bool(tc.enabled),
+                # THREE SEPARATE CONCEPTS (2026-07-26, Sol audit R5 R1). `trail_armed` used to be
+                # bool(tc.enabled) -- i.e. every position reported ARMED the moment the FEATURE was
+                # switched on, before price had gone anywhere near activation. That is false state
+                # in the model's input and in the training telemetry, and its consumer
+                # (_reconcile_ceiling_backstop) could suppress the take-profit ceiling on a position
+                # whose trail had never armed. Now:
+                #   trail_enabled    -- the feature may be used (config toggle);
+                #   trail_configured -- the model asked for a trail here (arm_trail), which relaxes
+                #                       the take-profit ceiling but arms NOTHING;
+                #   trail_armed      -- PERSISTED: price AND two-consecutive-qualifying-CLOSES
+                #                       confirmation actually passed. Only this can fire a trail.
+                "trail_enabled": bool(tc.enabled),
+                "trail_configured": str(cid) in self.state_manager.state.trail_configured,
+                "trail_armed": self.state_manager.state.is_trail_armed(cid),
+                "trail_confirming_closes": self.state_manager.state.trail_confirmation_for(
+                    cid)["consecutive_qualifying_closes"],
                 "trail_activation_gain_pct": tc.activation_gain_pct,
                 "trail_giveback_fraction": tc.giveback_fraction,
                 # TAKE-PROFIT-AND-RELOAD (2026-07-03): let the CONTINUATION judgment be more than
@@ -2092,12 +2652,16 @@ class ExitManager:
             if gb is not None:
                 gb = max(0.1, min(0.9, float(gb)))
                 new_gb = gb if free else min(gb, tc.giveback_fraction)
-            # PART 1 (2026-07-03): DURABLY mark this position trail-armed so the take-profit CEILING
-            # stays suppressed on SUBSEQUENT cycles (incl. plain 'hold'). Persisted with state (saved
-            # at cycle end), so it survives a process bounce. Best-effort: a state hiccup here must
-            # never break the decision path. Gates ONLY the take-profit side; never the stop.
+            # PART 1 (2026-07-03; RESCOPED 2026-07-26 per Sol audit R5 R1): DURABLY mark this
+            # position trail-CONFIGURED so the take-profit CEILING stays suppressed on SUBSEQUENT
+            # cycles (incl. plain 'hold'). Persisted with state (saved at cycle end), so it survives
+            # a process bounce. Best-effort: a state hiccup here must never break the decision path.
+            # Gates ONLY the take-profit side; never the stop.
+            # IT DOES NOT ARM THE TRAIL. A model arm_trail supplies PARAMETERS (activation/giveback)
+            # and its judgment to let the runner run; the armed bit belongs exclusively to the
+            # two-consecutive-qualifying-CLOSES confirmation in State.record_session_close.
             try:
-                self.state_manager.state.trail_armed[str(con_id)] = True
+                self.state_manager.state.trail_configured[str(con_id)] = True
             except Exception:
                 pass
             return replace(rules, trailing=replace(tc, enabled=True, activation_gain_pct=new_act, giveback_fraction=new_gb)), None
@@ -2110,45 +2674,66 @@ class ExitManager:
         return rules, None
 
     @staticmethod
-    def _reconcile_ceiling_backstop(rules, decision, armed=False):
-        """MODEL JUDGMENT = PRIMARY, TIER CEILING = BACKSTOP (2026-07-03; PERSISTED 2026-07-03 P1).
-        Suppress the fixed pot-tier profit_target whenever a trailing stop is ARMED for this
-        position -- either the model says arm_trail THIS cycle OR it armed one on a PRIOR cycle
-        (`armed`, read from persisted state.trail_armed). Without the persistent check a model that
-        armed a trail and then returned 'hold' would let the ceiling snap back and force-close (clip)
-        exactly the runner the trail was meant to let RUN. While armed, the armed TRAILING STOP (+
-        the untouched airtight 30% stop) govern the exit. When NO trail is armed (hold / take_profit
-        / cut / never-armed / no model response) the ceiling is UNCHANGED and still fires as the
-        entry-default backstop. Only relaxes take-profit -- NEVER the stop."""
-        _arm = bool(armed) or bool(decision and decision.get("action") == "arm_trail")
+    def _reconcile_ceiling_backstop(rules, decision, configured=False, armed=None):
+        """MODEL JUDGMENT = PRIMARY, TIER CEILING = BACKSTOP (2026-07-03; PERSISTED 2026-07-03 P1;
+        RENAMED 2026-07-26 per Sol audit R5 R1).
+        Suppress the fixed pot-tier profit_target whenever the MODEL has asked for a trailing stop
+        on this position -- either it says arm_trail THIS cycle OR it did on a PRIOR cycle
+        (`configured`, read from persisted state.trail_configured). Without the persistent check a
+        model that asked for a trail and then returned 'hold' would let the ceiling snap back and
+        force-close (clip) exactly the runner the trail was meant to let RUN. When the model has
+        asked for NO trail (hold / take_profit / cut / never-asked / no model response) the ceiling
+        is UNCHANGED and still fires as the entry-default backstop. Only relaxes take-profit --
+        NEVER the stop.
+
+        `configured` is deliberately NOT the armed bit. Suppressing a take-profit is the model's
+        judgment call and needs no session confirmation; FIRING a trailing stop does, and that lives
+        in State.is_trail_armed. `armed=` is accepted as the pre-rename alias for `configured`."""
+        if armed is not None:
+            configured = configured or armed
+        _arm = bool(configured) or bool(decision and decision.get("action") == "arm_trail")
         if _arm and rules.profit_target_pct is not None:
             from dataclasses import replace as _rp_pt
             return _rp_pt(rules, profit_target_pct=None)
         return rules
 
     @staticmethod
-    def _apply_auto_trail(rules, auto_cfg, peak_price, entry_debit, quantity):
+    def _apply_auto_trail(rules, auto_cfg, peak_price, entry_debit, quantity, armed=False,
+                          peak_since_arm=None):
         """PART 2 (2026-07-03) GAIN-PROTECTING AUTO-TRAIL SAFETY FLOOR. Independently of the model
-        AND of the global rules.trailing toggle, once a winner's PEAK gain clears
+        AND of the global rules.trailing toggle, once an ARMED winner's post-arm peak gain clears
         auto_trail.activation_gain_pct ensure a WIDE protective trailing stop is active for this
         eval so the gain can't round-trip to breakeven when the model returns 'hold'. WIDEN-ONLY: it
         enables the trail and takes the ROOMIER (larger) giveback of {config, auto} so it never
         chokes a runner the config would have let run, and lowers the activation only enough to keep
-        it armed -- it never RAISES an existing activation or tightens below what config/model set.
-        It rides the monotonic peak UP (peak_price is monotonic, so the protected floor only
-        ratchets up). It NEVER suppresses the take-profit ceiling (that is arm_trail's job) and NEVER
-        touches the protective stop. No-op when disabled, no peak, or below activation. Returns
-        (rules, armed_now: bool)."""
+        it usable -- it never RAISES an existing activation or tightens below what config/model set.
+        It rides the post-arm peak UP (peak_since_arm ratchets, so the protected floor only ratchets
+        up). It NEVER suppresses the take-profit ceiling (that is arm_trail's job) and NEVER touches
+        the protective stop. Returns (rules, widened_now: bool).
+
+        2026-07-26 (Sol audit R5 R1): THIS PATH MAY NOT BYPASS THE CONFIRMATION CONTRACT. It used to
+        force `trailing.enabled=True` off the monotonic LIFETIME peak, which made it a second,
+        unconfirmed arming mechanism -- a single intraday spike could switch on a trail the
+        two-session contract had refused. It is now a strict no-op until State.is_trail_armed says
+        the position is confirmed-armed, and it measures the activation gain from `peak_since_arm`,
+        never from the lifetime peak. `peak_price` is retained for signature/audit compatibility and
+        is NOT used for any gate. Enabling `trailing` here still cannot fire anything on its own:
+        evaluate_position additionally requires the persisted armed bit."""
         from dataclasses import replace as _rp_at
         if auto_cfg is None or not getattr(auto_cfg, "enabled", False):
+            return rules, False
+        # CONFIRMATION GATE -- identical contract to the model/config trail. No arm, no auto-trail.
+        if not armed:
+            return rules, False
+        if peak_since_arm is None:
             return rules, False
         try:
             q = int(quantity)
             ed = float(entry_debit)
-            pk = float(peak_price)
+            pk = float(peak_since_arm)
         except (TypeError, ValueError):
             return rules, False
-        if peak_price is None or q <= 0 or ed <= 0:
+        if q <= 0 or ed <= 0 or pk != pk or pk <= 0:
             return rules, False
         entry_per_share = ed / (100.0 * q)
         if entry_per_share <= 0:
@@ -2169,6 +2754,70 @@ class ExitManager:
         return _rp_at(rules, trailing=_rp_at(tc, enabled=True,
                                              activation_gain_pct=new_act,
                                              giveback_fraction=new_gb)), True
+
+    # ------------------------------------------- CONFIRMED-TRAIL SESSION CLOSES (Sol R5 R1)
+    # The window in which a mark read from the broker IS that session's official closing mark.
+    # Regular equity-option trading ends at 16:00 ET (13:00 ET on the exchange's half days, whose
+    # marks are likewise frozen well before 16:00), so anything read from 16:00 ET onward on a
+    # trading day is the CLOSE. The upper bound keeps a late-evening/overnight process from
+    # attributing a next-day quote to today's session.
+    SESSION_CLOSE_START_ET_MIN = 16 * 60
+    SESSION_CLOSE_END_ET_MIN = 20 * 60
+
+    @classmethod
+    def _completed_session_date(cls, now=None) -> Optional[str]:
+        """The YYYY-MM-DD of a COMPLETED regular trading session whose official closing mark can be
+        read RIGHT NOW, or None. Deliberately conservative: outside the post-close window, on a
+        weekend, or on an exchange holiday there is no session to record, and a session whose close
+        was never read simply never counts (it is never reconstructed after the fact)."""
+        from datetime import timezone as _tz
+        try:
+            from zoneinfo import ZoneInfo
+            et = ZoneInfo("America/New_York")
+            n = now or datetime.now(et)
+            if getattr(n, "tzinfo", None) is None:
+                n = n.replace(tzinfo=_tz.utc)
+            n = n.astimezone(et)
+        except Exception:
+            return None
+        if not rules_mod.is_trading_session(n.date()):
+            return None
+        mins = n.hour * 60 + n.minute
+        if not (cls.SESSION_CLOSE_START_ET_MIN <= mins <= cls.SESSION_CLOSE_END_ET_MIN):
+            return None
+        return str(n.date())
+
+    def _maybe_record_session_close(self, con_id, close_price, entry_debit, quantity,
+                                    is_official_mark=True, now=None):
+        """Feed one official closing mark into the trail confirmation, if this cycle is running in
+        the post-close window of a completed regular session. Idempotent across the many cycles in
+        that window (State.record_session_close ignores an already-recorded session).
+
+        `is_official_mark` MUST be False when the price came from the streaming-quote fallback
+        rather than the broker's portfolio mark: an inferred/stale price is a MISSING close, and the
+        contract says a missing close does not count and is never guessed. Fully wrapped -- a bug in
+        confirmation bookkeeping may never break the exit path."""
+        try:
+            if not is_official_mark:
+                return None
+            session_date = self._completed_session_date(now)
+            if session_date is None:
+                return None
+            st = self.state_manager.state
+            before = st.is_trail_armed(con_id)
+            rec = st.record_session_close(
+                con_id, session_date, close_price, entry_debit, quantity,
+                self.config.rules.trailing.activation_gain_pct)
+            if not before and rec["armed_at"] is not None:
+                print(f"[TRAIL] con_id={con_id}: trail ARMED after 2 consecutive qualifying "
+                      f"closes (session {session_date}, close={close_price:.4f}, "
+                      f"activation=+{self.config.rules.trailing.activation_gain_pct:.1f}%); "
+                      f"peak_since_arm seeded from THIS close")
+            return rec
+        except Exception as e:
+            print(f"[WARN] trail session-close bookkeeping failed for con_id={con_id}: {e} "
+                  "(continuing; the position stays unarmed)")
+            return None
 
     def _maybe_write_reload_ticket(self, con_id, symbol, trigger, quantity, entry_debit,
                                    fill_px, fill_status, *, fill_key=None, je=None) -> bool:
@@ -2270,7 +2919,7 @@ class ExitManager:
         self._load_journal()
 
         # EXTERNAL-FILL CAPTURE (2026-07-03): fold EVERY IBKR account execution -- including
-        # Trevor's MANUAL / direct-in-TWS trades -- into the training dataset. READ-ONLY
+        # the operator's MANUAL / direct-in-TWS trades -- into the training dataset. READ-ONLY
         # (reqExecutions + commissionReport); reuses this cycle's live IB handle; NEVER places
         # an order. Best-effort + never raises into the exit path.
         await self._capture_external_fills_safe()
@@ -2310,9 +2959,12 @@ class ExitManager:
             print("[CYCLE] reconciliation UNSAFE - clean positions still get stops; only "
                   "reconcile-inconsistent con_ids are withheld (entries suppressed globally)")
 
-        # Get live positions
+        # Get live positions.
+        # SHORT VISIBILITY (2026-07-26): ONE broker read, three books. `live_positions` stays the
+        # LONG-ONLY book that every consumer below already expects -- the short and stock books
+        # are additive channels handled by _report_short_positions / _process_short_assignments.
         try:
-            live_positions = await self.ib_conn.get_positions()
+            live_positions, live_shorts, live_stocks = await self._fetch_position_book()
         except Exception as e:
             print(f"[ERROR] Could not fetch positions: {e}")
             return
@@ -2330,9 +2982,25 @@ class ExitManager:
         # arc is never invisible to the dataset. Runs before prune (mark path still intact) and
         # before the managed-position early-return (an expired position is not "managed").
         try:
-            await self._process_expiries(live_positions)
+            await self._process_expiries(live_positions, live_shorts=live_shorts)
         except Exception as e:
             print(f"[WARN] expiry terminal-logging errored (continuing): {e}")
+
+        # SHORT VISIBILITY (2026-07-26). Both run BEFORE the "no managed positions" early-return
+        # below: an account holding nothing but a cash-secured put has an empty LONG book, and
+        # that is exactly the case that used to print "No positions to evaluate" and go quiet on
+        # a live, unstopped, real-money position.
+        #   (1) assignment/disappearance: a journaled short that left the option book. Runs
+        #       first so an assigned put is closed out rather than re-reported as open.
+        #   (2) the short report: correctly signed unrealized P&L + an explicit UNMANAGED flag.
+        try:
+            await self._process_short_assignments(live_shorts, live_stocks)
+        except Exception as e:
+            print(f"[WARN] short assignment check errored (continuing): {e}")
+        try:
+            await self._report_short_positions()
+        except Exception as e:
+            print(f"[WARN] short reporting errored (continuing): {e}")
 
         # RECORD-ONLY housekeeping: drop excursion/mark tracking for contracts no longer active
         # (not live at the broker AND not journaled) so state.json / mark paths stay bounded
@@ -2371,7 +3039,7 @@ class ExitManager:
             # size a second SELL from the old quantity (or sell a now-flat contract).  Refresh both
             # sides of the broker book and fail closed if either read is unavailable.
             try:
-                live_positions = await self.ib_conn.get_positions()
+                live_positions, live_shorts, live_stocks = await self._fetch_position_book()
                 live_open_orders_raw = await self.ib_conn.get_open_orders(
                     short_leg_con_ids=set(getattr(self, "_spread_short_legs", {}).keys()))
                 live_open_orders = {
@@ -2401,6 +3069,20 @@ class ExitManager:
             pos_data = live_positions.get(con_id)
             if pos_data is None:
                 continue
+
+            # BACKSTOP (2026-07-26): the long/short split upstream already guarantees this, but
+            # assert it here too. Everything downstream of this list -- rules.py's stop/target
+            # comparisons, order.py's hardcoded SELL, state.py's peak tracking -- is long-only,
+            # and a short reaching it would produce a WRONG-SIDE order on real money rather than
+            # a visible error. Cheap, explicit, and loud.
+            try:
+                if int(getattr(pos_data, "quantity", 0) or 0) < 0:
+                    print(f"[ERROR] con_id={con_id} is SHORT (quantity="
+                          f"{getattr(pos_data, 'quantity', None)}) and reached the long-only "
+                          "management path; refusing to manage it (see _report_short_positions)")
+                    continue
+            except (TypeError, ValueError):
+                pass
 
             # Check if already in-flight (being closed)
             in_flight = self.state_manager.state.get_in_flight(con_id)
@@ -2593,6 +3275,10 @@ class ExitManager:
 
             # PREFER IBKR marking over the (possibly stale) streaming quote.
             current_price = _mark.get(con_id, quote["price"])
+            # Is this price the broker's own mark (the thing that becomes the OFFICIAL CLOSE after
+            # 16:00 ET), or the streaming-quote fallback? Only the former may advance the trail's
+            # session confirmation -- an inferred price is a MISSING close (Sol audit R5 R1).
+            _official_mark = con_id in _mark
 
             # Journaled spread: value the position as the NET (long - short) so the same
             # profit/stop/time rules apply to the spread as a unit. Never evaluate on the
@@ -2607,6 +3293,8 @@ class ExitManager:
                         print(f"[WARN] No price (mark or quote) for spread short leg of con_id={con_id}, skipping")
                         continue
                     short_px = short_quote["price"]
+                # A spread's net price is only an official close when BOTH legs are broker marks.
+                _official_mark = _official_mark and (scid in _mark)
                 current_price = current_price - short_px
 
             # Get entry debit from journal (or estimate from avg_cost if not in journal)
@@ -2683,17 +3371,7 @@ class ExitManager:
                           if entry_debit and entry_debit > 0 else None)
                 _tp_e = _je_e.get("profit_target_pct") or getattr(self.config.rules, "profit_target_pct", None)
                 _sl_e = _je_e.get("stop_pct") or getattr(self.config.rules, "stop_pct", None)
-                _days_held = None
-                _ets = _je_e.get("ts")
-                if _ets:
-                    try:
-                        _et = datetime.fromisoformat(str(_ets).replace("Z", "+00:00"))
-                        if _et.tzinfo is None:
-                            from datetime import timezone as _tz
-                            _et = _et.replace(tzinfo=_tz.utc)
-                        _days_held = round((datetime.now().astimezone() - _et).total_seconds() / 86400.0, 3)
-                    except Exception:
-                        _days_held = None
+                _days_held = _calendar_days_elapsed(_je_e.get("fill_ts") or _je_e.get("ts"))
                 _und = None
                 try:
                     _und = ((self._price_stats or {}).get(symbol) or {}).get("last")
@@ -2725,9 +3403,25 @@ class ExitManager:
             except Exception as _ee:
                 print(f"[WARN] mark enrichment build failed for con_id={con_id} (recording plain mark): {_ee}")
                 _enrich = None
-            self.state_manager.state.record_mark(
+            _v6_exc = self.state_manager.state.record_mark(
                 con_id, current_price, entry_debit, quantity, path_cap=self.MARK_PATH_CAP,
                 enrich=_enrich)
+            try:  # v6 raw-event capture: periodic position-path sample (fail-open)
+                from exitmgr import capture_v6 as _v6
+                _v6.on_position_mark(con_id, symbol=symbol, enrich=_enrich, pnl_pct=_v6_exc)
+            except Exception:
+                pass
+            # ---------------- CONFIRMED TRAIL (2026-07-26, Sol audit R5 R1) ----------------
+            # 1. In the post-close window, feed this session's OFFICIAL closing mark into the
+            #    confirmation. Two CONSECUTIVE qualifying closes -- and nothing else -- arm a trail.
+            # 2. Ratchet peak_since_arm. A no-op while unarmed, which is exactly what stops a
+            #    pre-confirmation spike from setting the eventual floor.
+            # Order matters: the arming close seeds peak_since_arm BEFORE the ratchet sees it.
+            self._maybe_record_session_close(con_id, current_price, entry_debit, quantity,
+                                             is_official_mark=_official_mark)
+            self.state_manager.state.record_trail_peak(con_id, current_price)
+            _trail_armed = self.state_manager.state.is_trail_armed(con_id)
+            _peak_since_arm = self.state_manager.state.trail_peak_since_arm(con_id)
             # Per-position sell levels the model recommended (journaled); fall back to the global
             # config rule when a level wasn't specified for this trade.
             rules = self.config.rules
@@ -2744,9 +3438,7 @@ class ExitManager:
             # NO stop. Force the constructor-default magnitude so every open trade is always stopped.
             # This only raises a stop into existence; it never loosens an existing one, and the TP
             # tiering never touches it.
-            if rules.stop_pct is None or float(rules.stop_pct) <= 0:
-                from dataclasses import replace as _rp_stop
-                rules = _rp_stop(rules, stop_pct=_STOP_BACKSTOP_PCT)
+            rules = _enforce_airtight_stop(rules)
             # Apply the model's per-position decision (monotonic guardrails). A take_profit/cut
             # forces an immediate exit this cycle; otherwise the (possibly tuned) rules drive eval.
             forced = None
@@ -2755,7 +3447,7 @@ class ExitManager:
                 rules, forced = self._apply_decision(
                     rules, decision, current_price, entry_debit, quantity, con_id, symbol,
                     regime=self._regime)
-            # MODEL JUDGMENT = PRIMARY, TIER CEILING = BACKSTOP (2026-07-03, per Trevor: "adopt my
+            # MODEL JUDGMENT = PRIMARY, TIER CEILING = BACKSTOP (2026-07-03, per the operator: "adopt my
             # STRATEGIES not my JUDGMENTS -- let winners run to a level IT sees worthy of selling").
             # The pot-tiered tp_max_pct ceiling is stamped onto the journal profit_target_pct at
             # ENTRY; without this, evaluate_position's fixed profit_target (priority 1) would
@@ -2767,7 +3459,7 @@ class ExitManager:
             # NOTE: this ONLY relaxes the take-profit ceiling; the protective stop is never loosened.
             rules = self._reconcile_ceiling_backstop(
                 rules, decision,
-                armed=(str(con_id) in self.state_manager.state.trail_armed))
+                configured=(str(con_id) in self.state_manager.state.trail_configured))
             # PART 2 (2026-07-03) GAIN-PROTECTING AUTO-TRAIL SAFETY FLOOR. Independently of the model
             # and of the global rules.trailing toggle, guarantee a WIDE protective trailing stop for
             # any winner whose PEAK gain has cleared auto_trail.activation_gain_pct, so an up-big
@@ -2775,7 +3467,8 @@ class ExitManager:
             # suppresses the ceiling and NEVER touches the stop; rides the monotonic peak UP.
             rules, _auto_armed = self._apply_auto_trail(
                 rules, getattr(self.config.rules, "auto_trail", None),
-                peaks.get(k), entry_debit, quantity)
+                peaks.get(k), entry_debit, quantity,
+                armed=_trail_armed, peak_since_arm=_peak_since_arm)
             if _auto_armed:
                 print(f"[EVAL] con_id={con_id} ({symbol}): auto-trail safety floor active "
                       f"(keep {(1 - rules.trailing.giveback_fraction):.0%} of peak gain)")
@@ -2792,9 +3485,11 @@ class ExitManager:
                     entry_debit=entry_debit,
                     current_price=current_price,
                     days_to_expiry=dte,
-                    peak_price=peaks.get(k),
+                    peak_price=peaks.get(k),      # lifetime peak: audit/MFE evidence ONLY
                     rules=rules,
                     already_trimmed=already_trimmed,
+                    trail_armed=_trail_armed,     # persisted two-close confirmation
+                    peak_since_arm=_peak_since_arm,
                 )
 
             if trigger:

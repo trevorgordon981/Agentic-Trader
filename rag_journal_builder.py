@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build Trevor's daily journal for the Alfred RAG "memory" domain by extracting
+Build the operator's daily journal for the Alfred RAG "memory" domain by extracting
 key facts from Alfred's conversation history.
 
 Every run, for each target day, it reads that day's messages from
@@ -49,9 +49,9 @@ def _date_block(target):
 
 
 SYSTEM_PROMPT = (
-    "You maintain Trevor's daily journal. You are given timestamped excerpts from "
+    "You maintain the operator's daily journal. You are given timestamped excerpts from "
     "his assistant Alfred's conversations on a single day. Extract the concrete "
-    "facts, events, decisions, and changes that actually happened — what Trevor "
+    "facts, events, decisions, and changes that actually happened — what the operator "
     "did, decided, learned, built, traded, or experienced. Be specific and factual.\n\n"
     "Output GitHub-flavored markdown grouped under only the relevant headings from: "
     "## Health, ## Trading, ## Infra & Homelab, ## Decisions, ## Personal, ## Learnings. "

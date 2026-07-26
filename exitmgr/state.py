@@ -9,6 +9,44 @@ from typing import Optional, Dict, List
 from pathlib import Path
 
 
+#: The exact shape Sol audit R5 R1 specifies for the per-con_id trail confirmation record.
+TRAIL_CONFIRMATION_FIELDS = ("last_session", "consecutive_qualifying_closes",
+                             "armed_at", "peak_since_arm")
+
+
+def _normalize_trail_confirmation(raw) -> dict:
+    """Coerce a persisted (or absent, or partial, or corrupt) confirmation blob into the exact
+    four-field record.  Anything unreadable degrades to UNARMED -- never to armed."""
+    rec = {"last_session": None, "consecutive_qualifying_closes": 0,
+           "armed_at": None, "peak_since_arm": None}
+    if not isinstance(raw, dict):
+        return rec
+    ls = raw.get("last_session")
+    if isinstance(ls, str) and ls:
+        rec["last_session"] = ls[:10]
+    try:
+        rec["consecutive_qualifying_closes"] = max(0, min(2, int(raw.get(
+            "consecutive_qualifying_closes", 0) or 0)))
+    except (TypeError, ValueError):
+        rec["consecutive_qualifying_closes"] = 0
+    at = raw.get("armed_at")
+    if isinstance(at, str) and at:
+        rec["armed_at"] = at
+    try:
+        pk = raw.get("peak_since_arm")
+        pk = None if pk is None else float(pk)
+        if pk is not None and (pk != pk or pk <= 0):
+            pk = None
+        rec["peak_since_arm"] = pk
+    except (TypeError, ValueError):
+        rec["peak_since_arm"] = None
+    # An "armed" record with no ratchet price cannot fire a floor -- treat it as unarmed rather
+    # than letting evaluate_trailing_stop meet an armed flag with nothing to measure from.
+    if rec["armed_at"] is not None and rec["peak_since_arm"] is None:
+        rec["armed_at"] = None
+    return rec
+
+
 @dataclass
 class InFlightClose:
     """Durable record of a pending close order for a contract.
@@ -82,14 +120,27 @@ class State:
     # Persisted so a process bounce doesn't forget a trim and re-trim the runner. Backward-compatible:
     # an old state file with no `scaled_out` key loads as empty (no position considered trimmed).
     scaled_out: Dict[str, bool] = field(default_factory=dict)
-    # TRAIL-ARMED (2026-07-03 Part 1): con_id(str)->True once the MODEL has armed a trailing stop
-    # for this position (a decision arm_trail). Persisted so the take-profit CEILING stays
-    # SUPPRESSED across SUBSEQUENT cycles (incl. plain 'hold') for the life of the position --
-    # otherwise the fixed pot-tier profit_target would snap back and force-close (clip) a runner the
-    # model chose to let RUN. Cleared on close via prune_tracking. Backward-compatible: an old state
-    # file with no `trail_armed` key loads as {} (nothing armed). Gates ONLY the take-profit side;
-    # never the protective stop.
-    trail_armed: Dict[str, bool] = field(default_factory=dict)
+    # TRAIL-CONFIGURED (2026-07-03 Part 1; RENAMED from `trail_armed` on 2026-07-26 per Sol audit
+    # R5 R1): con_id(str)->True once the MODEL asked for a trailing stop on this position (a
+    # decision arm_trail). Persisted so the take-profit CEILING stays SUPPRESSED across SUBSEQUENT
+    # cycles (incl. plain 'hold') for the life of the position -- otherwise the fixed pot-tier
+    # profit_target would snap back and force-close (clip) a runner the model chose to let RUN.
+    # Cleared on close via prune_tracking. Gates ONLY the take-profit side; never the protective
+    # stop, and -- this is the rename -- it does NOT arm anything. See trail_confirmation.
+    trail_configured: Dict[str, bool] = field(default_factory=dict)
+    # CONFIRMED TRAIL (2026-07-26, Sol audit R5 R1). con_id(str) -> the confirmation record
+    #   {last_session, consecutive_qualifying_closes, armed_at, peak_since_arm}
+    # A trail is ARMED only after TWO CONSECUTIVE completed regular sessions whose OFFICIAL
+    # CLOSING mark was at or above the activation gain versus entry. Intraday peaks never count; a
+    # session with no closing mark does not count and is never inferred from lifetime MFE; a close
+    # below the threshold resets the streak; consecutiveness follows the exchange calendar.
+    # `peak_since_arm` is seeded FROM THE SECOND QUALIFYING CLOSE and ratchets only thereafter, so
+    # a one-day pre-confirmation spike cannot poison the floor. The monotonic lifetime
+    # `peak_prices` above stays audit/MFE evidence and must never arm the trail or set its floor.
+    # MIGRATION: a state file written before this change has no `trail_confirmation` key and
+    # therefore loads as {} -> EVERY existing open position is UNARMED, deliberately, with no
+    # MFE/peak-based backfill. Re-arming requires two fresh qualifying closes.
+    trail_confirmation: Dict[str, dict] = field(default_factory=dict)
 
     def record_mark(self, con_id: int, current_price: float, entry_debit: Optional[float],
                     quantity: int, ts: Optional[str] = None, path_cap: int = 5000,
@@ -141,6 +192,113 @@ class State:
                 mp.append(mark)
         return exc
 
+    # ------------------------------------------------------- CONFIRMED TRAIL (Sol audit R5 R1)
+    def trail_confirmation_for(self, con_id) -> dict:
+        """The normalized confirmation record for `con_id` (never None, never partial).  Returns a
+        COPY: mutate only through record_session_close / record_trail_peak / clear_trail_state."""
+        return _normalize_trail_confirmation(self.trail_confirmation.get(str(con_id)))
+
+    def is_trail_armed(self, con_id) -> bool:
+        """The ONE authoritative armed bit.  True IFF the multi-session confirmation actually
+        completed for this position.  Never derived from rules.trailing.enabled, from a model
+        arm_trail, or from the lifetime peak/MFE."""
+        return self.trail_confirmation_for(con_id)["armed_at"] is not None
+
+    def trail_peak_since_arm(self, con_id) -> Optional[float]:
+        """The post-arm ratchet price the protected floor is measured from (None when unarmed)."""
+        return self.trail_confirmation_for(con_id)["peak_since_arm"]
+
+    def record_session_close(self, con_id, session_date, close_price, entry_debit, quantity,
+                             activation_gain_pct, ts: Optional[str] = None) -> dict:
+        """Record ONE completed regular session's OFFICIAL CLOSING mark for a position and advance
+        (or reset) the trail confirmation.  This is the ONLY thing that can arm a trail.
+
+        Contract (Sol audit R5 R1):
+          * a close at/above entry*(1+activation_gain_pct/100) QUALIFIES;
+          * the streak advances only when this session is the very NEXT trading session after the
+            last recorded one (exchange calendar: Fri->Mon advances, Fri->Tue restarts at 1);
+          * a close BELOW the threshold resets the streak to 0;
+          * a session with no closing mark is simply never recorded -- it does not count, and it
+            breaks consecutiveness because the next recorded session will not be adjacent.  It is
+            never inferred from lifetime MFE;
+          * on the SECOND consecutive qualifying close the trail arms ONCE and `peak_since_arm` is
+            seeded FROM THAT CLOSE (never from the lifetime peak);
+          * re-recording the same session, or an out-of-order/stale one, is a no-op -- a rerun of
+            the cycle can never double-count a session into an arm.
+
+        Unusable inputs (bad date, non-numeric/NaN/non-positive price, bad basis) leave the record
+        untouched: an unreadable close is a MISSING close, never a qualifying one.
+        Returns the resulting record."""
+        k = str(con_id)
+        rec = self.trail_confirmation_for(con_id)
+
+        from exitmgr.rules import _as_date, is_next_trading_session
+        sd = _as_date(session_date)
+        if sd is None:
+            return rec
+        sd = str(sd)
+
+        try:
+            q = int(quantity)
+            ed = float(entry_debit)
+            px = float(close_price)
+            act = float(activation_gain_pct)
+        except (TypeError, ValueError):
+            return rec
+        if q <= 0 or ed <= 0 or px != px or px <= 0 or ed != ed:
+            return rec
+        entry_per_share = ed / (100.0 * q)
+        if entry_per_share <= 0:
+            return rec
+
+        last = rec["last_session"]
+        if last is not None and sd <= last:
+            # already recorded (idempotent) or arrived out of order -- never counted twice
+            return rec
+
+        qualifies = px >= entry_per_share * (1.0 + act / 100.0)
+        if not qualifies:
+            n = 0
+        elif last is not None and is_next_trading_session(last, sd):
+            n = int(rec["consecutive_qualifying_closes"]) + 1
+        else:
+            # first-ever recorded close, or a gap (a session in between produced no close):
+            # the streak restarts AT this session rather than continuing.
+            n = 1
+
+        rec["last_session"] = sd
+        rec["consecutive_qualifying_closes"] = min(n, 2)
+        if n >= 2 and rec["armed_at"] is None:
+            rec["armed_at"] = ts or datetime.now().astimezone().isoformat()
+            rec["peak_since_arm"] = px   # FROM THIS CLOSE -- not from the lifetime peak
+        self.trail_confirmation[k] = rec
+        return rec
+
+    def record_trail_peak(self, con_id, current_price) -> Optional[float]:
+        """Ratchet `peak_since_arm` upward.  A NO-OP while unarmed -- that is what stops a pre-arm
+        spike from ever setting the post-arm floor.  Returns the current peak_since_arm."""
+        rec = self.trail_confirmation_for(con_id)
+        if rec["armed_at"] is None:
+            return None
+        try:
+            px = float(current_price)
+        except (TypeError, ValueError):
+            return rec["peak_since_arm"]
+        if px != px or px <= 0:
+            return rec["peak_since_arm"]
+        if rec["peak_since_arm"] is None or px > rec["peak_since_arm"]:
+            rec["peak_since_arm"] = px
+            self.trail_confirmation[str(con_id)] = rec
+        return rec["peak_since_arm"]
+
+    def clear_trail_state(self, con_id) -> None:
+        """Drop ALL trail state for a contract: the confirmation record (last_session,
+        consecutive_qualifying_closes, armed_at, peak_since_arm) and the model-configured flag.
+        Called on close/prune so a re-entry of the same conId can never inherit an arm."""
+        k = str(con_id)
+        self.trail_confirmation.pop(k, None)
+        self.trail_configured.pop(k, None)
+
     def prune_tracking(self, active_con_ids) -> None:
         """Drop per-position excursion/mark tracking for contracts that are no longer active
         (not live at the broker AND not in the journal). RECORD-ONLY housekeeping so the
@@ -150,7 +308,7 @@ class State:
         active = {str(c) for c in (active_con_ids or [])}
         for d in (self.peak_prices, self.mfe_pct, self.mae_pct,
                   self.mfe_ts, self.mae_ts, self.mark_path, self.scaled_out,
-                  self.trail_armed):
+                  self.trail_configured, self.trail_confirmation):
             for kk in [k for k in d if k not in active]:
                 del d[kk]
 
@@ -223,7 +381,20 @@ class StateManager:
                 mae_ts=data.get("mae_ts", {}),
                 mark_path=data.get("mark_path", {}),
                 scaled_out=data.get("scaled_out", {}),  # backward-compatible: absent -> {}
-                trail_armed=data.get("trail_armed", {}),  # backward-compatible: absent -> {}
+                # MIGRATION (2026-07-26, Sol R5 R1). `trail_armed` was the MODEL-CONFIGURED flag
+                # misnamed as an armed bit; it is now `trail_configured`. Read the new key when
+                # present, else the legacy one, so an in-place upgrade keeps every open runner's
+                # take-profit ceiling suppressed exactly as before.
+                trail_configured=(data.get("trail_configured")
+                                  if data.get("trail_configured") is not None
+                                  else data.get("trail_armed", {})) or {},
+                # MIGRATION: absent -> {} -> every position loads UNARMED. There is deliberately
+                # NO backfill from peak_prices/mfe_pct: a lifetime intraday excursion is exactly
+                # the evidence the confirmed-trail contract refuses to accept as an arm.
+                trail_confirmation={
+                    str(k): _normalize_trail_confirmation(v)
+                    for k, v in (data.get("trail_confirmation") or {}).items()
+                },
             )
         except (json.JSONDecodeError, TypeError, KeyError) as e:
             # Corrupted state file - treat as empty but log
@@ -247,7 +418,13 @@ class StateManager:
             "mae_ts": self.state.mae_ts,
             "mark_path": self.state.mark_path,
             "scaled_out": self.state.scaled_out,
-            "trail_armed": self.state.trail_armed,
+            "trail_configured": self.state.trail_configured,
+            # ROLLBACK SAFETY: mirror the model-configured flag under its legacy key so reverting
+            # to the pre-2026-07-26 code still finds it and does not un-suppress the take-profit
+            # ceiling on every open runner. The legacy key was NEVER an armed bit, so writing it
+            # cannot resurrect an arm: the old code's `armed=` reads it as the same flag it wrote.
+            "trail_armed": self.state.trail_configured,
+            "trail_confirmation": self.state.trail_confirmation,
         }
 
         # Write + fsync the temp file, atomically replace, then fsync the directory.  A rename

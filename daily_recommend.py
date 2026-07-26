@@ -26,8 +26,13 @@ from exitmgr.account import get_pot_snapshot
 from exitmgr.connection import IBConnection
 from exitmgr.ibkr import Stock, Option, Order, pick_chain, strikes_near, underlying_price
 from exitmgr.strategist import propose, discover_names, propose_one, TradeIdea
-from exitmgr.trader import ResolvedOrder, order_summary, contract_snapshot, audit, _trading_day
-from exitmgr import approval, construction, entry_safety, research, trade_capture, risk
+from exitmgr.trader import (
+    ResolvedOrder, order_summary, contract_snapshot, audit, _trading_day,
+    # The structure gate is IMPORTED from trader.py, which itself imports the allow-list from
+    # strategist.py. One list, one gate, one place to change it -- this file declares neither.
+    debit_structure_ok, _structure_implied_right, _require_allowed_structure,
+)
+from exitmgr import apewisdom, approval, construction, entry_safety, research, trade_capture, risk
 from exitmgr.config import ConstructionConfig, construction_from_dict
 from exitmgr.slate_lock import slate_active_guard
 from exitmgr.market import fetch_universe_quotes, usable_price
@@ -53,7 +58,7 @@ FILLS_PATH = "./fills.log"  # entry-fill confirmations (SEPARATE file: trades.lo
                             # key newest-line-per-contract_id, so lifecycle lines can't go there)
 
 # 2026-07-03 gate H2: the sector/correlation cap (risk.py #6b) + single-name-agg cap (#6) only
-# ran on the autonomous trader path. The daily slate -- Trevor's PRIMARY entry path -- never
+# ran on the autonomous trader path. The daily slate -- the operator's PRIMARY entry path -- never
 # called risk.evaluate_trade, so the flagship concentration protection was dormant where trades
 # actually originate. We now SURFACE a warning (never hard-block; the human tap decides) if a
 # candidate would breach either cap. _RISK_LIMITS is loaded from config.yaml `trading:` in run()
@@ -117,7 +122,7 @@ def _concentration_notes(open_positions, underlying, candidate_debit, is_index, 
     of (warning_text, audit_kwargs); EMPTY when nothing breaches (so no head note is added and there
     is NO behavior change on an under-cap idea). Mirrors risk.py #6/#6b math exactly -- same $
     premium-at-risk basis, same caps, same 'index ETFs exempt' rule -- but is SURFACE-ONLY: the
-    slate has a human tap, so we warn and let Trevor decide rather than hard-block."""
+    slate has a human tap, so we warn and let the operator decide rather than hard-block."""
     notes = []
     u = (underlying or "").upper()
     if is_index or pot <= 0:
@@ -147,6 +152,80 @@ def _concentration_notes(open_positions, underlying, candidate_debit, is_index, 
                      exposure=round(sec_exposure, 2), cap=round(sec_cap, 2), pot=round(pot, 2)),
             ))
     return notes
+
+
+async def _probe_apewisdom_row(ib, row, blocked_sector_keywords, semaphore):
+    """Fail-closed eligibility probe for an external social-attention candidate.
+
+    It must be a liquid USD equity/ETF, a qualified SMART stock, and have a
+    usable SMART options chain before it can enter either discovery consumer.
+    """
+    ticker = row["ticker"]
+    try:
+        async with semaphore:
+            profile = await asyncio.wait_for(
+                asyncio.to_thread(apewisdom.security_profile, ticker), timeout=20)
+            allowed, reason = apewisdom.profile_eligible(profile, blocked_sector_keywords)
+            if not allowed:
+                return None, reason
+            qualified = await asyncio.wait_for(
+                ib.qualifyContractsAsync(Stock(ticker, "SMART", "USD")), timeout=20)
+            stock = next((c for c in qualified
+                          if getattr(c, "conId", None)
+                          and getattr(c, "secType", None) == "STK"
+                          and getattr(c, "currency", None) == "USD"), None)
+            if stock is None:
+                return None, "smart_usd_stock_unqualified"
+            params = await asyncio.wait_for(
+                ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId), timeout=20)
+            if pick_chain(params, ticker) is None:
+                return None, "no_smart_option_chain"
+            return row, "eligible"
+    except Exception as exc:
+        return None, f"probe_error:{type(exc).__name__}"
+
+
+async def _load_apewisdom_pool(ib, tr, audit_path):
+    """Fetch and screen ApeWisdom. Any failure returns an empty pool; the normal slate continues."""
+    cfg = tr.get("apewisdom_discovery") or {}
+    if not cfg.get("enabled", False):
+        return None, []
+    try:
+        source_limit = max(1, min(100, int(cfg.get("source_limit", 20))))
+        probe_limit = max(1, min(source_limit, int(cfg.get("probe_limit", 12))))
+        feed = await asyncio.to_thread(
+            apewisdom.load_trends, cfg.get("filter", "all-stocks"), source_limit)
+        initial = apewisdom.initial_rows(feed, blocked=tr.get("blocked_names", []))[:probe_limit]
+        semaphore = asyncio.Semaphore(4)
+        probed = await asyncio.gather(*[
+            _probe_apewisdom_row(ib, row, tr.get("blocked_sector_keywords", []), semaphore)
+            for row in initial
+        ])
+        eligible = [row for row, _reason in probed if row is not None]
+        dropped = [{"ticker": initial[i]["ticker"], "reason": reason}
+                   for i, (row, reason) in enumerate(probed) if row is None]
+        audit(audit_path, "apewisdom_source_screen",
+              source_url=feed.get("source_url"), stale=bool(feed.get("stale")),
+              age_seconds=feed.get("age_seconds"), fetched=len(feed.get("results", [])),
+              probed=len(initial), eligible=[r["ticker"] for r in eligible], dropped=dropped,
+              signal_type="attention_only", trade_authority=False, training_eligible=False)
+        return feed, eligible
+    except Exception as exc:
+        audit(audit_path, "apewisdom_source_error", error=f"{type(exc).__name__}: {exc}")
+        return None, []
+
+
+def _merge_discovery_candidates(*groups):
+    """Stable dedupe for the ordinary and ApeWisdom new-name rounds."""
+    out, seen = [], set()
+    for group in groups:
+        for ticker, reason in group or []:
+            ticker = str(ticker).upper()
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            out.append((ticker, reason))
+    return out
 
 
 def _watch_entry_fills(placed_watch, token, audit_path):
@@ -237,10 +316,135 @@ def _score_tag(s):
     return "_below-average / middle_"
 
 
+def user_directed_idea(args) -> TradeIdea:
+    """BYPASS 1 CLOSED (2026-07-26).
+
+    `--structure` was an ARBITRARY string handed straight to TradeIdea(): this idea is never
+    parsed by the strategist, so strategist._require_allowed_structure() never ran on it.
+        daily_recommend.py --ticker AAPL --structure "naked call"
+    therefore built and proposed an idea LABELLED "naked call". What it actually constructed was
+    a long call -- _resolve() branches on the substring "spread" and takes the option right from
+    `direction`, never from the structure string -- so nothing was ever sold short on this path.
+    The damage was to the RECORD: a long call filed in the journal, and thence in the training
+    corpus, under the name of a short structure the account never held.
+
+    Raises ValueError for a structure that is not on the allow-list, or one that contradicts
+    --right. It is NEVER coerced back to the "long call"/"long put" default: silently swapping in
+    a different structure is the same mislabelling defect wearing a different hat."""
+    direction = "bullish" if args.right.upper() == "C" else "bearish"
+    structure = args.structure or ("long call" if direction == "bullish" else "long put")
+    idea = TradeIdea(underlying=args.ticker.upper(),
+                     is_index=args.ticker.upper() in ("SPY", "QQQ", "IWM"),
+                     direction=direction, structure=structure,
+                     target_dte=args.dte, target_delta=args.delta,
+                     est_debit_usd=0.0, conviction=int(args.conviction),
+                     thesis=args.thesis, profit_target_pct=args.tp, stop_pct=args.stop)
+    ok, why = debit_structure_ok(idea)
+    if not ok:
+        raise ValueError("--structure %r refused. %s" % (structure, why))
+    return idea
+
+
+def apply_structure_override(idea, ovr):
+    """BYPASS 3 CLOSED (2026-07-26). Returns (effective_idea, error, note).
+
+    A Slack approval reply may flip/set the direction and may switch single<->spread. The result
+    was written onto the idea with dataclasses.replace() and used directly, so the allow-list
+    never saw it.
+
+    The override VOCABULARY was never the hole: approval.parse_structure_override() only ever
+    emits 'single' or 'spread', and both map to structures already on the allow-list. The hole was
+    the DIRECTION half, which rewrites the direction and LEAVES THE STRUCTURE ALONE. An idea
+    approved as a "bull call spread" came out of here as ("bull call spread", bearish); _resolve()
+    then read the right off `direction` and built a PUT vertical, which the journal recorded as a
+    bull call spread. Same silent mislabelling, arriving by a different door.
+
+    RESOLUTION: when a direction override makes the structure's own noun stale, the structure is
+    RELABELLED to match -- keeping its single-vs-spread shape, using the same canonical strings the
+    'single'/'spread' override already uses -- and the relabel is returned as `note` so it is
+    audited and shown in Slack. This is not a silent coercion and not a guess: the human has just
+    said, explicitly, which direction they want, so the direction is authoritative and the stale
+    noun is the error. THE ORDER IS UNCHANGED BY THIS -- the same contract was already being
+    built; only the name attached to it is corrected.
+
+    Anything still contradictory or off-list after that (a contradiction the idea arrived with,
+    with no direction override to resolve it) is REFUSED via `error`; the caller must not place."""
+    from dataclasses import replace as _replace
+    # FAIL CLOSED ON THE WAY IN. An idea whose own structure is off the allow-list is refused
+    # before ANY override is applied, so no reply can launder it: without this, ("naked call",
+    # bullish) + a bare "flip" relabelled to ("long put", bearish) and passed the gate, and
+    # {"structure": "single"} replaced it outright with "long call". A banned structure must not
+    # be rescuable by a Slack reply -- it should never have reached approval at all.
+    try:
+        _require_allowed_structure("debit", idea.structure)
+    except ValueError as _incoming_exc:
+        return idea, ("structure override refused. STRUCTURE REFUSED: %s" % (_incoming_exc,)), ""
+    nd = idea.direction
+    _dir_overridden = False
+    if ovr.get("direction") == "flip":
+        nd = "bearish" if idea.direction == "bullish" else "bullish"
+        _dir_overridden = True
+    elif ovr.get("direction") in ("bullish", "bearish"):
+        nd = ovr["direction"]
+        _dir_overridden = True
+    ns = idea.structure
+    if ovr.get("structure") == "single":
+        ns = "long put" if nd == "bearish" else "long call"
+    elif ovr.get("structure") == "spread":
+        ns = "put debit spread" if nd == "bearish" else "call debit spread"
+    note = ""
+    # ns is guaranteed to be on the allow-list here: it is either the incoming structure (checked
+    # above) or one of the four canonical strings the 'single'/'spread' override maps to.
+    if _dir_overridden and not ovr.get("structure"):
+        _implied = _structure_implied_right(ns)
+        _want = "C" if nd == "bullish" else "P"
+        if _implied and _implied != _want:
+            _relabelled = (("put debit spread" if nd == "bearish" else "call debit spread")
+                           if "spread" in str(ns).lower()
+                           else ("long put" if nd == "bearish" else "long call"))
+            note = ("structure relabelled %r -> %r to match the direction you set (%s); the "
+                    "single-vs-spread shape and the contract are unchanged" % (ns, _relabelled, nd))
+            ns = _relabelled
+    effective = _replace(idea, direction=nd, structure=ns)
+    ok, why = debit_structure_ok(effective)
+    if not ok:
+        return effective, ("structure override refused. %s" % why), note
+    return effective, "", note
+
+
+def submit_structure_ok(r, idea) -> tuple:
+    """STRUCTURE GATE AT THE MONEY BOUNDARY for this file's OWN placeOrder call -- trader.py's
+    _submit_order_unlocked does not cover the slate path. Returns (ok, reason).
+
+    Checks the same two things the trader's submit-time gate does: the idea's structure is on the
+    allow-list and agrees with its direction, AND the concrete order that was resolved buys the
+    right the structure names. An order carrying NO structure ("" -- nothing was ever declared) is
+    not an allow-list failure; every route that HAS one is gated upstream."""
+    if not getattr(r, "structure", ""):
+        return True, ""
+    ok, why = debit_structure_ok(idea)
+    if not ok:
+        return False, why
+    implied = _structure_implied_right(r.structure)
+    if implied and implied != str(r.right).upper()[:1]:
+        return False, ("resolved order buys a %r but its structure %r names a %s -- filling it "
+                       "would journal the position under a name describing a different trade"
+                       % (r.right, r.structure, "call" if implied == "C" else "put"))
+    return True, ""
+
+
 async def _resolve(ib, idea, available, net_liq=None):
     """Pick the concrete option (nearest expiry to target DTE, strike by delta) and price it via
     OPRA. Single-leg long call/put; sizes to >=1 contract within available funds. None if it
     can't price or even one contract is unaffordable."""
+    # STRUCTURE GATE (2026-07-26): the constructor's own check, the mirror of the one at the top
+    # of trader._resolve_order(). Every debit order this process builds is built here, so an idea
+    # that reached construction by any route -- including one added later -- is refused before a
+    # contract is qualified. A refusal is returned as an ordinary (None, reason), the same shape
+    # every other constructor rejection uses.
+    _ok_struct, _why_struct = debit_structure_ok(idea)
+    if not _ok_struct:
+        return None, _why_struct
     right = "C" if idea.direction == "bullish" else "P"
     stk = (await ib.qualifyContractsAsync(Stock(idea.underlying, "SMART", "USD")))[0]
     params = await ib.reqSecDefOptParamsAsync(idea.underlying, "", "STK", stk.conId)
@@ -356,6 +560,7 @@ async def _resolve(ib, idea, available, net_liq=None):
                 return None, (f"one spread contract ${net*100:,.0f} > available ${available:,.0f}")
             return ResolvedOrder(idea.underlying, right, expiry, float(contract.strike), qty, net,
                                  contract, short_strike=short_strike, short_contract=short_contract,
+                                 structure=str(getattr(idea, "structure", "") or ""),
                                  **enrich), None
         # no affordable short leg -> fall through to the single long leg
 
@@ -363,7 +568,8 @@ async def _resolve(ib, idea, available, net_liq=None):
         return None, f"one contract ${mid*100:,.0f} > available ${available:,.0f}"
     qty = max(1, int(available // (mid * 100)))
     return ResolvedOrder(idea.underlying, right, expiry, float(contract.strike), qty, round(mid, 2),
-                         contract, **enrich), None
+                         contract, structure=str(getattr(idea, "structure", "") or ""),
+                         **enrich), None
 
 
 def _daily_cap_rejected(stage, reason, idea, resolved):
@@ -512,7 +718,7 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
         # A6: no ex-div date available for a spread -- assignment risk could NOT be checked.
         head += "_:grey_question: ex-dividend date unknown — early-assignment risk UNCHECKED_\n"
     # CONCENTRATION / CORRELATION WARNING (2026-07-03 gate H2, SURFACE-ONLY): the daily slate is
-    # Trevor's PRIMARY entry path but never called risk.evaluate_trade, so the sector/correlation
+    # the operator's PRIMARY entry path but never called risk.evaluate_trade, so the sector/correlation
     # cap (risk.py #6b) and single-name-agg cap (#6) never ran where trades originate. SURFACE (do
     # NOT hard-block) if ADDING this trade would breach either -- the human tap still decides,
     # mirroring the earnings-unchecked / ex-div-warn disposition above. FAIL-SAFE: any error logs
@@ -561,7 +767,8 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
     ts = approval.post_proposal(token, channel, msg)
     if ts:
         pending.append((ts, resolved, tp_pct, sl_pct, idea, over_default,
-                        time.monotonic(), decision_id, 0))
+                        time.monotonic(), decision_id, 0, candidates, raw_strategist,
+                        cot, market_context, technical_card))
         audit(audit_path, audit_event, underlying=idea.underlying,
               conviction=idea.conviction, order=order_summary(resolved),
               profit_target_pct=tp_pct, stop_pct=sl_pct, over_default=over_default,
@@ -644,6 +851,7 @@ async def run(args):
     ib = conn.ib
     try:
         disc_ts, disc_cands = None, []
+        _ape_rows, _ape_addable = [], set()
         _raw_slate = None    # verbatim strategist output (model path), for v2 decision capture
         _slate_cot = None    # [m3cot] chain-of-thought (reasoning_content), separate from the answer
         _slate_identity = None
@@ -652,23 +860,38 @@ async def run(args):
         if args.ticker:
             # USER-DIRECTED: you name the trade; it runs the SAME price -> one-tap -> execute ->
             # journal -> exit-manage pipeline as the model slate (no bypass — you still tap to fire it).
-            direction = "bullish" if args.right.upper() == "C" else "bearish"
-            structure = args.structure or ("long call" if direction == "bullish" else "long put")
-            ideas = [TradeIdea(underlying=args.ticker.upper(),
-                               is_index=args.ticker.upper() in ("SPY", "QQQ", "IWM"),
-                               direction=direction, structure=structure,
-                               target_dte=args.dte, target_delta=args.delta,
-                               est_debit_usd=0.0, conviction=int(args.conviction),
-                               thesis=args.thesis, profit_target_pct=args.tp, stop_pct=args.stop)]
+            # BYPASS 1: construction moved into user_directed_idea(), which gates --structure
+            # against the allow-list. Identical output for every permitted structure; a refused
+            # one raises ValueError instead of being proposed under a false name.
+            _ud_idea = user_directed_idea(args)
+            direction, structure = _ud_idea.direction, _ud_idea.structure
+            ideas = [_ud_idea]
             audit(audit_path, "user_directed_proposal", underlying=args.ticker.upper(),
                   direction=direction, structure=structure, dte=args.dte, delta=args.delta)
         else:
             _all = sorted({"SPY", "QQQ", "IWM"} | {n.upper() for n in tr.get("approved_names", [])})
             _core = ["SPY", "QQQ", "IWM"]; _watch = [n for n in _all if n not in _core]
             _off = datetime.now(timezone.utc).timetuple().tm_yday % max(1, len(_watch))
-            names = _core + (_watch[_off:] + _watch[:_off])[:35]  # rotating deep-research cap; all approved names still tradeable via open universe
+            _base_names = _core + (_watch[_off:] + _watch[:_off])[:35]  # rotating deep-research cap
+            _ape_feed, _ape_probe_rows = await _load_apewisdom_pool(ib, tr, audit_path)
+            _candidate_names = apewisdom.merge_research_universe(_base_names, _ape_probe_rows)
             today = str(datetime.now(timezone.utc).date())
-            quotes = await fetch_universe_quotes(ib, names)
+            quotes = await fetch_universe_quotes(ib, _candidate_names)
+            _ape_cfg = tr.get("apewisdom_discovery") or {}
+            _ape_limit = max(1, min(20, int(_ape_cfg.get("research_limit", 8))))
+            _ape_quoted_rows = [r for r in _ape_probe_rows
+                                if usable_price((quotes.get(r["ticker"]) or {}).get("last"))]
+            _ape_rows = _ape_quoted_rows[:_ape_limit]
+            names = apewisdom.merge_research_universe(_base_names, _ape_rows)
+            _ape_names = {r["ticker"] for r in _ape_rows}
+            if _ape_feed is not None:
+                audit(audit_path, "apewisdom_research_universe",
+                      candidates=sorted(_ape_names), count=len(_ape_names),
+                      excluded_no_live_quote=sorted(
+                          r["ticker"] for r in _ape_probe_rows if r not in _ape_quoted_rows),
+                      excluded_by_research_cap=[r["ticker"] for r in _ape_quoted_rows[_ape_limit:]],
+                      attention_metrics_in_main_brief=False,
+                      trade_authority=False, training_eligible=False)
             data = await research.gather(ib, names, single_names=[n for n in names if n not in ("SPY", "QQQ", "IWM")])
             try:
                 _slate_book = await _open_positions_for_risk()
@@ -684,20 +907,47 @@ async def run(args):
             # SOFT-MUTEX (2026-06-23): hold the slate-active flag across the discovery+propose model
             # burst so the trader defers its exit-management model call instead of colliding with us.
             _slate_gen = slate_active_guard(); _slate_gen.__enter__()
+            broad_cands = []
             try:
-                cands = discover_names(tr.get("llm_endpoint"), tr.get("llm_model"), brief,
-                                       exclude=set(names), timeout=400,
-                                       blocked=tr.get("blocked_names", []))
-                if cands:
-                    disc_cands = [t for t, _ in cands]
-                    disc_ts = approval.post_proposal(token, channel,
-                        ":mag: *Names to consider* (scouted this morning — NOT on your watchlist):\n"
-                        + "\n".join(f"  • *{t}* — {why}" for t, why in cands)
-                        + "\n_Reply *add TICKER* (or *add all*) right here to put any on the watchlist._"
-                        + "\n_Anytime (even outside this window): just ask Alfred to *add TICKER*._")
-                    audit(audit_path, "discovery", candidates=disc_cands)
+                broad_cands = discover_names(
+                    tr.get("llm_endpoint"), tr.get("llm_model"), brief,
+                    exclude=set(_all) | _ape_names, timeout=400,
+                    blocked=tr.get("blocked_names", []))
             except Exception as e:
-                audit(audit_path, "discovery_error", error=str(e))
+                audit(audit_path, "discovery_error", source="ordinary", error=str(e))
+
+            ape_cands = []
+            _ape_new_rows = [r for r in _ape_rows if r["ticker"] not in set(_all)]
+            if _ape_new_rows:
+                try:
+                    _ape_discovery_brief = apewisdom.discovery_context(
+                        brief, _ape_new_rows, watched=_all,
+                        price_stats=_slate_price_stats)
+                    _ape_reviewed = discover_names(
+                        tr.get("llm_endpoint"), tr.get("llm_model"), _ape_discovery_brief,
+                        exclude=set(_all), timeout=400, blocked=tr.get("blocked_names", []))
+                    ape_cands = apewisdom.bind_reviewed_candidates(
+                        _ape_reviewed, _ape_new_rows, watched=_all,
+                        price_stats=_slate_price_stats)
+                    _ape_addable = {t for t, _ in ape_cands}
+                    audit(audit_path, "apewisdom_discovery",
+                          eligible=[r["ticker"] for r in _ape_new_rows],
+                          candidates=[t for t, _ in ape_cands],
+                          signal_type="attention_only", trade_authority=False,
+                          training_eligible=False)
+                except Exception as e:
+                    audit(audit_path, "discovery_error", source="apewisdom", error=str(e))
+
+            cands = _merge_discovery_candidates(broad_cands, ape_cands)
+            if cands:
+                disc_cands = [t for t, _ in cands]
+                disc_ts = approval.post_proposal(token, channel,
+                    ":mag: *Names to consider* (scouted this morning — NOT on your watchlist):\n"
+                    + "\n".join(f"  • *{t}* — {why}" for t, why in cands)
+                    + "\n_Reply *add TICKER* (or *add all*) right here to put any on the watchlist._"
+                    + "\n_Anytime (even outside this window): just ask Alfred to *add TICKER*._")
+                audit(audit_path, "discovery", candidates=disc_cands,
+                      apewisdom_candidates=[t for t, _ in ape_cands])
 
             try:
                 _res = propose(tr.get("llm_endpoint"), tr.get("llm_model"), brief,
@@ -721,6 +971,10 @@ async def run(args):
                 _slate_gen.__exit__(None, None, None)
                 return 1
             ideas.sort(key=lambda i: -i.conviction)
+            audit(audit_path, "apewisdom_trade_consideration",
+                  researched=sorted(_ape_names),
+                  proposed=sorted(i.underlying for i in ideas if i.underlying in _ape_names),
+                  attention_metrics_in_main_brief=False, trade_authority=False)
             audit(audit_path, "daily_recommend", count=len(ideas),
                   scores=[i.conviction for i in ideas])
             _slate_gen.__exit__(None, None, None)  # generation burst done -> release the soft-mutex
@@ -741,7 +995,9 @@ async def run(args):
         pot = await get_pot_snapshot(ib)
         default_pct = float(tr.get("max_trade_pct", 0.12))     # conservative default slice of the pot
         cons_budget = min(pot.available_funds, default_pct * pot.net_liq)
-        # (ts, resolved, tp, sl, idea, over_default, posted_monotonic, decision_id, revision)
+        # (ts, resolved, tp, sl, idea, over_default, posted_monotonic, decision_id,
+        #  revision, original_candidates, raw_strategist, cot, model_request_context,
+        #  model_technical_card)
         pending = []
         placed_watch = []  # fill-verification watch for orders placed this session (2026-07-01)
 
@@ -785,6 +1041,35 @@ async def run(args):
                     want |= set(approval.parse_add_tickers(m.get("text", ""), disc_cands))
                 new = sorted(want - added_watch)
                 if new:
+                    # External-source names are rechecked against the current config, liquidity,
+                    # SMART stock identity, and option chain immediately before watchlist write.
+                    # A long-running slate must not rely on a hours-old social-source screen.
+                    _fresh_cfg = yaml.safe_load(open(args.config)) or {}
+                    _fresh_tr = _fresh_cfg.get("trading", {}) or {}
+                    _fresh_blocked = {str(t).upper() for t in _fresh_tr.get("blocked_names", [])}
+                    _ape_row_by_ticker = {r["ticker"]: r for r in _ape_rows}
+                    _accepted_new, _rejected_new = [], []
+                    for _ticker in new:
+                        if _ticker in _fresh_blocked or _ticker == "TSLA":
+                            _rejected_new.append((_ticker, "currently_blocked"))
+                            continue
+                        if _ticker in _ape_addable:
+                            _row, _reason = await _probe_apewisdom_row(
+                                ib, _ape_row_by_ticker[_ticker],
+                                _fresh_tr.get("blocked_sector_keywords", []),
+                                asyncio.Semaphore(1))
+                            if _row is None:
+                                _rejected_new.append((_ticker, _reason))
+                                continue
+                        _accepted_new.append(_ticker)
+                    new = _accepted_new
+                    if _rejected_new:
+                        audit(audit_path, "discovery_add_rejected_recheck",
+                              rejected=[{"ticker": t, "reason": r} for t, r in _rejected_new])
+                        approval.post_proposal(token, channel,
+                            ":warning: Not added after the fresh eligibility recheck: "
+                            + ", ".join(f"*{t}* ({r})" for t, r in _rejected_new))
+                if new:
                     really = _append_watchlist(args.config, new)
                     added_watch |= set(new)
                     if really:
@@ -799,9 +1084,27 @@ async def run(args):
                             _one_raw = None
                             _one_cot = None
                             _one_identity = None
+                            _one_brief = brief
+                            _one_price_stats = _slate_price_stats
                             try:
+                                if tk in _ape_addable:
+                                    # The social feed only nominated the ticker. Rebuild a fresh,
+                                    # independent market brief before same-day trade consideration;
+                                    # never reuse attention metrics or an hours-old morning snapshot.
+                                    _one_names = ["SPY", "QQQ", "IWM", tk]
+                                    _one_quotes = await fetch_universe_quotes(ib, _one_names)
+                                    if not usable_price((_one_quotes.get(tk) or {}).get("last")):
+                                        raise RuntimeError("fresh underlying quote unavailable")
+                                    _one_data = await research.gather(
+                                        ib, _one_names, single_names=[tk])
+                                    _one_book = await _open_positions_for_risk()
+                                    _one_brief = research.build_brief(
+                                        today=str(datetime.now(timezone.utc).date()),
+                                        quotes=_one_quotes, universe=_one_names,
+                                        allow_any_name=False, book=_one_book, **_one_data)
+                                    _one_price_stats = _one_data.get("price_stats")
                                 with slate_active_guard():
-                                    _one = propose_one(tr.get("llm_endpoint"), tr.get("llm_model"), brief, tk,
+                                    _one = propose_one(tr.get("llm_endpoint"), tr.get("llm_model"), _one_brief, tk,
                                                        timeout=400, return_cot=True,
                                                        return_identity=True)
                                 # robust to all shapes: (idea, raw, cot) 3-tuple, (idea, raw) 2-tuple,
@@ -830,9 +1133,11 @@ async def run(args):
                             await _post_idea(ib, idea, snap, default_pct, token, channel, audit_path, pending,
                                              label="Added & suggested", audit_event="add_suggest_posted",
                                              candidates=[idea], raw_strategist=_one_raw, cot=_one_cot,
-                                             market_context=brief, technical_card=_slate_price_stats,
+                                             market_context=_one_brief, technical_card=_one_price_stats,
                                              model_identity=_one_identity)
-            for ts, r, tp_pct, sl_pct, idea, over_default, posted_at, decision_id, revision in pending:
+            for (ts, r, tp_pct, sl_pct, idea, over_default, posted_at, decision_id,
+                 revision, capture_candidates, capture_raw, capture_cot, capture_context,
+                 capture_technical_card) in pending:
                 if ts in done:
                     continue
                 rxn = approval._api("reactions.get", token, {"channel": channel, "timestamp": ts}, http_post=False)
@@ -879,17 +1184,25 @@ async def run(args):
                 # Always reconstruct the effective idea and re-resolve its contract from a new
                 # chain/NBBO/account snapshot. Overrides never fall back to the stale original.
                 from dataclasses import replace as _replace
-                nd = idea.direction
-                if ovr.get("direction") == "flip":
-                    nd = "bearish" if idea.direction == "bullish" else "bullish"
-                elif ovr.get("direction") in ("bullish", "bearish"):
-                    nd = ovr["direction"]
-                ns = idea.structure
-                if ovr.get("structure") == "single":
-                    ns = "long put" if nd == "bearish" else "long call"
-                elif ovr.get("structure") == "spread":
-                    ns = "put debit spread" if nd == "bearish" else "call debit spread"
-                effective_idea = _replace(idea, direction=nd, structure=ns)
+                # BYPASS 3: the override is applied by apply_structure_override(), which runs
+                # the allow-list on the RESULT and relabels a structure the human's own direction
+                # override has just made stale (audited + shown, never silent).
+                effective_idea, _ovr_error, _ovr_note = apply_structure_override(idea, ovr)
+                nd, ns = effective_idea.direction, effective_idea.structure
+                if _ovr_error:
+                    approval.post_proposal(token, channel,
+                        f":no_entry: *{r.underlying}* NOT placed — {_ovr_error}")
+                    audit(audit_path, "structure_override_rejected", underlying=r.underlying,
+                          decision_id=decision_id, override=dict(ovr),
+                          structure=idea.structure, direction=idea.direction, reason=_ovr_error)
+                    done.add(ts)
+                    continue
+                if _ovr_note:
+                    approval.post_proposal(token, channel,
+                        f":pencil2: *{r.underlying}* — {_ovr_note}")
+                    audit(audit_path, "structure_relabelled", underlying=r.underlying,
+                          decision_id=decision_id, override=dict(ovr),
+                          was=idea.structure, now=ns, direction=nd, note=_ovr_note)
 
                 _block_reasons = []
                 try:
@@ -1104,7 +1417,9 @@ async def run(args):
                     if _new_ts:
                         fresh_r.decision_revision = revision + 1
                         pending.append((_new_ts, fresh_r, eff_tp, eff_sl, effective_idea,
-                                        False, time.monotonic(), decision_id, revision + 1))
+                                        False, time.monotonic(), decision_id, revision + 1,
+                                        capture_candidates, capture_raw, capture_cot,
+                                        capture_context, capture_technical_card))
                     audit(audit_path, "reapproval_required", decision_id=decision_id,
                           underlying=fresh_r.underlying, changes=_changes,
                           revision=revision + 1)
@@ -1127,6 +1442,19 @@ async def run(args):
                           reasons=_quote_now.reasons)
                     done.add(ts)
                     continue
+                # STRUCTURE GATE AT THE MONEY BOUNDARY -- this file has its own placeOrder call,
+                # so it needs its own submit-time check; trader._submit_order_unlocked's does not
+                # cover this path. Last line before the order is priced and captured.
+                _ok_submit, _why_submit = submit_structure_ok(r, effective_idea)
+                if not _ok_submit:
+                    approval.post_proposal(token, channel,
+                        f":no_entry: *{r.underlying}* NOT placed — structure gate at submit: "
+                        f"{_why_submit}")
+                    audit(audit_path, "structure_blocked_submit", decision_id=decision_id,
+                          underlying=r.underlying, structure=r.structure, right=r.right,
+                          reason=_why_submit)
+                    done.add(ts)
+                    continue
                 _lmt = entry_safety.executable_price(r)
                 try:
                     trade_capture.capture_decision(
@@ -1134,7 +1462,10 @@ async def run(args):
                         symbol=r.underlying, right=r.right, strike=r.strike, expiry=r.expiry,
                         structure=("spread" if r.short_contract is not None else "single"),
                         con_id=getattr(r.contract, "conId", None), chosen_idea=effective_idea,
-                        candidates=[effective_idea], market_context=brief,
+                        candidates=(capture_candidates or [effective_idea]),
+                        raw_strategist=capture_raw, cot=capture_cot,
+                        market_context=capture_context,
+                        technical_card=capture_technical_card,
                         decision_id=decision_id, revision=revision, event="approved",
                         model_identity=getattr(r, "model_identity", None),
                         final_contract=contract_snapshot(r),
@@ -1181,7 +1512,10 @@ async def run(args):
                         symbol=r.underlying, right=r.right, strike=r.strike, expiry=r.expiry,
                         structure=("spread" if r.short_contract is not None else "single"),
                         con_id=getattr(r.contract, "conId", None), chosen_idea=effective_idea,
-                        candidates=[effective_idea], market_context=brief,
+                        candidates=(capture_candidates or [effective_idea]),
+                        raw_strategist=capture_raw, cot=capture_cot,
+                        market_context=capture_context,
+                        technical_card=capture_technical_card,
                         decision_id=decision_id, revision=revision, event="submitted",
                         model_identity=getattr(r, "model_identity", None),
                         final_contract=contract_snapshot(r),
@@ -1308,4 +1642,13 @@ if __name__ == "__main__":
     ap.add_argument("--conviction", type=int, default=6, help="conviction 1-10 (display only)")
     ap.add_argument("--thesis", default="User-directed proposal.", help="thesis line shown in the proposal")
     ap.add_argument("--client-id", type=int, default=None, dest="client_id", help="override IBKR clientId (avoid clash with the cron's 93)")
-    raise SystemExit(asyncio.run(run(ap.parse_args())))
+    _args = ap.parse_args()
+    # FAIL FAST, BEFORE ANY IBKR CONNECTION: a refused --structure must not cost a gateway connect,
+    # a slate lock and a Slack post first. This is an EARLY COPY of the same one gate that runs
+    # inside run() -- not a second check with a list of its own.
+    if _args.ticker:
+        try:
+            user_directed_idea(_args)
+        except ValueError as _structure_error:
+            raise SystemExit("[REFUSED] %s" % _structure_error)
+    raise SystemExit(asyncio.run(run(_args)))

@@ -27,9 +27,9 @@ def test_malformed_json_drops_everything():
 def test_out_of_bounds_normalized_or_dropped():
     # conviction>10 and delta>1 are CLAMPED (kept); bad direction and negative debit are dropped
     raw = ('{"trades":['
-           '{"underlying":"SPY","direction":"bullish","structure":"x","target_dte":7,"target_delta":1.7,"est_debit_usd":50,"conviction":9,"thesis":"clamp"},'
+           '{"underlying":"SPY","direction":"bullish","structure":"long call","target_dte":7,"target_delta":1.7,"est_debit_usd":50,"conviction":9,"thesis":"clamp"},'
            '{"underlying":"SPY","direction":"sideways","structure":"iron condor","target_dte":7,"target_delta":0.3,"est_debit_usd":50,"conviction":3,"thesis":"drop-dir"},'
-           '{"underlying":"SPY","direction":"bullish","structure":"x","target_dte":7,"target_delta":0.3,"est_debit_usd":-5,"conviction":3,"thesis":"drop-debit"}'
+           '{"underlying":"SPY","direction":"bullish","structure":"long call","target_dte":7,"target_delta":0.3,"est_debit_usd":-5,"conviction":3,"thesis":"drop-debit"}'
            ']}')
     ideas = parse_ideas(raw)
     assert len(ideas) == 1 and ideas[0].conviction == 9 and ideas[0].target_delta == 1.0

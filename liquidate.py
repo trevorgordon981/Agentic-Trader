@@ -2,8 +2,8 @@
 """Liquidate ALL open positions at MARKET. SELL longs, BUY-to-close shorts, using each
 position's own contract for guaranteed fills. Spreads close leg-by-leg at market (sub-second
 fills). DRY-RUN by default; --confirm sends. Logs + Slacks a summary to #trading-alerts.
-Fired by Trevor via the Slack 'liquidate everything' command (liquidate_listener.py), or run
-directly with --confirm. Trevor authorizes; this just carries it out."""
+Fired by the operator via the Slack 'liquidate everything' command (liquidate_listener.py), or run
+directly with --confirm. the operator authorizes; this just carries it out."""
 import argparse, asyncio, json, os, sys
 sys.path.insert(0, os.path.expanduser("~/exitmgr-app"))
 from exitmgr.connection import IBConnection

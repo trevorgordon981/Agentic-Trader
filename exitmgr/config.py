@@ -79,7 +79,7 @@ class AutoTrailConfig:
     runner on option-vol noise) and rides the monotonic peak UP; the model can still WIDEN it or
     take_profit early. It NEVER suppresses the take-profit ceiling (only the model's arm_trail does
     that) and NEVER touches the protective stop. Purpose: stop an up-big winner round-tripping to
-    breakeven when the model returns 'hold'. Shipped ENABLED with a wide default per Trevor's
+    breakeven when the model returns 'hold'. Shipped ENABLED with a wide default per the operator's
     'protect gains by default' ask; tune the knobs in config.yaml `rules.auto_trail:`. Disable
     (enabled: false) for an exact no-op (byte-identical to the pre-feature behavior)."""
     enabled: bool = True
@@ -102,12 +102,20 @@ class ConstructionConfig:
     """Trade-CONSTRUCTION rulebook thresholds (2026-07-01 journal-audit rework).
     All consumed via exitmgr.construction; tune in config.yaml `construction:`, not here."""
     min_dte: int = 25                          # floor on DTE at entry (prefer 25-45)
-    prefer_dte_max: int = 45
+    prefer_dte_max: int = 170                  # entry window 25-170 DTE (config.yaml sets 800)
+    # 2026-07-26. Cash-secured puts ONLY -- these must NEVER apply to a debit entry, or the
+    # 365-DTE long-premium doctrine is defeated from below by a 3-DTE long call. Enforcement
+    # lives in construction.dte_bounds_for_side(), which reads these only inside the credit
+    # branch. Declared here because construction_from_dict() FILTERS UNKNOWN KEYS: without
+    # these fields the YAML values load and are silently discarded, so editing config.yaml
+    # would appear to work and do nothing.
+    credit_min_dte: int = 3                    # weeklies allowed (the operator's real fills: 2-7d writes)
+    credit_max_dte: int = 45                   # HARD ceiling -- refuse rather than round up
     tp_pct: float = 0.30                       # default take-profit = +30% of debit
     tp_min_pct: float = 0.25                   # model TP clamped into [tp_min, tp_max]
     tp_max_pct: float = 0.35
     sl_pct: float = -0.30                      # default stop = -30% of debit (was -50%)
-    max_premium_pct: float = 0.15              # premium per trade <= 15% of net-liq
+    max_premium_pct: float = 0.25              # premium per trade <= 25% of net-liq
     max_deployed_pct: float = 0.40             # total deployed premium <= 40% of net-liq
     max_decay_pct_per_day: float = 0.01        # (debit/DTE)/net-liq <= 1%/day per trade
     max_portfolio_decay_pct_per_day: float = 0.04
@@ -290,7 +298,7 @@ def load_config(
                                                            # multiplier proposed by
                                                            # calibrate_conviction_sizing.py; None/
                                                            # empty => 1.0 (flat, unchanged). PROPOSE-
-                                                           # ONLY: apply only after Trevor opts in
+                                                           # ONLY: apply only after the operator opts in
                                                            # (also wire it in run_trader.py, mirroring
                                                            # conviction_size_curve).
                    ('blocked_names', []), ('blocked_sector_keywords', []),
@@ -298,11 +306,11 @@ def load_config(
                                                   # (subset of the single-name book); 0/empty-map => no-op
                    ('sector_map', {}),            # static symbol->sector/cluster dict (empty => no clustering)
                    ('max_trade_pct', 0.12), ('max_concurrent', 4), ('daily_halt_pct', 0.08),
-                   # TAKE-PROFIT-AND-RELOAD (2026-07-03). Encode Trevor's serial-reload exit style:
+                   # TAKE-PROFIT-AND-RELOAD (2026-07-03). Encode the operator's serial-reload exit style:
                    # when the MODEL banks a winner (take_profit) AND still sees room, bank it and
                    # SUGGEST a fresh same-name entry through the normal propose->approve->submit
                    # path (each reload re-anchors its own 30% stop to the new basis). OFF by default
-                   # -- reload_enabled=False is a pure no-op (today's behavior); Trevor flips it on
+                   # -- reload_enabled=False is a pure no-op (today's behavior); the operator flips it on
                    # deliberately after re-arm + validation. The other knobs only bind when enabled.
                    ('reload_enabled', False),          # master flag; False => feature is a full no-op
                    ('reload_conviction_min', 6),       # friction gate: reload clears only if the

@@ -111,7 +111,7 @@ def main(
         max_orders_per_day=int(getattr(cfg.caps, "max_orders_per_day", 20)),
         max_notional_per_day=float(getattr(cfg.caps, "max_notional_per_day", 50000.0)),
         # TAKE-PROFIT-AND-RELOAD (2026-07-03). OFF BY DEFAULT (reload_enabled=False => no-op);
-        # Trevor flips it on in config.yaml `trading:` after re-arm + validation. Knobs gate churn.
+        # the operator flips it on in config.yaml `trading:` after re-arm + validation. Knobs gate churn.
         reload_enabled=bool(getattr(cfg, "reload_enabled", False)),
         reload_conviction_min=float(getattr(cfg, "reload_conviction_min", 6)),
         reload_friction_k=float(getattr(cfg, "reload_friction_k", 1.5)),

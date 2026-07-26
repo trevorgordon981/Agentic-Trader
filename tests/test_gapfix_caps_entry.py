@@ -19,6 +19,7 @@ IDEA = TradeIdea("SPY", True, "bullish", "long call", 7, 0.35, 90.0, 4, "trend")
 
 def _trader(tmp_path, *, n_ideas, state_manager=None, **caps):
     ibc = MagicMock(); ibc.ib = MagicMock()
+    ibc.ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
     ibc.get_positions = AsyncMock(return_value={})
     em = MagicMock(); em.run_cycle = AsyncMock()
     if state_manager is not None:
@@ -26,7 +27,8 @@ def _trader(tmp_path, *, n_ideas, state_manager=None, **caps):
     t = Trader(ib_conn=ibc, exit_manager=em, limits=LIM, approved_names=set(),
                endpoint="http://x", model="m", slack_token="tok", slack_channel="C1",
                approver_ids={"OWNER"}, baseline_path=str(tmp_path / "b.json"),
-               audit_path=str(tmp_path / "a.jsonl"), approve_timeout_s=60, **caps)
+               audit_path=str(tmp_path / "a.jsonl"), approve_timeout_s=60,
+               trading_down_path=str(tmp_path / "TRADING_DOWN"), **caps)
     # limit 1.20 x 100 x qty 1 = $120 per entry (used by the notional test).
     resolved = ResolvedOrder(
         "SPY", "C", "20260620", 50.0, 1, 1.20, MagicMock(conId=123),
@@ -94,6 +96,25 @@ async def test_caps_none_means_no_throttle(tmp_path, monkeypatch):
     t = _trader(tmp_path, n_ideas=3)   # no caps kwargs -> all None -> disabled
     await t.run_once(dry_run=False)
     assert t._submit_order.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_same_cycle_submitted_buys_count_against_deployed_budget(tmp_path, monkeypatch):
+    # $1,010 net-liq => 40% deployed cap $404. Four $120 entries would be $480, so the
+    # fourth must be rejected even if IBKR has not reflected the prior same-cycle submits yet.
+    monkeypatch.setattr(trader, "propose", _propose_n(4))
+    t = _trader(tmp_path, n_ideas=4)
+    await t.run_once(dry_run=False)
+    assert t._submit_order.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_working_order_snapshot_failure_blocks_entries(tmp_path, monkeypatch):
+    monkeypatch.setattr(trader, "propose", _propose_n(1))
+    t = _trader(tmp_path, n_ideas=1)
+    t.ib_conn.ib.reqAllOpenOrdersAsync = AsyncMock(side_effect=RuntimeError("broker snapshot down"))
+    await t.run_once(dry_run=False)
+    assert t._submit_order.await_count == 0
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,13 @@ def isolate_dataset_dir(tmp_path, monkeypatch):
     ddir = tmp_path / "dataset_isolated"
     ddir.mkdir(exist_ok=True)
     monkeypatch.setenv("EXITMGR_DATASET_DIR", str(ddir))
+    # v6 RAW-EVENT store isolation (2026-07-21): the capture_v6 hooks (entry_decision / exit_action /
+    # order_fill / position_path / ...) fire via trade_capture + manager + exec_capture during tests.
+    # Point TRADE_CAPTURE_DIR at a fresh tmp dir so no test can ever write into the real
+    # ~/trade-capture store (same rationale as EXITMGR_DATASET_DIR above).
+    v6dir = tmp_path / "trade_capture_isolated"
+    v6dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("TRADE_CAPTURE_DIR", str(v6dir))
     yield str(ddir)
 
 

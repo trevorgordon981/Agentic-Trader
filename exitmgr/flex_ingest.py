@@ -1,10 +1,10 @@
-"""IBKR Flex Web Service history ingest (2026-07-03): backfill Trevor's FULL trade history --
+"""IBKR Flex Web Service history ingest (2026-07-03): backfill the operator's FULL trade history --
 including MANUAL trades that never touched Alfred AND app trades older than the ~7-day
 reqExecutions window -- into the trade_dataset.v2 training corpus.
 
 WHY THIS EXISTS
 ---------------
-exec_capture.py pulls executions via reqExecutions, which only reaches ~7 days. Trevor's real
+exec_capture.py pulls executions via reqExecutions, which only reaches ~7 days. the operator's real
 edge is trades he punches straight into TWS / the mobile app; anything older than a week is
 invisible to reqExecutions. The IBKR **Flex Web Service** serves a 365-day Activity Flex Query
 (real execIDs, real commissions, real fifoPnlRealized) -- the authoritative history. This module
@@ -47,12 +47,49 @@ DESIGN
 
 This is a MANUAL / periodic archive + reconcile tool (not run every exit cycle -- reqExecutions
 already covers going-forward). CLI: `python -m exitmgr.flex_ingest`.
+
+CASH TRANSACTIONS -> THE P&L LEDGER (2026-07-26)
+------------------------------------------------
+From 2026-07-26 the account receives $500/month, so the balance stops being a performance
+signal. ~/pnl-tracker/pnl_net.py separates trading P&L from cash flows, but on its own it can
+only compute a RESIDUAL -- "money that moved and P&L cannot explain" -- and a residual cannot
+tell a $500 wire from a $500 dividend. Its own README says the shortest path from "detected" to
+"proven" is to pull the Flex **Cash Transactions** section and write it out as the ledger at
+~/contributions.jsonl. That is what the cash-transaction half of this module does.
+
+  * parse: each <CashTransaction> row -> one ledger row shaped EXACTLY as pnl_net.py consumes:
+        {"date": "YYYY-MM-DD", "amount": <float, signed>, "type": <str>, "note": <str>}
+    plus non-conflicting provenance keys (id / ibkr_type / currency / symbol / source /
+    account / date_source) that pnl_net ignores. Nothing is invented: `amount` is IBKR's own
+    signed amount and `type` is derived ONLY from IBKR's own `type` attribute.
+  * classify: IBKR's `type` decides capital vs income, and that distinction IS the point --
+    a dividend is NOT a contribution, and calling one a contribution understates the strategy.
+        Deposits/Withdrawals, transfers      -> deposit / withdrawal / transfer   (CAPITAL)
+        Dividends, Payment In Lieu           -> dividend                          (INCOME)
+        Broker/Bond Interest Received|Paid   -> interest                          (INCOME)
+        Withholding Tax                      -> tax                               (INCOME)
+        Other/Advisor/Broker Fees            -> fee                               (INCOME)
+        Commissions / Commission Adjustments -> commission                        (INCOME)
+        Price Adjustments                    -> adjustment                        (INCOME)
+    An IBKR type this module does not recognise is emitted with its raw slug, which pnl_net
+    treats as CAPITAL -- i.e. removed from performance. An unknown label must never become
+    profit. Every unrecognised type is also reported so it can be mapped deliberately.
+  * idempotency: append-only, keyed on IBKR's own transactionID (falling back to a content
+    hash when a statement omits it). A re-run appends 0. A row whose id already exists but
+    whose date/amount DISAGREES is never appended and never silently rewritten -- it is
+    reported as a conflict for a human to settle.
+  * NO FABRICATION: if the configured Flex query does not contain a <CashTransactions>
+    section, NOTHING is written and the call fails loudly. Emitting an empty ledger would
+    read as "no contributions" and would quietly corrupt the P&L report -- the single worst
+    outcome available here.
 """
 import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
+import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -71,6 +108,17 @@ _INPROGRESS_CODE = "1019"  # "Statement generation in progress. Please try again
 _BAK_SUFFIX = "bak-flexingest-20260703"
 _STRATEGY_CLOSE_WINDOW_S = 24 * 60 * 60
 _PNL_TOLERANCE_USD = 0.05
+
+# --- cash-transaction ledger (feeds ~/pnl-tracker/pnl_net.py) ------------------------------
+# pnl_net.py defaults to Path.home()/"contributions.jsonl"; keep them identical or the tracker
+# reads nothing.  The env var exists so tests (and any dry inspection) can never write into
+# the operator's real ledger.
+CASH_LEDGER_ENV = "EXITMGR_CASH_LEDGER"
+DEFAULT_CASH_LEDGER = os.path.join(os.path.expanduser("~"), "contributions.jsonl")
+# Amounts at/below this are treated as no cash movement at all.  Emitting a $0.00 row would be
+# worse than useless: pnl_net's "no ledger rows AND |residual| < epsilon -> noise" branch keys
+# on ROW PRESENCE, so a zero row silently reclassifies an otherwise-quiet period.
+_CASH_ZERO_USD = 0.005
 
 
 # --------------------------------------------------------------------------- small utils
@@ -297,6 +345,375 @@ def parse_statement(xml_text: str) -> Dict[str, Any]:
     except Exception:
         pass
     return {"fills": fills, "meta": meta}
+
+
+# --------------------------------------------------------------- cash transactions -> ledger
+# pnl_net.py's own vocabulary.  CAPITAL is external capital and is removed from performance
+# entirely; INCOME is real (non-trading) return and stays in net P&L, reported separately.
+# Mirrored here rather than imported because ~/pnl-tracker is a separate, settled tree.
+CASH_CAPITAL_TYPES = ("contribution", "deposit", "withdrawal", "transfer")
+CASH_INCOME_TYPES = ("dividend", "interest", "fee", "commission", "tax", "adjustment")
+
+# IBKR's own CashTransaction `type` strings, normalised (lowercased, punctuation -> spaces).
+# "deposit_or_withdrawal" is resolved by the SIGN of the amount, which is the only honest way
+# to tell the operator's $500 in from a $500 out -- IBKR reports both under one type string.
+_CASH_TYPE_MAP: Dict[str, str] = {
+    "deposits withdrawals": "deposit_or_withdrawal",
+    "deposits and withdrawals": "deposit_or_withdrawal",
+    "deposits": "deposit_or_withdrawal",
+    "withdrawals": "deposit_or_withdrawal",
+    "deposit": "deposit_or_withdrawal",
+    "withdrawal": "deposit_or_withdrawal",
+    "electronic fund transfer": "deposit_or_withdrawal",
+    "internal transfers": "transfer",
+    "internal transfer": "transfer",
+    "transfers": "transfer",
+    "transfer": "transfer",
+    "dividends": "dividend",
+    "dividend": "dividend",
+    "payment in lieu of dividends": "dividend",
+    "payment in lieu of dividend": "dividend",
+    "payment in lieu": "dividend",
+    "broker interest received": "interest",
+    "broker interest paid": "interest",
+    "broker interest": "interest",
+    "bond interest received": "interest",
+    "bond interest paid": "interest",
+    "credit interest": "interest",
+    "debit interest": "interest",
+    "interest": "interest",
+    "withholding tax": "tax",
+    "taxes": "tax",
+    "tax": "tax",
+    "other fees": "fee",
+    "advisor fees": "fee",
+    "broker fees": "fee",
+    "fees": "fee",
+    "fee": "fee",
+    "commission adjustments": "commission",
+    "commission adjustment": "commission",
+    "commissions": "commission",
+    "commission": "commission",
+    "price adjustments": "adjustment",
+    "price adjustment": "adjustment",
+    "adjustments": "adjustment",
+    "adjustment": "adjustment",
+}
+
+CASH_SECTION_MISSING_ACTION = (
+    "The configured IBKR Activity Flex Query does not include the Cash Transactions section, so "
+    "deposits/dividends/interest/fees CANNOT be distinguished and NO ledger was written (an empty "
+    "ledger would read as 'no contributions' and corrupt the P&L report). To enable it: IBKR "
+    "Client Portal -> Performance & Reports -> Flex Queries -> edit the Activity Flex Query -> "
+    "Sections -> tick 'Cash Transactions', and inside it select the options Deposits/Withdrawals, "
+    "Dividends, Payment In Lieu Of Dividends, Broker Interest Received, Broker Interest Paid, "
+    "Withholding Tax and Other Fees, plus the fields Type, Amount, Currency, FXRateToBase, "
+    "DateTime, SettleDate, ReportDate, Description, Symbol, TransactionID and LevelOfDetail."
+)
+
+
+def cash_ledger_path(path: Optional[str] = None) -> str:
+    """Where the cash ledger lives.  Explicit arg > $EXITMGR_CASH_LEDGER > pnl_net's default."""
+    return path or os.environ.get(CASH_LEDGER_ENV) or DEFAULT_CASH_LEDGER
+
+
+def _norm_cash_type(raw: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(raw or "").strip().lower()).strip()
+
+
+def _cash_date(attr: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    """The date IBKR credited the cash, as 'YYYY-MM-DD', plus which attribute it came from.
+
+    settleDate is when the cash actually lands in the balance, which is what pnl_net matches
+    against a net_liq snapshot; dateTime/reportDate are the fallbacks.  Returns (None, None)
+    when no attribute yields a real date -- an unplaceable row is skipped, never guessed."""
+    for key in ("settleDate", "dateTime", "reportDate", "date"):
+        iso = _parse_flex_dt(attr.get(key))
+        if iso and re.match(r"^\d{4}-\d{2}-\d{2}", iso):
+            return iso[:10], key
+    return None, None
+
+
+def classify_cash_type(ibkr_type: Optional[str], amount: float) -> Tuple[str, bool]:
+    """IBKR's `type` (+ sign, for the combined deposits/withdrawals bucket) -> a pnl_net type.
+
+    Returns (type, recognised).  An unrecognised IBKR type yields its normalised slug, which
+    pnl_net does not find in INCOME_TYPES and therefore treats as CAPITAL -- removed from
+    performance.  That is the deliberate fail-safe: an unknown label must never become profit."""
+    norm = _norm_cash_type(ibkr_type)
+    mapped = _CASH_TYPE_MAP.get(norm)
+    if mapped == "deposit_or_withdrawal":
+        return ("deposit" if amount > 0 else "withdrawal"), True
+    if mapped:
+        return mapped, True
+    return (norm.replace(" ", "_") or "unknown"), False
+
+
+def normalize_cash_transaction(attr: Dict[str, str],
+                               meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """One Flex <CashTransaction> row -> one pnl_net ledger row, or None if unusable.
+
+    Shape is pnl_net's, exactly: date / amount / type / note.  Everything else is provenance
+    pnl_net ignores.  Never raises; a malformed row is dropped so the rest of the statement
+    survives."""
+    try:
+        amount = _num(attr.get("amount"))
+        if amount is None:
+            return None
+        date, date_source = _cash_date(attr)
+        if not date:
+            return None
+
+        currency = (attr.get("currency") or "").strip().upper() or None
+        base = str((meta or {}).get("baseCurrency") or "USD").strip().upper() or "USD"
+        fx = _num(attr.get("fxRateToBase"))
+        # net_liq is denominated in the account's base currency, so the ledger must be too.
+        # IBKR's OWN fxRateToBase does the conversion -- no rate is ever invented here.
+        fx_unconverted = False
+        amount_original = amount
+        if currency and currency != base:
+            if fx is not None and fx > 0:
+                amount = amount * fx
+            else:
+                fx_unconverted = True
+
+        if abs(amount) < _CASH_ZERO_USD:
+            return None                                    # no cash moved; see _CASH_ZERO_USD
+
+        ibkr_type = (attr.get("type") or "").strip()
+        kind, recognised = classify_cash_type(ibkr_type, amount)
+
+        desc = (attr.get("description") or "").strip()
+        symbol = (attr.get("symbol") or "").strip() or None
+        note_bits = [b for b in (ibkr_type or None, symbol, desc or None) if b]
+        if fx_unconverted:
+            note_bits.append(f"UNCONVERTED {currency} (no fxRateToBase)")
+        if not recognised and ibkr_type:
+            note_bits.append("UNMAPPED IBKR type -> treated as capital")
+
+        row: Dict[str, Any] = {
+            # ---- the four keys pnl_net.py reads ----
+            "date": date,
+            "amount": round(float(amount), 6),
+            "type": kind,
+            "note": " | ".join(note_bits) or None,
+            # ---- provenance pnl_net ignores ----
+            "id": (attr.get("transactionID") or "").strip() or None,
+            "ibkr_type": ibkr_type or None,
+            "currency": currency,
+            "base_currency": base,
+            "amount_original": round(float(amount_original), 6),
+            "fx_rate_to_base": fx,
+            "fx_unconverted": fx_unconverted or None,
+            "symbol": symbol,
+            "account": (attr.get("accountId") or "").strip() or None,
+            "date_source": date_source,
+            "type_recognised": recognised,
+            "source": "ibkr_flex",
+        }
+        return {k: v for k, v in row.items() if v is not None or k in ("note", "amount", "date", "type")}
+    except Exception:
+        return None
+
+
+def parse_cash_transactions(xml_text: str) -> Dict[str, Any]:
+    """Parse a FlexQueryResponse -> normalised cash-ledger rows + an honest presence verdict.
+
+    Returns {parsed_ok, section_present, rows, skipped, unmapped_types, level_of_detail, meta}.
+    `section_present` is False when the query simply has no Cash Transactions section -- that
+    is a CONFIGURATION failure, not an empty period, and callers must not write a ledger for
+    it.  Never raises."""
+    out: Dict[str, Any] = {"parsed_ok": False, "section_present": False, "rows": [],
+                           "skipped": 0, "skipped_detail": [], "unmapped_types": [],
+                           "level_of_detail": None, "meta": {}, "raw_rows": 0}
+    try:
+        root = ET.fromstring((xml_text or "").strip())
+    except Exception as e:
+        out["error"] = f"statement XML did not parse: {e}"
+        return out
+    out["parsed_ok"] = True
+
+    meta: Dict[str, Any] = {}
+    stmt = root.find(".//FlexStatement")
+    if stmt is not None:
+        for k in ("accountId", "fromDate", "toDate", "period", "whenGenerated", "baseCurrency"):
+            if stmt.get(k):
+                meta[k] = stmt.get(k)
+    out["meta"] = meta
+
+    containers = list(root.iter("CashTransactions"))
+    elems = list(root.iter("CashTransaction"))
+    # A row can appear without its container (and vice-versa on a genuinely empty period);
+    # either one proves the section is enabled.
+    out["section_present"] = bool(containers) or bool(elems)
+    if not out["section_present"]:
+        return out
+    out["raw_rows"] = len(elems)
+
+    # Flex can emit the same cash event at SUMMARY and DETAIL granularity.  Keeping both
+    # double-counts every dividend.  Prefer DETAIL when it exists; otherwise take what there is.
+    lods = {(e.get("levelOfDetail") or "").strip().upper() for e in elems}
+    keep_lod = "DETAIL" if "DETAIL" in lods else None
+    out["level_of_detail"] = keep_lod or (sorted(x for x in lods if x) or [None])[0]
+
+    unmapped: Dict[str, int] = {}
+    for e in elems:
+        a = e.attrib
+        if keep_lod and (a.get("levelOfDetail") or "").strip().upper() != keep_lod:
+            continue
+        row = normalize_cash_transaction(a, meta)
+        if row is None:
+            out["skipped"] += 1
+            if len(out["skipped_detail"]) < 25:
+                out["skipped_detail"].append({
+                    "type": a.get("type"), "amount": a.get("amount"),
+                    "dateTime": a.get("dateTime"), "settleDate": a.get("settleDate"),
+                    "transactionID": a.get("transactionID"),
+                    "reason": "unparseable amount/date, or zero net cash movement"})
+            continue
+        if row.get("type_recognised") is False:
+            unmapped[str(row.get("ibkr_type") or row.get("type"))] = \
+                unmapped.get(str(row.get("ibkr_type") or row.get("type")), 0) + 1
+        out["rows"].append(row)
+
+    out["rows"].sort(key=lambda r: (str(r.get("date") or ""), str(r.get("id") or ""),
+                                    float(r.get("amount") or 0.0)))
+    out["unmapped_types"] = [{"ibkr_type": k, "rows": v} for k, v in sorted(unmapped.items())]
+    return out
+
+
+def _cash_key(row: Dict[str, Any]) -> str:
+    """Idempotency key.  IBKR's transactionID when present -- it is stable across re-pulls of
+    the same statement.  Otherwise a content hash, so a statement that omits the id still
+    cannot duplicate itself."""
+    tid = str(row.get("id") or "").strip()
+    if tid:
+        return f"txn:{tid}"
+    basis = "|".join(str(row.get(k) or "") for k in
+                     ("date", "amount", "type", "ibkr_type", "symbol", "currency", "note"))
+    return "sha:" + hashlib.sha256(basis.encode()).hexdigest()[:32]
+
+
+def read_cash_ledger(path: Optional[str] = None) -> List[Dict[str, Any]]:
+    return _read_rows(cash_ledger_path(path))
+
+
+def write_cash_ledger(rows: List[Dict[str, Any]], path: Optional[str] = None,
+                      dry_run: bool = False) -> Dict[str, Any]:
+    """APPEND new ledger rows.  Idempotent and append-only: existing lines are never rewritten.
+
+    A row whose key already exists is a duplicate and is dropped.  A row whose key exists but
+    whose date/amount DISAGREES with what is on disk is a conflict: it is neither appended nor
+    silently overwritten -- IBKR restating a cash event is a fact a human should see, and
+    guessing which version is true is exactly how a ledger stops being authoritative."""
+    target = cash_ledger_path(path)
+    existing = _read_rows(target)
+    index: Dict[str, Dict[str, Any]] = {}
+    for r in existing:
+        index.setdefault(_cash_key(r), r)
+
+    fresh: List[Dict[str, Any]] = []
+    duplicates = 0
+    conflicts: List[Dict[str, Any]] = []
+    for row in rows:
+        key = _cash_key(row)
+        prior = index.get(key)
+        if prior is not None:
+            try:
+                same = (str(prior.get("date")) == str(row.get("date"))
+                        and abs(float(prior.get("amount")) - float(row.get("amount"))) < 1e-6)
+            except (TypeError, ValueError):
+                same = False
+            if same:
+                duplicates += 1
+            else:
+                conflicts.append({"key": key, "on_disk": {"date": prior.get("date"),
+                                                          "amount": prior.get("amount"),
+                                                          "type": prior.get("type")},
+                                  "from_statement": {"date": row.get("date"),
+                                                     "amount": row.get("amount"),
+                                                     "type": row.get("type")}})
+            continue
+        index[key] = row
+        fresh.append(row)
+
+    result = {"path": target, "existing": len(existing), "appended": len(fresh),
+              "duplicates": duplicates, "conflicts": conflicts, "dry_run": dry_run,
+              "appended_detail": [{"date": r["date"], "amount": r["amount"], "type": r["type"]}
+                                  for r in fresh]}
+    if dry_run or not fresh:
+        result["final_rows"] = len(existing) + (0 if dry_run else 0)
+        return result
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    with open(target, "a") as fh:
+        for r in fresh:
+            fh.write(json.dumps(r, default=str) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    result["final_rows"] = len(existing) + len(fresh)
+    return result
+
+
+def ingest_cash_transactions(*, xml_text: Optional[str] = None, token: Optional[str] = None,
+                             query_id: Optional[str] = None, env_path: str = DEFAULT_ENV,
+                             opener: Callable[[str], str] = _http_get,
+                             ledger_path: Optional[str] = None, dry_run: bool = False,
+                             tries: int = 10,
+                             sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
+    """Fetch (or accept) a Flex statement, and write its cash transactions to the pnl_net ledger.
+
+    READ-ONLY against IBKR (HTTPS GET only).  Returns a summary with `ok`.  ok is False -- and
+    NOTHING is written -- when the query has no Cash Transactions section; `action_required`
+    then names exactly what to enable in IBKR's web UI.  Never raises."""
+    summary: Dict[str, Any] = {"ok": False, "note": None,
+                               "ledger_path": cash_ledger_path(ledger_path)}
+    tok = token
+    try:
+        if xml_text is None:
+            if not token or not query_id:
+                token, query_id = load_flex_creds(env_path)
+            tok = token
+            if not token or not query_id:
+                summary["note"] = "missing IBKR_FLEX_TOKEN / IBKR_FLEX_QUERY_ID"
+                return summary
+            xml_text = fetch_statement_xml(token, query_id, opener, tries=tries, sleep=sleep)
+
+        parsed = parse_cash_transactions(xml_text)
+        summary["meta"] = parsed.get("meta")
+        summary["section_present"] = parsed.get("section_present")
+        if not parsed.get("parsed_ok"):
+            summary["note"] = parsed.get("error") or "statement XML did not parse"
+            return summary
+        if not parsed.get("section_present"):
+            summary["note"] = "Flex query has no <CashTransactions> section"
+            summary["action_required"] = CASH_SECTION_MISSING_ACTION
+            summary["ledger_written"] = False
+            return summary
+
+        rows = parsed["rows"]
+        summary.update({
+            "cash_rows": len(rows), "raw_rows": parsed.get("raw_rows"),
+            "skipped": parsed.get("skipped"), "skipped_detail": parsed.get("skipped_detail"),
+            "unmapped_types": parsed.get("unmapped_types"),
+            "level_of_detail": parsed.get("level_of_detail"),
+            "capital_total": round(sum(r["amount"] for r in rows
+                                       if r["type"] not in CASH_INCOME_TYPES), 2),
+            "income_total": round(sum(r["amount"] for r in rows
+                                      if r["type"] in CASH_INCOME_TYPES), 2),
+            "by_type": {t: round(sum(r["amount"] for r in rows if r["type"] == t), 2)
+                        for t in sorted({r["type"] for r in rows})},
+        })
+        written = write_cash_ledger(rows, ledger_path, dry_run=dry_run)
+        summary["ledger"] = written
+        summary["ledger_written"] = not dry_run
+        summary["ok"] = True
+        if written.get("conflicts"):
+            summary["note"] = (f"{len(written['conflicts'])} ledger row(s) disagree with the "
+                               "statement and were NOT appended; resolve by hand")
+        return summary
+    except Exception as e:
+        summary["note"] = _redact(f"exception: {e}", tok if isinstance(tok, str) else None)
+        return summary
 
 
 # --------------------------------------------------------------------------- build flex rows
@@ -796,13 +1213,42 @@ def _underlying_summary(trade_rows: List[Dict[str, Any]],
 
 
 # --------------------------------------------------------------------------- public entry point
+def _cash_ledger_step(xml_text: str, ledger_path: Optional[str] = None, dry_run: bool = False,
+                      enabled: bool = True, warn: bool = True) -> Dict[str, Any]:
+    """Run the cash-ledger half over an already-fetched statement.
+
+    Deliberately isolated from the trade-ingest verdict: a missing Cash Transactions section is
+    a real failure for the P&L tracker but must not turn the (successful) trade archive run
+    into a failure.  It is shouted to stderr instead, so the scheduled job's .err log carries
+    it without anyone having to opt in to noticing."""
+    if not enabled:
+        return {"ok": None, "note": "cash ledger disabled for this run", "ledger_written": False}
+    cash = ingest_cash_transactions(xml_text=xml_text, ledger_path=ledger_path, dry_run=dry_run)
+    if warn and not cash.get("ok"):
+        try:
+            sys.stderr.write("WARNING flex_ingest: cash ledger NOT updated -- "
+                             f"{cash.get('note')}\n")
+            if cash.get("action_required"):
+                sys.stderr.write(str(cash["action_required"]) + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    return cash
+
+
 def ingest_flex(*, token: Optional[str] = None, query_id: Optional[str] = None,
                 env_path: str = DEFAULT_ENV, config=None, ddir: Optional[str] = None,
                 xml_text: Optional[str] = None, opener: Callable[[str], str] = _http_get,
                 dry_run: bool = False, tries: int = 10,
-                sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
+                sleep: Callable[[float], None] = time.sleep,
+                cash_ledger: bool = True,
+                cash_ledger_path: Optional[str] = None) -> Dict[str, Any]:
     """Fetch (or accept) a Flex statement, ingest its trade history, reconcile against existing
-    rows, and persist. Returns a summary dict. READ-ONLY (HTTPS GET only). Never raises."""
+    rows, and persist. Returns a summary dict. READ-ONLY (HTTPS GET only). Never raises.
+
+    Also writes the cash-transaction ledger pnl_net.py consumes (additive: the `cash_ledger`
+    key is new, `ok` still reflects the TRADE ingest only, and every pre-existing key is
+    unchanged).  Pass cash_ledger=False to skip it."""
     summary: Dict[str, Any] = {"ok": False, "note": None}
     try:
         # resolve dataset dir / path
@@ -823,6 +1269,12 @@ def ingest_flex(*, token: Optional[str] = None, query_id: Optional[str] = None,
 
         parsed = parse_statement(xml_text)
         fills, meta = parsed["fills"], parsed["meta"]
+
+        # Cash-transaction ledger for ~/pnl-tracker.  Runs whether or not the statement holds
+        # trades -- a month with no trades still has a $500 deposit that the tracker must see.
+        summary["cash_ledger"] = _cash_ledger_step(
+            xml_text, ledger_path=cash_ledger_path, dry_run=dry_run, enabled=cash_ledger)
+
         if not fills:
             summary.update({"ok": True, "note": "no trades in statement",
                             "fills": 0, "meta": meta})
@@ -885,6 +1337,13 @@ def _main(argv=None) -> int:
     ap.add_argument("--xml", default=None, help="ingest a saved statement XML instead of fetching")
     ap.add_argument("--tries", type=int, default=10, help="GetStatement poll attempts")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--cash-ledger", default=None,
+                    help=f"cash ledger path (default: ${CASH_LEDGER_ENV} or {DEFAULT_CASH_LEDGER})")
+    ap.add_argument("--no-cash", action="store_true",
+                    help="skip the cash-transaction ledger entirely")
+    ap.add_argument("--cash-only", action="store_true",
+                    help="write ONLY the cash ledger (no trade ingest). Exits non-zero -- and "
+                         "writes nothing -- if the Flex query has no Cash Transactions section.")
     args = ap.parse_args(argv)
 
     cfg = None
@@ -902,8 +1361,20 @@ def _main(argv=None) -> int:
         with open(args.xml) as f:
             xml_text = f.read()
 
+    if args.cash_only:
+        c = ingest_cash_transactions(xml_text=xml_text, env_path=args.env,
+                                     ledger_path=args.cash_ledger, dry_run=args.dry_run,
+                                     tries=args.tries)
+        print(json.dumps(c, indent=2, default=str))
+        if not c.get("ok"):
+            sys.stderr.write(f"cash ledger NOT written: {c.get('note')}\n")
+            if c.get("action_required"):
+                sys.stderr.write(str(c["action_required"]) + "\n")
+        return 0 if c.get("ok") else 1
+
     s = ingest_flex(env_path=args.env, config=cfg, ddir=args.ddir,
-                    xml_text=xml_text, dry_run=args.dry_run, tries=args.tries)
+                    xml_text=xml_text, dry_run=args.dry_run, tries=args.tries,
+                    cash_ledger=not args.no_cash, cash_ledger_path=args.cash_ledger)
     print(json.dumps(s, indent=2, default=str))
     return 0 if s.get("ok") else 1
 

@@ -18,6 +18,7 @@ Output: JSON {"trades": [<canonical idea>, ...]} to stdout.
 """
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -25,12 +26,13 @@ import urllib.request
 import urllib.error
 import time
 from dataclasses import dataclass, asdict
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import List, Optional
 
 from exitmgr.risk import INDEX_UNDERLYINGS
 from exitmgr import provenance
 
-# 1-10 conviction rubric (Trevor 2026-06-12): 1-3 desperate-only, 4 below-avg, 5 middle,
+# 1-10 conviction rubric (the operator 2026-06-12): 1-3 desperate-only, 4 below-avg, 5 middle,
 # 6-8 medium confidence, 8-10 high confidence. Score HONESTLY -- a low score is fine and useful.
 _SCORING = (
     "Score each idea 1-10 on its ABSOLUTE conviction -- this is NOT a rank-ordering of your picks, "
@@ -61,6 +63,7 @@ _CONTRACT = (
     '"direction": "bullish" | "bearish", '
     '"structure": "<e.g. long call, call debit spread>", '
     '"target_dte": <int days>, '
+    '"intended_hold_days": <positive int CALENDAR days>, '
     '"target_delta": <0.0-1.0>, '
     '"est_debit_usd": <TOTAL dollars = premium_per_share * 100 * contracts, e.g. 180 not 1.80>, '
     '"conviction": <1-10>, '
@@ -118,9 +121,21 @@ class TradeIdea:
     thesis: str
     profit_target_pct: float = 0.0   # SELL to take profit at +this% of premium (0 = use default)
     stop_pct: float = 0.0            # SELL to cut loss at -this% of premium (0 = use default)
+    intended_hold_days: Optional[int] = None  # source-bound calendar underwriting window
+    # -- CREDIT LIMB (2026-07-26, CREDIT_PATH_SPEC.md S1). Absent/"debit" == the historical
+    # contract. The only permitted short structure is a cash-secured put; every other short
+    # (naked call, strangle, condor) is UNREPRESENTABLE ON EITHER SIDE -- the allow-list in
+    # _require_allowed_structure() is enforced on the debit path too (audit R4 / S2 hole 1).
+    side: str = "debit"              # "debit" | "credit"
+    collateral_usd: float = 0.0      # credit only: strike * 100 * contracts
+    net_credit_usd: float = 0.0      # credit only: TOTAL dollars received (never normalize_debit'd)
+    max_loss_usd: float = 0.0        # credit only: collateral_usd - net_credit_usd
+    strike: float = 0.0              # credit only: a CSP is defined by its strike
 
 
 def normalize_direction(raw_dir: str, structure: str) -> Optional[str]:
+    """GENERIC direction mapping -- UNCHANGED. An ordinary long put is bearish and stays
+    bearish. Cash-secured puts do NOT come through here: see normalize_csp_direction()."""
     d = _DIRECTION.get(str(raw_dir).lower().strip())
     if d:
         return d
@@ -133,7 +148,12 @@ def normalize_direction(raw_dir: str, structure: str) -> Optional[str]:
 
 
 def _clamp_pct(value, lo: float, hi: float) -> float:
-    """Sell-level % from the model: clamp into [lo, hi]; 0.0 means 'use the default rule'."""
+    """Sell-level % from the model: clamp into [lo, hi]; 0.0 means 'use the default rule'.
+    A boolean is not a percentage (S2 hole 4): `"stop_pct": true` used to become float(True)
+    == 1.0 and then clamp UP to the 10% floor, inventing a sell level. It now falls back to
+    0.0 == "use the default rule", which is the same outcome as omitting the field."""
+    if isinstance(value, bool):
+        return 0.0
     try:
         v = float(value)
     except (TypeError, ValueError):
@@ -149,6 +169,263 @@ def normalize_debit(value: float) -> float:
     if 0 < value < 25.0:
         return round(value * 100.0, 2)
     return value
+
+
+# The ONLY short structure this system may ever express. Invariant 1 ("never sell a naked
+# call") is enforced by making an unbounded-loss structure unparseable, not merely discouraged.
+CSP_STRUCTURE = "cash secured put"
+_SIDES = ("debit", "credit")
+
+# ============================================================================================
+# STRUCTURE ALLOW-LIST  (audit R4 / S2 hole 1, reproduced live 2026-07-26 on strategist.py
+# d54b571c4543da5d7930cc5a0cf90b4c7e420de8e01d7c93a31654018be52237)
+#
+# THE DEFECT: the CSP structure gate lived only inside the credit branch, so
+#   {"structure": "naked call", "est_debit_usd": 500}          (side absent or "debit")
+#   {"structure": "short strangle", "est_debit_usd": 500}      (side "debit")
+# both PARSED. An unbounded-loss structure was expressible on the path that has no structure
+# gate at all -- the single most dangerous defect in this file.
+#
+# THE FIX: an ALLOW-LIST enforced on EVERY path, debit and credit alike, through the one
+# choke point `_require_allowed_structure()`. Allow-list, not deny-list: a deny-list can only
+# ban the shorts somebody remembered to name, and the space of ways to write "sell a naked
+# call" is unbounded. An unrecognised structure is REFUSED (fail closed).
+#
+# WHY THESE ENTRIES: every one is (a) a bounded-loss LONG-DEBIT structure whose maximum loss
+# is the debit paid, and (b) routed correctly by the executors, which branch on the substring
+# "spread" (exitmgr/trader.py:1926, daily_recommend.py:402): a name containing "spread" builds
+# a two-leg vertical via pick_spread_short(); anything else builds a single long leg whose
+# right (C/P) comes from `direction`. Nothing here can produce a short naked leg.
+#
+# NOT normalisation: membership is tested on the whitespace/case-canonical form, but the
+# ORIGINAL string is what gets stored on the TradeIdea, so no downstream consumer sees a
+# rewritten structure and the debit path stays byte-identical for everything it still accepts.
+DEBIT_STRUCTURES = frozenset({
+    # single long leg -- max loss = the debit paid
+    "long call",
+    "long put",
+    "long option",              # trader.py:1658's own canonical single-leg string
+    # vertical DEBIT spreads -- max loss = the net debit paid
+    "call debit spread",        # daily_recommend.py:1066 canonical
+    "put debit spread",         # daily_recommend.py:1066 canonical
+    "debit call spread",
+    "debit put spread",
+    "bull call spread",         # the standard trade name for a call debit spread
+    "bear put spread",          # the standard trade name for a put debit spread
+    "long call spread",
+    "long put spread",
+    "debit spread",             # trader.py:1658's own canonical spread string
+})
+
+# Deliberately ABSENT and therefore refused on every path: naked/short call, short put,
+# strangle, straddle, iron condor, ratio spread, "credit spread", "bull put spread",
+# "bear call spread", covered call, and every undefined placeholder ("x", "", "options
+# trade"). A short-premium name arriving on the DEBIT path is the worst case of all: the
+# executor would have silently BOUGHT the leg the model meant to SELL.
+
+
+def _require_allowed_structure(side: str, raw_structure) -> str:
+    """THE structure choke point. Runs on EVERY parsed idea, debit and credit alike.
+
+    Returns the canonical form (for the credit path, which stores the canonical CSP string).
+    Raises ValueError -- caught by parse_ideas' except-clause -- for anything not on the
+    allow-list for that side."""
+    canon = _canonical_structure(raw_structure)
+    allowed = frozenset({CSP_STRUCTURE}) if side == "credit" else DEBIT_STRUCTURES
+    if canon not in allowed:
+        raise ValueError(
+            "structure %r is not permitted on side=%r. Permitted: %s. An unrecognised or "
+            "short-premium structure is REFUSED, never guessed -- a naked short has unbounded "
+            "loss and this account may not carry one." % (raw_structure, side,
+                                                          ", ".join(sorted(allowed))))
+    return canon
+
+
+# --------------------------------------------------------------------------------------------
+# CENT-SAFE MONEY  (audit R4 / S2 hole 4)
+#
+# THE DEFECT: money was compared in binary floats. `abs(11815.01 - (12000.0 - 185.0))` is
+# 0.010000000000218279, so the nominal EXACT "$0.01" boundary the spec promises to accept was
+# REJECTED, while $0.009 passed. And JSON booleans are Python ints, so `float(True) == 1.0`
+# silently fabricated a value for EVERY numeric field: `"est_debit_usd": true` became a $100
+# debit, `"strike": true` a $1 strike, `"collateral_usd": true` a $1 collateral.
+#
+# THE FIX: booleans are rejected BEFORE any numeric coercion, and every money comparison is
+# done on exact integer CENTS with a DECLARED INCLUSIVE boundary (see _MAX_LOSS_TOL_CENTS).
+# --------------------------------------------------------------------------------------------
+
+_CENT = Decimal("0.01")
+
+# The spec says max_loss_usd must equal collateral - credit "within $0.01". DECLARED BOUNDARY:
+# INCLUSIVE -- a difference of exactly one cent is ACCEPTED, two cents is refused. In integer
+# cents that boundary is exactly representable, which is the whole point.
+_MAX_LOSS_TOL_CENTS = 1
+
+# Same inclusive one-cent slop for the collateral/strike multiple, to absorb a model rounding
+# its own arithmetic, and nothing more.
+_COLLATERAL_TOL_CENTS = 1
+
+
+def _reject_bool(value, key: str):
+    """`True`/`False` are ints in Python: float(True) == 1.0. Every numeric field must refuse a
+    boolean BEFORE coercion or the parser invents a number the model never stated."""
+    if isinstance(value, bool):
+        raise ValueError("%s must be a number, not the boolean %r" % (key, value))
+    return value
+
+
+def _cents(value, key: str) -> int:
+    """Exact integer cents. Rejects booleans, non-numerics, NaN and +/-Inf.
+
+    Decimal(str(v)) reads the DECIMAL the model wrote rather than its binary approximation, so
+    $0.01 is exactly one cent here and stays exact through every comparison."""
+    _reject_bool(value, key)
+    try:
+        d = Decimal(str(value))
+        if not d.is_finite():
+            raise ValueError("%s must be finite, got %r" % (key, value))
+        return int(d.quantize(_CENT, rounding=ROUND_HALF_UP) * 100)
+    except (InvalidOperation, ArithmeticError, TypeError) as exc:
+        raise ValueError("%s is not a usable decimal amount: %r (%s)" % (key, value, exc))
+
+
+def normalize_csp_direction(raw) -> str:
+    """Audit R4 / S4 ruling: A CASH-SECURED PUT'S DIRECTION IS `bullish`.
+
+    A short put has POSITIVE delta -- you profit if the underlying holds or rises, and the
+    worst case is being assigned long stock at the strike. That is a bullish/neutral thesis;
+    the accepted enum has no neutral value, so it is `bullish`.
+
+    STRICTLY CREDIT-SCOPED. normalize_direction()'s generic `"put" -> bearish` mapping is
+    UNTOUCHED: an ordinary LONG put is still bearish. This function is only ever reached after
+    _parse_credit_fields() has already proved the idea is a fully specified cash-secured put.
+
+      * direction omitted / blank / unrecognised + valid CSP -> infer `bullish`
+      * explicit `bullish` (or a bullish synonym)  + valid CSP -> accept
+      * explicit `bearish` (or a bearish synonym, incl. the literal "put") + CSP -> REJECT
+
+    The bearish case FAILS CLOSED rather than being silently corrected: a model that asks to
+    sell a put while calling it bearish does not understand the position it is proposing, and
+    the rest of its numbers cannot be trusted either."""
+    d = _DIRECTION.get(str(raw if raw is not None else "").strip().lower())
+    if d is None:
+        return "bullish"
+    if d != "bullish":
+        raise ValueError(
+            "direction %r is inconsistent with a cash-secured put: a short put has POSITIVE "
+            "delta and expresses a bullish/neutral thesis. Failing closed rather than "
+            "correcting the model." % (raw,))
+    return "bullish"
+
+
+def normalize_side(raw) -> Optional[str]:
+    """Absent/blank -> "debit" (the historical contract). "credit" only when explicitly asked
+    for. Anything else -> None, which drops the idea: an unrecognised side must never silently
+    fall through to a live order path."""
+    s = str(raw if raw not in (None, "") else "debit").strip().lower()
+    return s if s in _SIDES else None
+
+
+def _canonical_structure(raw) -> str:
+    return re.sub(r"\s+", " ", str(raw if raw is not None else "").strip().lower())
+
+
+def _require_positive(t: dict, key: str) -> float:
+    """Required, finite and > 0. Raises so parse_ideas' existing except-clause drops the idea.
+    Booleans are refused BEFORE coercion (S2 hole 4) -- float(True) == 1.0 would otherwise pass
+    this gate as a legitimate $1.00 / 1-point value."""
+    _reject_bool(t[key], key)    # KeyError propagates == dropped
+    v = float(t[key])            # TypeError / ValueError propagate == dropped
+    if not math.isfinite(v) or v <= 0:
+        raise ValueError("%s must be a finite positive number, got %r" % (key, t[key]))
+    return v
+
+
+def _implied_contracts(strike_cents: int, collateral_cents: int) -> int:
+    """S2 hole 2. A cash-secured put's collateral IS strike x 100 x contracts -- that is what
+    makes it "cash secured" at all. The old parser checked only that collateral was positive,
+    so `strike=120, collateral_usd=1.00, net_credit_usd=0.50, max_loss_usd=0.50` was ACCEPTED:
+    a $12,000 obligation declared as a $1 one, with the max_loss arithmetic self-consistently
+    agreeing because it was computed from the same fictional collateral.
+
+    THE STRONGEST CHECK THIS SCHEMA SUPPORTS: TradeIdea has no `contracts` field, so the parser
+    cannot verify a specific contract count. It CAN verify that the declared collateral is a
+    POSITIVE INTEGER MULTIPLE of one contract's collateral (strike x 100), which rejects every
+    impossibility -- a fraction of a contract, a rounded-off collateral, an unrelated number --
+    and implies collateral >= strike x 100 for at least one contract.
+
+    RESIDUAL, MUST BE RE-VERIFIED AT SUBMIT TIME: this proves collateral == strike x 100 x N
+    for SOME integer N >= 1; it cannot prove N equals the quantity actually transmitted. Before
+    any order is placed, the submit path must re-check
+        collateral_usd == strike * 100 * order.totalQuantity
+    against the real order object, and against available cash. See trader.credit_structure_ok()
+    for the second (post-parse) enforcement point."""
+    unit_cents = strike_cents * 100          # one contract = 100 shares at the strike
+    if unit_cents <= 0:
+        raise ValueError("strike must be positive to bound collateral")
+    whole, rem = divmod(collateral_cents, unit_cents)
+    if rem > _COLLATERAL_TOL_CENTS and (unit_cents - rem) > _COLLATERAL_TOL_CENTS:
+        raise ValueError(
+            "collateral_usd $%s is not a whole multiple of one contract's collateral "
+            "(strike x 100 = $%s) -- a cash-secured put must post the full assignment cost"
+            % (collateral_cents / 100.0, unit_cents / 100.0))
+    contracts = whole + (1 if rem > _COLLATERAL_TOL_CENTS else 0)
+    if contracts < 1:
+        raise ValueError(
+            "collateral_usd $%s covers less than one contract (strike x 100 = $%s)"
+            % (collateral_cents / 100.0, unit_cents / 100.0))
+    return contracts
+
+
+def _parse_credit_fields(t: dict) -> dict:
+    """Validate the credit limb of a raw idea. Raises ValueError for anything that is not a
+    fully specified, collateral-backed cash-secured put.
+
+    NOTE: normalize_debit() is deliberately NOT applied to any field here. It rescales values
+    under $25 by x100 to repair a per-share/total mix-up on DEBITS; these are already total
+    dollars and a sub-$25 net credit is perfectly legitimate. Applying it would inflate a
+    position 100x."""
+    # Gate 1 (S2 hole 1): the credit allow-list is exactly one structure.
+    _require_allowed_structure("credit", t.get("structure"))
+    # Gate 2: every credit field present, finite, positive, not a boolean.
+    strike = _require_positive(t, "strike")
+    collateral = _require_positive(t, "collateral_usd")
+    net_credit = _require_positive(t, "net_credit_usd")
+    max_loss = _require_positive(t, "max_loss_usd")
+
+    # From here on money is compared in EXACT INTEGER CENTS (S2 hole 4), never binary floats.
+    strike_c = _cents(t["strike"], "strike")
+    collateral_c = _cents(t["collateral_usd"], "collateral_usd")
+    net_credit_c = _cents(t["net_credit_usd"], "net_credit_usd")
+    max_loss_c = _cents(t["max_loss_usd"], "max_loss_usd")
+
+    # Gate 3 (S2 hole 3): a CSP's credit can NEVER reach its collateral -- the credit is a
+    # fraction of the strike, and max_loss = collateral - credit must stay strictly positive.
+    # `collateral=100, credit=100.005, max_loss=0.001` used to be accepted: the absolute
+    # difference tolerance masked an economically impossible, near-zero declared risk.
+    if net_credit_c >= collateral_c:
+        raise ValueError(
+            "net_credit_usd $%.2f >= collateral_usd $%.2f -- impossible for a cash-secured "
+            "put; the credit received is always a fraction of the collateral posted"
+            % (net_credit, collateral))
+
+    # Gate 4 (S2 hole 4): max_loss == collateral - credit, INCLUSIVE $0.01 boundary, in cents.
+    if abs(max_loss_c - (collateral_c - net_credit_c)) > _MAX_LOSS_TOL_CENTS:
+        raise ValueError("max_loss_usd %.2f != collateral_usd %.2f - net_credit_usd %.2f"
+                         % (max_loss, collateral, net_credit))
+
+    # Gate 5 (S2 hole 2): collateral is bound to the strike, not merely positive.
+    contracts = _implied_contracts(strike_c, collateral_c)
+
+    return {
+        "structure": CSP_STRUCTURE,
+        "strike": strike,
+        "collateral_usd": collateral,
+        "net_credit_usd": net_credit,
+        "max_loss_usd": max_loss,
+        # not a TradeIdea field -- returned so callers/tests can see what the collateral implies
+        "implied_contracts": contracts,
+    }
 
 
 def _extract_json(raw: str) -> Optional[dict]:
@@ -173,27 +450,59 @@ def parse_ideas(raw: str) -> List[TradeIdea]:
         if not isinstance(t, dict):
             continue
         try:
+            side = normalize_side(t.get("side"))
+            if side is None:
+                raise ValueError("unrecognised side %r" % (t.get("side"),))
+            if side == "credit":
+                credit = _parse_credit_fields(t)   # raises -> idea dropped
+                # est_debit_usd is NOT required for a credit idea and must not be invented.
+                debit = 0.0
+                structure = credit["structure"]
+                # S4: credit-scoped CSP carve-out. Only reachable once the idea has been
+                # proved to be a valid cash-secured put, so it can never touch a long put.
+                direction = normalize_csp_direction(t.get("direction", ""))
+            else:
+                credit = {}
+                # S2 hole 1: the allow-list now runs on the DEBIT path too. This is the gate
+                # that was missing entirely -- "naked call" / "short strangle" parsed cleanly.
+                _require_allowed_structure("debit", t.get("structure"))
+                debit = normalize_debit(float(_reject_bool(t["est_debit_usd"], "est_debit_usd")))
+                # UNCHANGED: the ORIGINAL string is stored, not the canonical form.
+                structure = str(t.get("structure", "")).strip()
+                direction = normalize_direction(t.get("direction", ""), t.get("structure", ""))
             u = str(t["underlying"]).upper().strip()
-            direction = normalize_direction(t.get("direction", ""), t.get("structure", ""))
-            debit = normalize_debit(float(t["est_debit_usd"]))
+            _hold = t.get("intended_hold_days")
             idea = TradeIdea(
                 underlying=u,
                 is_index=bool(t.get("is_index", u in INDEX_UNDERLYINGS)) or (u in INDEX_UNDERLYINGS),
                 direction=direction or "",
-                structure=str(t.get("structure", "")).strip(),
-                target_dte=int(t["target_dte"]),
-                target_delta=min(1.0, abs(float(t["target_delta"]))),
+                structure=structure,
+                target_dte=int(_reject_bool(t["target_dte"], "target_dte")),
+                target_delta=min(1.0, abs(float(_reject_bool(t["target_delta"], "target_delta")))),
                 est_debit_usd=debit,
-                conviction=max(1, min(10, int(t["conviction"]))),  # 1-10 scale
+                conviction=max(1, min(10, int(_reject_bool(t["conviction"], "conviction")))),
                 thesis=str(t.get("thesis", "")).strip(),
                 profit_target_pct=_clamp_pct(t.get("profit_target_pct"), 20.0, 500.0),
                 stop_pct=_clamp_pct(t.get("stop_pct"), 10.0, 90.0),
+                intended_hold_days=(int(_reject_bool(_hold, "intended_hold_days"))
+                                    if _hold is not None
+                                    and int(_reject_bool(_hold, "intended_hold_days")) > 0
+                                    else None),
+                side=side,
+                collateral_usd=credit.get("collateral_usd", 0.0),
+                net_credit_usd=credit.get("net_credit_usd", 0.0),
+                max_loss_usd=credit.get("max_loss_usd", 0.0),
+                strike=credit.get("strike", 0.0),
             )
         except (KeyError, TypeError, ValueError):
             continue
         if not idea.underlying or idea.direction not in ("bullish", "bearish"):
             continue
-        if idea.target_dte <= 0 or idea.est_debit_usd <= 0 or not (0.0 < idea.target_delta <= 1.0):
+        if idea.target_dte <= 0 or not (0.0 < idea.target_delta <= 1.0):
+            continue
+        # Unchanged debit rejection (was the single :201 condition): a debit idea with no
+        # positive debit is unrecoverable. A credit idea legitimately has no debit at all.
+        if idea.side != "credit" and idea.est_debit_usd <= 0:
             continue
         out.append(idea)
     return out

@@ -366,6 +366,11 @@ def capture_decision(ddir: str, *, source: str, symbol: str,
             "extra": _as_dict(extra),
         }
         _append(decision_context_path(ddir), rec, dedup=True)
+        try:  # v6 raw-event capture (fail-open; never breaks the trading path)
+            from exitmgr import capture_v6 as _v6
+            _v6.on_decision(rec)
+        except Exception:
+            pass
         return rec
     except Exception as e:
         try:
@@ -399,6 +404,11 @@ def capture_no_trade(ddir: str, *, source: str, reason=None, raw_strategist=None
         _di.mark(rec, status=_di.CANONICAL, training=True, pnl=False,
                  reason="abstention has no realized P&L")
         _append(dataset_path(ddir), rec, dedup=True)
+        try:  # v6 raw-event capture (fail-open)
+            from exitmgr import capture_v6 as _v6
+            _v6.on_no_trade(rec)
+        except Exception:
+            pass
         return rec
     except Exception as e:
         try:
@@ -447,6 +457,11 @@ def capture_rejected(ddir: str, *, source: str, symbol: str, reason, stage,
         _di.mark(rec, status=_di.CANONICAL, training=True, pnl=False,
                  reason="rejected proposal has no realized P&L")
         _append(dataset_path(ddir), rec, dedup=True)
+        try:  # v6 raw-event capture (fail-open)
+            from exitmgr import capture_v6 as _v6
+            _v6.on_rejected(rec)
+        except Exception:
+            pass
         return rec
     except Exception as e:
         try:
@@ -509,6 +524,11 @@ def capture_unfilled(ddir: str, *, source: str, symbol: str, con_id=None,
         _di.mark(rec, status=_di.CANONICAL, training=False, pnl=False,
                  reason="unfilled exit has no realized outcome")
         _append(dataset_path(ddir), rec)
+        try:  # v6 raw-event capture (fail-open)
+            from exitmgr import capture_v6 as _v6
+            _v6.on_unfilled(rec)
+        except Exception:
+            pass
         return rec
     except Exception as e:  # never raise into the exit path
         try:

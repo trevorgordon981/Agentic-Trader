@@ -124,6 +124,7 @@ def test_reconcile_pos_consistent_with_journal_qty_not_fatal():
 def _trader(tmp_path, *, kill_switch_path=None, exit_mgr=None):
     ibc = MagicMock()
     ibc.ib = MagicMock()
+    ibc.ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
     ibc.get_positions = AsyncMock(return_value={})
     em = exit_mgr if exit_mgr is not None else MagicMock()
     if exit_mgr is None:

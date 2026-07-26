@@ -223,7 +223,7 @@ class OrderManager:
         `bid` and `trigger_type` are OPTIONAL and default to the guaranteed-fill behavior; the
         caller (manager.py eval loop) HAS both in scope (quotes[con_id]['bid'] and
         trigger.trigger_type) and SHOULD pass them to unlock the bid-anchored floor + passive-target
-        refinements -- FLAGGED for Trevor, couldn't edit manager.py.
+        refinements -- FLAGGED for the operator, couldn't edit manager.py.
         For journaled spreads (spread={"short_con_id": ...}) the close is a single BAG combo
         (SELL the same combo that was bought) so both legs always close atomically -- closing
         the long leg alone would leave a naked short option.
@@ -422,7 +422,7 @@ class OrderManager:
           2) the live portfolio's contract right for this con_id (the entry's real right);
           3) fall back to 'C' with a loud warning.
         TODO(caller): manager.place_close_order should pass right=je.get('right') from the
-        journal so this never has to fall back -- flagged for Trevor (couldn't edit manager.py)."""
+        journal so this never has to fall back -- flagged for the operator (couldn't edit manager.py)."""
         if right in ("C", "P"):
             return right
         try:
@@ -444,7 +444,7 @@ class OrderManager:
     # close below (1 - EXIT_SLIPPAGE_FLOOR) of the mark. This is a CATASTROPHE guard against a
     # broken/1-lot stub bid -- deliberately GENEROUS (a legitimately wide option book still fills;
     # only an obviously-broken bid is refused, and a refused/resting exit is escalated by the
-    # manager's unfilled-order alarm). FLAG for Trevor: make this a config knob
+    # manager's unfilled-order alarm). FLAG for the operator: make this a config knob
     # (e.g. rules.exit_slippage_floor) rather than a module constant. WIRED 2026-07-03: now
     # overridable per-instance via the constructor `exit_slippage_floor` arg (config-driven); this
     # class attr is the ultimate class-level fallback, sourced from the module constant so there is
