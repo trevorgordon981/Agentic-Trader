@@ -97,22 +97,39 @@ class TestNoOp:
 
 
 class TestClampAgainstTierCeiling:
+    """SUPERSEDED 2026-07-26 -- Sol audit R5 section R2 / RULING_TAKE_PROFIT.md.
+
+    This class used to assert that `clamp_tp_sl` clipped a model take-profit to the pot-tier
+    ceiling and, when none was supplied, installed the tier DEFAULT (+20% at the live account
+    size). That is precisely the mechanism Trevor's ruling abolishes: "+20% is doctrine, not a
+    clamp -- a potential exit when the thesis has changed AND value has been given back, never a
+    mechanical target."
+
+    The assertions are inverted rather than deleted, so the removal stays under test: a tiered
+    `cons` may no longer produce a take-profit at ANY pot size, from ANY model input. The tier
+    arithmetic itself (TestTierBoundaries above) is untouched and still passes -- the function is
+    inert, not broken. Full coverage of the new contract lives in tests/test_no_mechanical_tp.py.
+    """
+
     def _cons_for(self, net_liq):
         tp_max, tp_def = _tier(net_liq)
         return replace(C, tp_max_pct=tp_max, tp_pct=tp_def)
 
-    def test_proposed_tp_above_ceiling_clamps_to_ceiling(self):
-        # Small pot: ceiling 25% -> a model +75% target is clipped to 25.
+    def test_proposed_tp_is_no_longer_clipped_into_a_tier_ceiling(self):
+        # Small pot: a model +75% target used to be clipped to the 25% ceiling and installed.
         tp, sl = construction.clamp_tp_sl(75.0, 30.0, self._cons_for(1000))
-        assert tp == 25.0
-        # Big pot: ceiling 60% -> same +75% target now allowed up to 60 (runner not clipped).
+        assert tp is None
+        assert sl == 30.0            # the stop is untouched by any of this
+        # Big pot: same input, same answer. Account size is not an exit signal.
         tp2, sl2 = construction.clamp_tp_sl(75.0, 30.0, self._cons_for(150000))
-        assert tp2 == 60.0
+        assert tp2 is None
+        assert sl2 == 30.0
 
-    def test_proposed_tp_below_ceiling_passes_through(self):
-        tp, sl = construction.clamp_tp_sl(40.0, 30.0, self._cons_for(150000))  # ceiling 60
-        assert tp == 40.0
+    def test_a_sub_ceiling_proposal_is_also_refused(self):
+        # Used to pass straight through as a +40% mechanical target.
+        tp, sl = construction.clamp_tp_sl(40.0, 30.0, self._cons_for(150000))
+        assert tp is None
 
-    def test_zero_tp_uses_tier_default(self):
-        tp, sl = construction.clamp_tp_sl(0.0, 30.0, self._cons_for(30000))  # default 38
-        assert tp == 38.0
+    def test_zero_tp_no_longer_installs_the_tier_default(self):
+        tp, sl = construction.clamp_tp_sl(0.0, 30.0, self._cons_for(30000))  # was +38%
+        assert tp is None

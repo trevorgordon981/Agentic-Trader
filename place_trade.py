@@ -222,8 +222,18 @@ async def run(args):
                     construction.open_book(raw_positions, journal_path), cons)
                 if not budget_ok:
                     reasons.extend(budget_reasons)
-                earnings_days = await asyncio.to_thread(research.days_to_earnings, args.symbol)
-                if earnings_days is None:
+                # INDEX ETFs have no earnings (2026-08-13). days_to_earnings can only return
+                # None for SPY/QQQ/IWM, and this gate treated that None as "unavailable data" and
+                # hard-refused the order -- so every index trade was permanently unplaceable. A
+                # QQQ 725/726C spread was blocked this way at approval. Absence of a thing that
+                # cannot exist is not missing data. Single names are UNCHANGED: an unknown
+                # earnings date there still fails closed, which is a real IV-crush protection.
+                _is_index_sym = args.symbol.upper() in risk.INDEX_UNDERLYINGS
+                earnings_days = (None if _is_index_sym else
+                                 await asyncio.to_thread(research.days_to_earnings, args.symbol))
+                if _is_index_sym:
+                    pass  # index ETFs do not report earnings -- nothing to check, nothing to flag
+                elif earnings_days is None:
                     reasons.append("earnings date unavailable at approval time")
                 else:
                     entry_date = date.today()

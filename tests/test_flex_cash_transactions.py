@@ -19,7 +19,7 @@ AUTHORITATIVE rather than merely conservative:
   * and the pre-existing parse_statement({fills, meta}) contract is bit-for-bit unchanged.
 
 Every ledger write in this file is redirected to tmp_path via $EXITMGR_CASH_LEDGER, so no test
-can ever touch the operator's real ~/contributions.jsonl.
+can ever touch Trevor's real ~/contributions.jsonl.
 
 NEGATIVE CONTROLS.  Several tests are paired with a control that deliberately breaks the thing
 under test and asserts the assertion FLIPS.  A test that passes on both the right and the wrong
@@ -101,7 +101,7 @@ DIVIDEND = _cash(type="Dividends", amount="12.50", dateTime="20260814;202000",
                  symbol="SPY", description="SPY(US78462F1030) CASH DIVIDEND USD 1.25 PER SHARE")
 WITHDRAWAL = _cash(type="Deposits/Withdrawals", amount="-250", dateTime="20260820;202000",
                    settleDate="20260820", reportDate="20260820", transactionID="90000000003",
-                   description="DISBURSEMENT INITIATED BY Example User")
+                   description="DISBURSEMENT INITIATED BY Trevor Gordon")
 INTEREST = _cash(type="Broker Interest Received", amount="1.83", dateTime="20260805;202000",
                  settleDate="20260805", reportDate="20260805", transactionID="90000000004",
                  description="USD CREDIT INT FOR JUL-2026")
@@ -348,7 +348,7 @@ def test_ingest_flex_reports_the_missing_section_without_failing_the_trade_run(t
 
 def test_unparseable_xml_is_not_reported_as_a_missing_section():
     """A truncated download is a different failure from a misconfigured query, and conflating
-    them would send the operator to the IBKR UI to fix something that is not broken."""
+    them would send Trevor to the IBKR UI to fix something that is not broken."""
     s = fi.parse_cash_transactions("<FlexQueryResponse><notclosed>")
     assert s["parsed_ok"] is False
     assert s["section_present"] is False

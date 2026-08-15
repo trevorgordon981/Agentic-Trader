@@ -1,5 +1,6 @@
 """Configuration loading and CLI argument parsing."""
 
+import math
 import os
 from pathlib import Path
 from typing import Optional
@@ -79,7 +80,7 @@ class AutoTrailConfig:
     runner on option-vol noise) and rides the monotonic peak UP; the model can still WIDEN it or
     take_profit early. It NEVER suppresses the take-profit ceiling (only the model's arm_trail does
     that) and NEVER touches the protective stop. Purpose: stop an up-big winner round-tripping to
-    breakeven when the model returns 'hold'. Shipped ENABLED with a wide default per the operator's
+    breakeven when the model returns 'hold'. Shipped ENABLED with a wide default per Trevor's
     'protect gains by default' ask; tune the knobs in config.yaml `rules.auto_trail:`. Disable
     (enabled: false) for an exact no-op (byte-identical to the pre-feature behavior)."""
     enabled: bool = True
@@ -109,7 +110,7 @@ class ConstructionConfig:
     # branch. Declared here because construction_from_dict() FILTERS UNKNOWN KEYS: without
     # these fields the YAML values load and are silently discarded, so editing config.yaml
     # would appear to work and do nothing.
-    credit_min_dte: int = 3                    # weeklies allowed (the operator's real fills: 2-7d writes)
+    credit_min_dte: int = 3                    # weeklies allowed (Trevor's real fills: 2-7d writes)
     credit_max_dte: int = 45                   # HARD ceiling -- refuse rather than round up
     tp_pct: float = 0.30                       # default take-profit = +30% of debit
     tp_min_pct: float = 0.25                   # model TP clamped into [tp_min, tp_max]
@@ -123,6 +124,22 @@ class ConstructionConfig:
     fill_alarm_minutes: int = 15               # unfilled-order Slack alarm (RTH)
     delta_min: float = 0.55                    # long-leg target-delta band
     delta_max: float = 0.65
+    # How fresh an NBBO must be for a candidate to reach Stage B (2026-08-13). Was a hardcoded
+    # 10.0s in entry_safety; a build takes ~30s of sequential IBKR round trips, so the whole
+    # candidate set aged out and 91% of intents died as "0 prefiltered candidates". This is NOT
+    # the fill-safety gate -- reprice_binding re-quotes and re-validates the SELECTED contract at
+    # submission -- it only bounds how stale the quotes the model COMPARES may be.
+    stage_b_quote_max_age_s: float = 45.0
+    # Percent units: entry_spread_pct is ((ask - bid) / midpoint) * 100.  The 25.0
+    # default matches the existing 0.25 maximum-relative-spread liquidity gate.
+    max_entry_spread_pct: float = 25.0
+    # TWO-LEG COMBO liquidity gate (2026-08-13). A vertical crosses BOTH legs' spreads
+    # (bid = long.bid - short.ask, ask = long.ask - short.bid) against a small midpoint, so the
+    # same liquidity yields ~2x the relative spread of a single leg. Holding a combo to the
+    # single-leg 25% was really demanding ~12% per leg and discarded EVERY candidate on the live
+    # ORCL chain (e.g. a $280 spread at 38.3%). 45% is the 25% single-leg standard rescaled for a
+    # two-leg quote, not a relaxation of it. Single legs still use max_entry_spread_pct.
+    max_combo_spread_pct: float = 45.0
     spread_width_max_pct: float = 0.08         # no-IV fallback: spread width <= 8% of spot
     strike_near_spot_pct: float = 0.03         # no-IV fallback: long strike within 3% of spot
     earnings_blackout_enabled: bool = True     # block DEBIT trades that hold THROUGH an earnings
@@ -141,9 +158,24 @@ class ConstructionConfig:
 
 
 def construction_from_dict(d: Optional[dict]) -> ConstructionConfig:
-    """Build a ConstructionConfig from a raw YAML dict, ignoring unknown keys (so a config
-    typo or future key never crashes the trader)."""
-    d = d or {}
+    """Build ConstructionConfig, requiring a valid fail-closed entry-liquidity limit.
+
+    Other unknown keys remain ignored for backwards compatibility.
+    """
+    key = "max_entry_spread_pct"
+    qualified_key = f"construction.{key}"
+    if not isinstance(d, dict) or key not in d:
+        raise ValueError(f"{qualified_key} is required")
+
+    raw_value = d[key]
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+        raise ValueError(f"{qualified_key} must be a finite positive number")
+    value = float(raw_value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{qualified_key} must be a finite positive number")
+
+    d = dict(d)
+    d[key] = value
     known = {f.name for f in ConstructionConfig.__dataclass_fields__.values()}
     return ConstructionConfig(**{k: v for k, v in d.items() if k in known})
 
@@ -288,7 +320,21 @@ def load_config(
                    ('error_channel', ''),  # #error-logs -- unfilled-order fill alarms (2026-07-01)
                    ('llm_endpoint', 'http://127.0.0.1:8082/v1/chat/completions'),
                    ('llm_model', ''), ('manage_positions', True),
+                   # OFF-CYCLE MODEL EXIT MANAGEMENT (2026-08-12). The protective loop evaluates
+                   # static stops every ~30s and must never wait on the model, so the assessment
+                   # runs in a background task and the loop consumes its cached result.
+                   #   manage_positions_interval_s -- how often that task asks the model;
+                   #   manage_positions_max_age_s  -- how old a cached decision may be before a
+                   #     cycle refuses to act on it (a take_profit/cut FORCES a close, so this is
+                   #     a safety bound, not a performance knob). Keep max_age > interval.
+                   ('manage_positions_interval_s', 300),
+                   ('manage_positions_max_age_s', 600),
                    ('approved_names', []), ('allow_model_names', False),
+                   # AUTO-APPROVE (2026-08-14): skip the Slack tap for a proposal the risk
+                   # gate already cleared with zero reasons and inside its per-trade cap.
+                   # Submission still rebuilds and re-runs every hard gate. Default FALSE --
+                   # a missing or unparseable config must never arm autonomous submission.
+                   ('auto_approve_within_gates', False),
                    ('pot_cap_usd', None), ('confident_full_size', False), ('confident_conviction', 4),
                    ('cap_bypass_min_conviction', 6),  # conviction >= this may exceed the soft 12% cap
                                                       # (raised 2026-06-22 from the old effective 4)
@@ -298,7 +344,7 @@ def load_config(
                                                            # multiplier proposed by
                                                            # calibrate_conviction_sizing.py; None/
                                                            # empty => 1.0 (flat, unchanged). PROPOSE-
-                                                           # ONLY: apply only after the operator opts in
+                                                           # ONLY: apply only after Trevor opts in
                                                            # (also wire it in run_trader.py, mirroring
                                                            # conviction_size_curve).
                    ('blocked_names', []), ('blocked_sector_keywords', []),
@@ -306,11 +352,11 @@ def load_config(
                                                   # (subset of the single-name book); 0/empty-map => no-op
                    ('sector_map', {}),            # static symbol->sector/cluster dict (empty => no clustering)
                    ('max_trade_pct', 0.12), ('max_concurrent', 4), ('daily_halt_pct', 0.08),
-                   # TAKE-PROFIT-AND-RELOAD (2026-07-03). Encode the operator's serial-reload exit style:
+                   # TAKE-PROFIT-AND-RELOAD (2026-07-03). Encode Trevor's serial-reload exit style:
                    # when the MODEL banks a winner (take_profit) AND still sees room, bank it and
                    # SUGGEST a fresh same-name entry through the normal propose->approve->submit
                    # path (each reload re-anchors its own 30% stop to the new basis). OFF by default
-                   # -- reload_enabled=False is a pure no-op (today's behavior); the operator flips it on
+                   # -- reload_enabled=False is a pure no-op (today's behavior); Trevor flips it on
                    # deliberately after re-arm + validation. The other knobs only bind when enabled.
                    ('reload_enabled', False),          # master flag; False => feature is a full no-op
                    ('reload_conviction_min', 6),       # friction gate: reload clears only if the

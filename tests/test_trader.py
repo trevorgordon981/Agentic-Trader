@@ -69,6 +69,54 @@ def _trader(tmp_path, **over):
 
 
 @pytest.mark.asyncio
+async def test_strategist_receives_exact_live_account_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(trader.research, "gather", AsyncMock(return_value={}))
+    monkeypatch.setattr(trader, "_market_open", lambda: True)
+    monkeypatch.setattr(
+        trader, "get_pot_snapshot",
+        AsyncMock(return_value=PotSnapshot(1893.01, 1175.42, 1175.42)))
+    seen = {}
+
+    def fake_propose(_endpoint, _model, context, **_kwargs):
+        seen["context"] = context
+        return []
+
+    monkeypatch.setattr(trader, "propose", fake_propose)
+    t = _trader(tmp_path)
+    await t.run_once(dry_run=True)
+    assert "Net liquidation value: $1,893.01" in seen["context"]
+    assert "Available funds: $1,175.42" in seen["context"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_account_skips_entry_model_but_preserves_exit_cycle(tmp_path, monkeypatch):
+    monkeypatch.setattr(trader.research, "gather", AsyncMock(return_value={}))
+    monkeypatch.setattr(trader, "_market_open", lambda: True)
+    monkeypatch.setattr(
+        trader, "get_pot_snapshot",
+        AsyncMock(return_value=PotSnapshot(float("nan"), 9000.0, 1010.0)))
+    proposed = MagicMock(return_value=[IDEA])
+    monkeypatch.setattr(trader, "propose", proposed)
+    t = _trader(tmp_path)
+    await t.run_once(dry_run=True)
+    t.exit_manager.run_cycle.assert_awaited_once()
+    proposed.assert_not_called()
+    assert "account_snapshot_invalid" in (tmp_path / "a.jsonl").read_text()
+
+
+@pytest.mark.asyncio
+async def test_research_failure_fallback_keeps_account_snapshot(tmp_path, monkeypatch):
+    from exitmgr import market
+    monkeypatch.setattr(market, "fetch_universe_quotes", AsyncMock(return_value={}))
+    monkeypatch.setattr(trader.research, "gather", AsyncMock(side_effect=RuntimeError("offline")))
+    t = _trader(tmp_path)
+    context = await t._market_context(
+        [], 0.0, net_liq=1893.01, available_funds=1175.42)
+    assert "Net liquidation value: $1,893.01" in context
+    assert "Available funds: $1,175.42" in context
+
+
+@pytest.mark.asyncio
 async def test_dry_run_never_executes(tmp_path, monkeypatch):
     monkeypatch.setattr(trader.research, "gather", AsyncMock(return_value={}))  # no network in tests
     monkeypatch.setattr(trader, "_market_open", lambda: True)  # deterministic: the 6/28 market-closed

@@ -31,29 +31,59 @@ from typing import List, Optional
 
 from exitmgr.risk import INDEX_UNDERLYINGS
 from exitmgr import provenance
+from exitmgr.entry_contract import (
+    CONTRACT_VERSION,
+    EntryContractError,
+    RuntimeCandidate,
+    StageAIntent,
+    parse_stage_a,
+    parse_stage_b,
+    validate_candidates,
+)
 
-# 1-10 conviction rubric (the operator 2026-06-12): 1-3 desperate-only, 4 below-avg, 5 middle,
+# 1-10 conviction rubric (Trevor 2026-06-12): 1-3 desperate-only, 4 below-avg, 5 middle,
 # 6-8 medium confidence, 8-10 high confidence. Score HONESTLY -- a low score is fine and useful.
 _SCORING = (
     "Score each idea 1-10 on its ABSOLUTE conviction -- this is NOT a rank-ordering of your picks, "
     "and you must NOT default to a 6/5/4 spread. Use the FULL range every day: 8-10 = HIGH "
     "(genuinely strong -- clear catalyst, favorable structure, good risk/reward, you would size up; "
     "use it whenever warranted and do NOT cap a strong idea at 6); 6-7 = MEDIUM (solid but with real "
-    "caveats); 4-5 = MARGINAL (take-it-or-leave-it); 1-3 = WEAK (only if desperate -- and prefer an "
-    "EMPTY slate over forcing weak ideas). Be honest BOTH ways: do not inflate a mediocre idea, and "
+    "caveats); 4-5 = MARGINAL, which is BELOW THE TAKE BAR -- score it honestly and then do not "
+    "propose it at all; 1-3 = WEAK (never propose). Prefer an "
+    "EMPTY slate over forcing weak ideas. Be honest BOTH ways: do not inflate a mediocre idea, and "
     "do not suppress a strong one. If two ideas are both genuinely strong, score BOTH 8+ -- no need "
     "to spread them apart."
 )
 _UNIVERSE = (
-    "Universe: SPY, QQQ, IWM, and liquid large-cap single names only. DO NOT propose biotech / "
-    "pharma names or Elon-Musk-linked companies (e.g. TSLA) -- they are rejected. SPCX is the "
+    "Universe: SPY, QQQ, IWM, and liquid large-cap single names only. DO NOT propose "
+    "Elon-Musk-linked companies (e.g. TSLA) -- they are rejected. SPCX is the "
     "ONE permitted Elon-derivative name (allowed). "
-    "STRUCTURES: use ONLY long calls, long puts, or DEBIT spreads ('call debit spread' / "
-    "'put debit spread') -- you PAY a debit and that debit is your max loss. Do NOT propose credit "
-    "spreads, cash-secured puts, iron condors, or any short-premium / margin structure: the ~$1,000 "
-    "account can't post the collateral and the system only manages long-debit positions. Prefer "
-    "DEBIT SPREADS (cheaper, defined risk). For spreads, est_debit_usd is the NET debit. Keep "
-    "est_debit AFFORDABLE for a ~$1,000 account."
+    # 2026-07-26 (Trevor): the blanket biotech/pharma ban is REPLACED by the mechanism it was
+    # standing in for. The ban existed because biotech gaps had hurt him. Measured from the price
+    # cache: large-cap pharma averages 0.1 down-10% sessions/yr with a worst day of -10.5%, while
+    # the names already on the approved list average 5.7/yr at -22.2% -- i.e. the ban blocked the
+    # safer half of the sector while permitting the riskier names outright. The real hazard is a
+    # SCHEDULED BINARY EVENT that gaps through a stop overnight, which is a pipeline/market-cap
+    # property, not a sector. Stated as a sizing-and-timing rule below rather than an exclusion,
+    # deliberately: Trevor wants the high-volatility names and a gap gate would have cut them.
+    "BINARY EVENTS: if a scheduled binary catalyst (FDA decision, trial readout, earnings) falls "
+    "inside the intended hold, say so in the thesis and either decline or size for a gap THROUGH "
+    "the stop -- an overnight gap fills wherever it opens, not at your stop level. This is about "
+    "the event, not the sector. "
+    "STRUCTURES: long calls, long puts, DEBIT spreads ('call debit spread' / 'put debit "
+    "spread'), or CASH-SECURED PUTS ('cash secured put'). For a debit you PAY the debit and "
+    "that debit is your max loss. For a cash-secured put you RECEIVE a credit and must post "
+    "collateral_usd = strike x 100 x contracts -- THE COLLATERAL, NOT THE CREDIT, is the capital "
+    "the trade ties up, and it is what the size caps measure. A $40 credit on a $15 strike ties up "
+    "$1,500. A cash-secured put must earn at least 1.25% of its collateral in premium, and you must "
+    "state max_loss_usd = collateral_usd - net_credit_usd. Do NOT propose credit spreads, iron "
+    "condors, naked shorts, or any margin structure -- a short that is not fully cash-secured is "
+    "refused at the order layer. Prefer DEBIT SPREADS (cheaper, defined risk). For spreads, "
+    "est_debit_usd is the NET debit. SIZE ONLY FROM A VALID Account sizing snapshot in this "
+    "brief, not from a remembered figure; if that snapshot says unavailable, return no trades. "
+    "One debit may use at most 25% of net liquidation value in premium; one "
+    "cash-secured put may use at most 80% of net liquidation value in collateral. Compute the "
+    "dollar limit from the net liq in this brief."
 )
 _CONTRACT = (
     "OUTPUT CONTRACT -- respond with ONLY this JSON object, no markdown, no prose:\n"
@@ -77,27 +107,244 @@ _CONTRACT = (
     "protects the account."
 )
 
+# SYMMETRY FIX 2026-08-11 (Trevor: "let it trade puts on downtrends").
+#
+# The previous wording was bull-only in effect. Measured over 150 byron setups, the model traded
+# 93% of strong-uptrend tapes and 0 of 56 DOWNTRENDS -- it passed every falling tape rather than
+# buying a put, even though `long put` and `put debit spread` are valid structures. The cause was
+# this paragraph: "trade WITH the trend" was illustrated only with a bullish example, and "do not
+# buy falling knives" reads as "do not act on a downtrend" rather than its actual meaning, "do not
+# buy CALLS into a downtrend." Both directions now carry the same evidentiary bar.
 _REGIME = (
     "ENTRY DISCIPLINE: before any directional idea, confirm the underlying's trend and the broad "
-    "tape (SPY/QQQ) agree with it. Trade WITH the trend -- a bullish call/spread needs the "
-    "underlying confirming higher, not just 'oversold' or 'due to bounce.' Do not fade strong "
-    "momentum or buy falling knives. If the tape is choppy or against you, prefer an empty slate "
-    "or a defined-risk debit spread over a naked long."
+    "tape (SPY/QQQ) agree with it. Trade WITH the trend, in EITHER DIRECTION -- the trend is what "
+    "must be confirmed, not the direction bullish.\n"
+    "  * A confirmed UPTREND (underlying making higher highs, tape agreeing) supports a BULLISH "
+    "idea: a call debit spread or long call.\n"
+    "  * A confirmed DOWNTREND (underlying making lower lows, tape agreeing) supports a BEARISH "
+    "idea with exactly the same standing: a PUT DEBIT SPREAD or long put. A sustained downtrend is "
+    "a tradeable setup, not a reason to sit out. Do not skip it merely because it is short-side.\n"
+    "FADING is the error, not direction. Do not buy calls into a falling tape hoping for a bounce "
+    "('oversold', 'due to bounce'), and do not buy puts into a rising tape hoping for a top. "
+    "'Buying a falling knife' means buying CALLS as something drops -- it does NOT mean declining "
+    "to trade a downtrend. If the tape is genuinely choppy or directionless, prefer an empty slate; "
+    "and prefer a defined-risk debit spread over a naked long in either direction."
+)
+
+# TREVOR'S DOCTRINE, STATED IN-PROMPT (2026-08-10).
+#
+# These three rules were previously carried by the fine-tuned model's own weights (the v6
+# curriculum encodes them) and by downstream code that CLAMPS a violating idea. Neither applies
+# to a general-purpose serving model such as deepseek-v4-flash, which arrives knowing none of
+# them: it proposes off a generic rubric and the runtime silently repairs the result, so the
+# journal records a trade nobody actually reasoned about. Stating them here makes the model
+# reason INSIDE the doctrine instead of being corrected after the fact.
+#
+# Sources: conviction bar = the 629-case byron calibration; DTE scale = the 4-8x sliding rule;
+# construction = the n=524 construction bake-off plus the 2024-26 book A/B.
+_DOCTRINE = (
+    "TREVOR'S DOCTRINE -- these are hard rules of this desk, not preferences.\n"
+    "1. TAKE BAR -- conviction is a BARRIER TO ENTRY, not a label you attach afterwards. Only "
+    "propose a trade at conviction 6 or higher. Conviction 4-5 is a PASS -- "
+    "measured over 629 graded setups, conviction 4-5 ran a 31% win rate at -10% average after "
+    "costs (negative expectancy) while 6/7/8 ran 47%/52%/70%. The edge here is SELECTIVITY; "
+    "participating in modest-edge setups bleeds the account. This bar is a FLOOR on quality, not "
+    "a quota on activity: when the supplied evidence does support a setup at conviction 6 or "
+    "better -- a confirming tape, a clear trend, a real edge you can name -- propose it. Declining "
+    "a genuinely good setup is as much an error as taking a marginal one.\n"
+    "1b. AFFORDABILITY IS A SCREEN, NOT A SIZING STEP. The brief states Max debit per trade. Before you propose a name, satisfy yourself that a defined-risk spread on THAT underlying can be built for less than it. A rough test: a 0.60-delta debit spread typically costs on the order of 2% of the underlying's share price x 100, so a name roughly priced above HALF the Max debit per trade figure in this brief almost never fits. Use the figure in the brief, never a remembered one -- it moves with the account. Proposing an unfundable name is a wasted slot, not a near miss: a $1,627/share name was proposed on 2026-08-14 and its CHEAPEST real spread priced at $1,400, so no strike pair could have worked. Prefer names cheap enough that the budget buys real structure.\n"
+    "2. EXPIRY IS A 5-8x WINDOW ON YOUR OWN INTENDED HOLD, and you must do the arithmetic before "
+    "you answer. For any DEBIT structure: target_dte must land between 5x and 8x "
+    "intended_hold_days. Compute both ends explicitly -- 5 x intended_hold_days and "
+    "8 x intended_hold_days -- and place target_dte inside that window before emitting the intent. "
+    "8x is the default; the tighter end of the window is EARNED, never assumed. NOTHING below 5x, "
+    "ever: if your target_dte is under 5 x intended_hold_days, RAISE it (or shorten "
+    "intended_hold_days) rather than emit the smaller number. Worked example: intended_hold_days 8 "
+    "means target_dte belongs in 40-64; a 30 is a VIOLATION and is rejected. You buy far more time "
+    "than you intend to use because you are paying theta the whole way -- being long-dated relative "
+    "to the hold carries the large majority of the measured edge, more than which structure you "
+    "pick. State in the thesis the multiple you used. This rule governs DEBITS only: a "
+    "CASH-SECURED PUT is the deliberate inverse -- theta works for the seller there, so weeklies "
+    "(3-45 DTE) are correct process, never a violation. "
+    "REACH FOR THE LONGEST HOLD THE BUDGET ALLOWS. The 5-8x window is a floor on expiry, not a target for the hold: nothing caps target_dte below 800, so when a name is cheap enough that a long-dated spread still fits under Max debit per trade, intend a LONGER hold and let the multiple carry target_dte with it -- an intended_hold_days of 45-90 puts target_dte in LEAPS territory (300-720). Long-dated is where the measured edge lives, and on a cheap underlying it costs little to buy far more time than you expect to use. Only fall back to a shorter hold when the premium for a long-dated structure will not fit the cap.\n"
+    "3. CONSTRUCTION: the default build is a LONG-DATED DEBIT SPREAD in the direction the trend "
+    "confirms -- a CALL debit spread on a confirmed uptrend, a PUT debit spread on a confirmed "
+    "downtrend. Everything below applies identically to both; read 'bull call spread' as 'the "
+    "spread on the side the trend supports'. The short leg "
+    "finances part of the long, so the spread is the cheap way to enter long-dated bullish "
+    "exposure -- it is a capital-efficiency choice, not an aversion to naked calls. A long-dated "
+    "naked long call is also acceptable. What is NOT acceptable is choosing between them as a "
+    "function of conviction: conviction-gated structure mixing was tested on the 2024-26 book and "
+    "was dominated by both pure doctrines. Pick the structure on the trade's economics, never on "
+    "the conviction score.\n"
+    "4. LONG-LEG DELTA IS A BAND, NOT A PREFERENCE: for any DEBIT structure, target_delta must "
+    "land between 0.55 and 0.65. This is enforced at runtime -- a value outside the band is "
+    "CLAMPED into it, silently, before the order is built. Anything you ask for below 0.55 "
+    "becomes 0.55. The reason is that far-OTM low-delta legs were the lottery tickets in the "
+    "audit: a 0.55-0.65 leg is already WORKING, not hoping, and it moves with the underlying "
+    "instead of needing a miracle to reach the strike. THE CONSEQUENCE YOU MUST ACT ON: price the "
+    "trade for the leg you will actually be given. A 0.60-delta contract costs materially more "
+    "than a 0.40-delta one, so est_debit_usd and allocation_pct_net_liq must both be computed at "
+    "the IN-BAND delta. Asking for 0.40 and sizing for 0.40 produces a position roughly half the "
+    "size you intended, because the fill happens at the clamped delta and the cash does not "
+    "stretch. Emit target_delta inside 0.55-0.65 and size the trade to THAT contract. This governs "
+    "DEBITS only: a credit structure (CSP) uses your requested delta unclamped, since selling a "
+    "low-delta put is the whole point there."
 )
 
 # Conservative mode (the 15-min loop): silence is allowed.
 SYSTEM_PROMPT = (
     "You are a disciplined options swing-trading strategist for a SMALL account. Propose 0-3 trades "
     "you have genuine conviction on, or an empty list if nothing is compelling -- never force trades. "
-    + _UNIVERSE + "\n" + _REGIME + "\n" + _SCORING + "\n" + _CONTRACT
+    + _UNIVERSE + "\n" + _REGIME + "\n" + _DOCTRINE + "\n" + _SCORING + "\n" + _CONTRACT
 )
 
 # Recommend mode (the daily slate): ALWAYS surface your best ideas, scored honestly.
 RECOMMEND_PROMPT = (
-    "You are an options swing-trading strategist for a SMALL (~$1,000) account. Recommend your "
+    "You are an options swing-trading strategist for a SMALL account whose exact net liquidation value is stated in this brief -- size every trade from THAT figure, never from a remembered one. Recommend your "
     "BEST 1-3 option trade ideas for today. ALWAYS give at least one idea unless the market is "
     "genuinely untradeable -- it is fine to include moderate or weak ideas, just score them "
-    "honestly so the human can judge. " + _UNIVERSE + "\n" + _REGIME + "\n" + _SCORING + "\n" + _CONTRACT
+    "honestly so the human can judge. " + _UNIVERSE + "\n" + _REGIME + "\n" + _DOCTRINE + "\n" + _SCORING + "\n" + _CONTRACT
+)
+
+
+# --------------------------------------------------------------------- TWO-STAGE ENTRY CONTRACT
+#
+# This is deliberately additive.  The legacy TradeIdea contract above remains the compatibility
+# surface for intraday scouting, reload tickets, CLI/manual routes, and their existing tests.  New
+# live-entry callers use Stage A/B below; they never route a Stage A answer through parse_ideas(),
+# whose historical normalisation intentionally repairs fields that stage-ab.v3 must instead reject.
+STAGE_AB_CONTRACT_VERSION = CONTRACT_VERSION
+
+_STAGE_A_UNIVERSE = (
+    "Universe: SPY, QQQ, IWM, and liquid US single names permitted by the supplied market brief. "
+    "Do not propose Elon-Musk-linked companies (for example TSLA); SPCX is the one permitted "
+    "Elon-derivative name. Scheduled binary catalysts inside the intended hold must be stated in "
+    "the thesis and reflected in conviction and allocation. "
+    "The only structures are exactly: long call, long put, call debit spread, put debit spread, "
+    "cash secured put. A cash secured put is side credit, direction bullish. Every other structure "
+    "is side debit; call structures are bullish and put debit structures are bearish."
+)
+
+_STAGE_A_CONTRACT = (
+    f"STAGE A CONTRACT ({STAGE_AB_CONTRACT_VERSION}) -- respond with one complete JSON document "
+    "and nothing else: no markdown, prose, comments, or trailing bytes. The top level has exactly "
+    "one key, intents. Every key appears EXACTLY ONCE in the object that contains it -- a repeated "
+    "key (for example alpha given twice) makes the document invalid and the entire response is "
+    "discarded, so write each field once and only once. "
+    "intents contains zero to three objects, each with exactly these keys: "
+    "underlying, side, direction, structure, target_dte, intended_hold_days, target_delta, "
+    "conviction, allocation_pct_net_liq, alpha, thesis. Use the exact lowercase enum spellings "
+    "given here; the ticker itself must be uppercase. The enum values are these literal strings "
+    "and no others -- SPACE-separated words, never snake_case, camelCase, hyphenated or "
+    'abbreviated. side is exactly "debit" or "credit". direction is exactly "bullish" or '
+    '"bearish". structure is exactly one of "long call", "long put", "call debit spread", '
+    '"put debit spread", "cash secured put". A value such as "call_debit_spread", '
+    '"callDebitSpread", "bull call spread" or "CSP" is rejected outright and your ENTIRE '
+    "response is discarded, so copy the string byte-for-byte. "
+    "target_dte is an integer from 1 through 800; "
+    "intended_hold_days is an integer from 1 through 365 and may not exceed target_dte; "
+    "target_delta is greater than 0 and no greater than 1; conviction is an integer from 1 "
+    "through 10; allocation_pct_net_liq is a percentage greater than 0 and no greater than 100. "
+    "alpha and thesis must both be non-empty: alpha names the expected edge, while thesis states "
+    "the source-bound trade case and invalidation logic. The allocation is intent only; runtime "
+    "will apply the live account and risk caps. "
+    "You must not author or include est_debit_usd, price, premium, strike, expiry, con_id, contract "
+    "identifier, width, bid, ask, credit, collateral, max loss, quantity, or any other key. Runtime "
+    "alone discovers and prices contracts after this response. If declining, emit exactly "
+    '{"intents":[]} and stop; an empty Stage A result is terminal.'
+)
+
+STAGE_A_SYSTEM_PROMPT = (
+    "You are a disciplined options swing-trading strategist for a small account. Choose zero to "
+    "three trade intents only when the supplied evidence supports genuine alpha; never force a "
+    "trade. " + _STAGE_A_UNIVERSE + "\n" + _REGIME + "\n" + _DOCTRINE + "\n" + _SCORING + "\n" + _STAGE_A_CONTRACT
+)
+
+STAGE_A_RECOMMEND_PROMPT = (
+    "You are an options swing-trading strategist for a small account. Return the best one to three "
+    "trade intents supported by today's supplied evidence, scored honestly; an exact empty decline "
+    "is still required when the market is genuinely untradeable. "
+    + _STAGE_A_UNIVERSE + "\n" + _REGIME + "\n" + _DOCTRINE + "\n" + _SCORING + "\n" + _STAGE_A_CONTRACT
+)
+
+# STAGE A GUIDED DECODING (2026-08-10) -- opt-in via TRADER_STRUCTURED_OUTPUT=1.
+#
+# Measured on deepseek-v4-flash over 10 slate cycles: 8 produced fully doctrine-compliant
+# intents and 2 died on a DUPLICATE JSON KEY ("underlying" once, "conviction" once). The Stage A
+# parser rejects duplicate keys deliberately, so each of those cost a whole cycle. Restating the
+# rule in the prompt did NOT fix it -- the repeated key simply moved -- because it is a decoding
+# artifact, not a comprehension failure.
+#
+# vLLM constrains generation to a JSON Schema (xgrammar) when the request carries response_format,
+# which makes a duplicate key structurally unrepresentable rather than merely forbidden. The schema
+# below mirrors entry_contract.parse_stage_a EXACTLY, including additionalProperties: false, so it
+# forbids the same model-authored execution fields (est_debit_usd, strike, expiry, ...) the parser
+# rejects. It is a decode-time restatement of the contract, never a relaxation of it: the parser
+# still runs afterwards and remains the authority.
+#
+# Gated behind an env flag because it is server-dependent -- the custom m3_serve path has no such
+# support and must keep sending an unconstrained body.
+_STAGE_A_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intents": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "underlying": {"type": "string", "pattern": "^[A-Z][A-Z0-9.]{0,7}$"},
+                    "side": {"type": "string", "enum": ["debit", "credit"]},
+                    "direction": {"type": "string", "enum": ["bullish", "bearish"]},
+                    "structure": {"type": "string", "enum": ["long call", "long put",
+                                                             "call debit spread",
+                                                             "put debit spread",
+                                                             "cash secured put"]},
+                    "target_dte": {"type": "integer", "minimum": 1, "maximum": 800},
+                    "intended_hold_days": {"type": "integer", "minimum": 1, "maximum": 365},
+                    "target_delta": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                    "conviction": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "allocation_pct_net_liq": {"type": "number", "exclusiveMinimum": 0,
+                                               "maximum": 100},
+                    "alpha": {"type": "string", "minLength": 1},
+                    "thesis": {"type": "string", "minLength": 1},
+                },
+                "required": ["underlying", "side", "direction", "structure", "target_dte",
+                             "intended_hold_days", "target_delta", "conviction",
+                             "allocation_pct_net_liq", "alpha", "thesis"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["intents"],
+    "additionalProperties": False,
+}
+
+
+def structured_output_enabled() -> bool:
+    """True when the serving engine should be asked to constrain Stage A to the schema."""
+    value = os.environ.get("TRADER_STRUCTURED_OUTPUT", "0").strip().lower()
+    return value not in ("0", "false", "no", "off", "")
+
+
+def _stage_a_response_format():
+    return {"type": "json_schema",
+            "json_schema": {"name": "stage_a_intents", "strict": True,
+                            "schema": _STAGE_A_JSON_SCHEMA}}
+
+
+STAGE_B_SYSTEM_PROMPT = (
+    f"You are the Stage B selector for {STAGE_AB_CONTRACT_VERSION}. Runtime has already rejected "
+    "stale, one-sided, structurally invalid, illiquid, over-cap, and unaffordable contracts. Review "
+    "the supplied immutable Stage A intent and its three to five runtime-priced candidates. Select "
+    "only a supplied candidate whose executable economics best express that intent, or decline. "
+    "Respond with exactly one complete JSON document and nothing else. A selection is exactly "
+    '{"candidate_id":"cand_<64 lowercase hex characters>"}; copy the full candidate_id byte-for-byte '
+    "from the supplied candidates. A decline is exactly {\"decline\":true}. Do not include a "
+    "rationale or any second key. Do not author or alter price, strike, expiry, contract identifier, "
+    "width, credit, collateral, max loss, allocation, cap, or quantity. Decline is terminal."
 )
 
 _DIRECTION = {
@@ -330,6 +577,26 @@ def _canonical_structure(raw) -> str:
     return re.sub(r"\s+", " ", str(raw if raw is not None else "").strip().lower())
 
 
+def _require_finite(t: dict, key: str) -> float:
+    """Required and finite. Sign is PRESERVED -- the caller applies abs().
+
+    CLAUDE FIX 2026-07-26. `json.loads` accepts a bare `NaN` token, and `min(1.0, abs(nan))`
+    returns 1.0 because `nan < 1.0` is False and min() keeps its first argument. A NaN
+    target_delta therefore became delta 1.0 -- the deepest ITM, most expensive contract on the
+    board -- indistinguishable from the model deliberately asking for it. Verified empirically
+    before this fix. Raising here routes it into parse_ideas' existing except-clause, which
+    drops the idea, matching how every other malformed numeric field in this file behaves.
+
+    NOT _require_positive: puts quote a negative delta and the caller takes abs(); requiring
+    positivity would silently drop every put idea.
+    """
+    _reject_bool(t[key], key)    # KeyError propagates == dropped
+    v = float(t[key])            # TypeError / ValueError propagate == dropped
+    if not math.isfinite(v):
+        raise ValueError("%s must be a finite number, got %r" % (key, t[key]))
+    return v
+
+
 def _require_positive(t: dict, key: str) -> float:
     """Required, finite and > 0. Raises so parse_ideas' existing except-clause drops the idea.
     Booleans are refused BEFORE coercion (S2 hole 4) -- float(True) == 1.0 would otherwise pass
@@ -478,7 +745,7 @@ def parse_ideas(raw: str) -> List[TradeIdea]:
                 direction=direction or "",
                 structure=structure,
                 target_dte=int(_reject_bool(t["target_dte"], "target_dte")),
-                target_delta=min(1.0, abs(float(_reject_bool(t["target_delta"], "target_delta")))),
+                target_delta=min(1.0, abs(_require_finite(t, "target_delta"))),
                 est_debit_usd=debit,
                 conviction=max(1, min(10, int(_reject_bool(t["conviction"], "conviction")))),
                 thesis=str(t.get("thesis", "")).strip(),
@@ -518,6 +785,25 @@ def parse_ideas(raw: str) -> List[TradeIdea]:
 _BUSY_BACKOFFS = (8, 16, 24, 32)
 
 
+def _is_empty_completion(result) -> bool:
+    """True when a 200 carried no usable answer: no choices, or blank content AND no tool calls.
+
+    Blank content WITH tool_calls is ordinary function calling and is NOT empty -- retrying that
+    would re-issue a valid tool call. Reasoning-only replies (content blank, reasoning_content
+    populated, no tool call) DO count as empty: the parser cannot use them either.
+    """
+    try:
+        choices = (result or {}).get("choices") or []
+        if not choices:
+            return True
+        msg = (choices[0] or {}).get("message") or {}
+        if msg.get("tool_calls"):
+            return False
+        return not str(msg.get("content") or "").strip()
+    except Exception:
+        return False        # never let the guard itself fail a good response
+
+
 def _post_json(endpoint, body, timeout, retries=5, backoff=None, return_identity=False):
     _env_r = os.environ.get("SLATE_POST_RETRIES")
     if _env_r and _env_r.isdigit():
@@ -548,6 +834,16 @@ def _post_json(endpoint, body, timeout, retries=5, backoff=None, return_identity
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 result = json.loads(r.read().decode(), strict=False)
+                # EMPTY-REPLY RETRY (2026-08-14). A 200 with no content and no tool call is a
+                # silent nothing -- indistinguishable downstream from "the model had no ideas".
+                # Treated like the 503-busy case: retry within the existing bounded backoff.
+                if _is_empty_completion(result) and attempt < retries - 1:
+                    wait = backoff if backoff is not None else _BUSY_BACKOFFS[
+                        min(attempt, len(_BUSY_BACKOFFS) - 1)]
+                    print(f"[strategist] EMPTY reply (no content, no tool_calls), "
+                          f"retry {attempt + 1}/{retries - 1} in {wait}s")
+                    time.sleep(wait)
+                    continue
                 if not return_identity:
                     return result
                 if before is not None:
@@ -597,6 +893,221 @@ def _resolve_thinking(default):
     return v if v in ("enabled", "disabled", "adaptive") else default
 
 
+def _thinking_kwargs(think):
+    """Request fields that actually switch model thinking on/off, for BOTH serving stacks.
+
+    The bare top-level `"thinking"` key is m3_serve_batched's private extension. vLLM ACCEPTS
+    unknown body fields silently (no 400), so after the 2026-08-10 cutover to deepseek-v4-flash
+    every "thinking: enabled" call was a no-op: vLLM was launched with
+    `--default-chat-template-kwargs {"thinking": false}`, so the slate and research paths -- the
+    ones designed to reason deeply -- ran flat, and `reasoning` came back null on every request,
+    so the captured CoT was null for every decision. vLLM's real switch is
+    `chat_template_kwargs`, verified live 2026-08-11: with it set, DeepSeek returns a full
+    reasoning trace; without it, nothing.
+
+    Emitting BOTH keys keeps the custom M3 server working unchanged if it is ever served again.
+    """
+    on = str(think).strip().lower() in ("enabled", "true", "1", "on", "adaptive")
+    return {"chat_template_kwargs": {"thinking": on}}
+
+
+def _read_cot(message):
+    """Chain-of-thought from either serving stack, or None.
+
+    m3_serve_batched publishes it as `reasoning_content`; vLLM's reasoning parser
+    (`--reasoning-parser deepseek_v4`) publishes it as `reasoning`. Reading only the former
+    silently dropped every DeepSeek trace.
+    """
+    if not isinstance(message, dict):
+        return None
+    return message.get("reasoning_content") or message.get("reasoning") or None
+
+
+def _two_stage_message(posted, return_identity):
+    """Return (content, reasoning_content, identity) from one OpenAI-compatible response.
+
+    The legacy callers below retain their historical indexing behavior.  The stage-ab.v3 path is
+    fail-closed: a malformed envelope is a contract failure, never an empty/declined trade.
+    """
+    d, identity = posted if return_identity else (posted, None)
+    try:
+        message = d["choices"][0]["message"]
+        content = message.get("content") or ""
+        cot = _read_cot(message)
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise EntryContractError(f"malformed model response envelope: {exc}") from exc
+    if not isinstance(content, str):
+        raise EntryContractError("model response content must be a string")
+    return content, cot, identity
+
+
+def _two_stage_return(value, content, cot, identity, *, return_raw, return_cot,
+                      return_identity):
+    """Preserve the additive capture tuple convention used by propose()/propose_one()."""
+    if return_identity:
+        return value, content, cot, identity
+    if return_cot:
+        return value, content, cot
+    if return_raw:
+        return value, content
+    return value
+
+
+def _stage_a_prompt(*, recommend: bool, ticker: Optional[str]) -> str:
+    if ticker is None:
+        return STAGE_A_RECOMMEND_PROMPT if recommend else STAGE_A_SYSTEM_PROMPT
+    symbol = str(ticker).strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.]{0,7}", symbol):
+        raise EntryContractError(f"invalid Stage A ticker constraint: {ticker!r}")
+    return (
+        "You are an options swing-trading strategist for a small account. Return at most one trade "
+        f"intent, and it must be for {symbol}; do not emit any other underlying. If the evidence "
+        "does not support real alpha on that name, return the exact terminal decline. "
+        + _STAGE_A_UNIVERSE + "\n" + _REGIME + "\n" + _DOCTRINE + "\n" + _SCORING + "\n" + _STAGE_A_CONTRACT
+    )
+
+
+def propose_intents(endpoint: str, model: str, market_context: str, timeout: int = 300,
+                    recommend: bool = False, thinking: str = None,
+                    return_raw: bool = False, return_cot: bool = False,
+                    return_identity: bool = False, ticker: Optional[str] = None):
+    """Stage A: request strictly validated, price-free trade intents under stage-ab.v3.
+
+    This is a new entry-only surface.  It intentionally does not call parse_ideas(), normalize an
+    enum, repair a number, or derive a missing field.  Any extra/model-authored execution field is
+    rejected by entry_contract.parse_stage_a().  ``ticker`` constrains the add-name route to zero or
+    one intent for exactly that uppercase symbol.
+
+    Return/capture shapes mirror propose(): a bare list by default, then (value, raw),
+    (value, raw, cot), or (value, raw, cot, identity) as the corresponding flag is enabled.
+    """
+    symbol = str(ticker).strip().upper() if ticker is not None else None
+    prompt = _stage_a_prompt(recommend=recommend, ticker=symbol)
+    think = thinking if thinking is not None else (
+        "enabled" if (recommend or symbol is not None) else "disabled")
+    think = _resolve_thinking(think)
+    # The continuous entry loop historically got 1400 tokens because it never reasoned. With
+    # thinking ON the trace is emitted BEFORE the answer, so a 1400 budget would truncate the JSON
+    # behind its own reasoning and fail the contract. 6000 covers an entry-sized trace plus the
+    # answer with room to spare, and the loop runs every 1200s so the extra decode time is free.
+    max_tokens = ((24000 if think == "enabled" else 2000) if (recommend or symbol)
+                  else (6000 if think == "enabled" else 1400))
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": market_context},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.4,
+        "thinking": think,
+        **_thinking_kwargs(think),
+    }
+    if structured_output_enabled():
+        body["response_format"] = _stage_a_response_format()
+    posted = _post_json(endpoint, body, timeout, return_identity=return_identity)
+    content, cot, identity = _two_stage_message(posted, return_identity)
+    intents = parse_stage_a(content)
+    if symbol is not None:
+        if len(intents) > 1:
+            raise EntryContractError(
+                f"ticker-constrained Stage A returned {len(intents)} intents; maximum is one")
+        if any(intent.underlying != symbol for intent in intents):
+            got = ", ".join(intent.underlying for intent in intents)
+            raise EntryContractError(
+                f"ticker-constrained Stage A requested {symbol} but returned {got}")
+    return _two_stage_return(
+        intents, content, cot, identity, return_raw=return_raw, return_cot=return_cot,
+        return_identity=return_identity)
+
+
+def _stage_b_payload(intent: StageAIntent, candidates: List[RuntimeCandidate],
+                     intent_id: Optional[str]):
+    """Build the exact Stage B input and the immutable ID->object selection map."""
+    if not isinstance(intent, StageAIntent):
+        raise EntryContractError("Stage B intent must be a StageAIntent")
+    candidate_list = list(candidates or [])
+    if not 3 <= len(candidate_list) <= 5:
+        raise EntryContractError(
+            f"Stage B requires 3 to 5 runtime candidates, got {len(candidate_list)}")
+    if any(not isinstance(candidate, RuntimeCandidate) for candidate in candidate_list):
+        raise EntryContractError("every Stage B candidate must be a RuntimeCandidate")
+
+    intent_dict = intent.to_dict()
+    candidate_dicts = [candidate.to_dict() for candidate in candidate_list]
+    candidate_ids = [candidate["candidate_id"] for candidate in candidate_dicts]
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise EntryContractError("Stage B candidate_id values must be unique")
+    candidate_intent_ids = {candidate["intent_id"] for candidate in candidate_dicts}
+    if len(candidate_intent_ids) != 1:
+        raise EntryContractError("all Stage B candidates must share one intent_id")
+    supplied_intent_id = next(iter(candidate_intent_ids))
+    if intent_id is not None and str(intent_id) != supplied_intent_id:
+        raise EntryContractError(
+            f"Stage B intent_id mismatch: {intent_id!r} != {supplied_intent_id!r}")
+
+    # Do the full frozen arithmetic/identity/quote/affordability validation before a byte of the
+    # candidate payload reaches the model.  RuntimeCandidate is a dataclass and can be instantiated
+    # directly, so isinstance()/to_dict() alone are not a safety boundary.
+    checked_candidates = validate_candidates(supplied_intent_id, intent, candidate_list)
+    candidate_dicts = [candidate.to_dict() for candidate in checked_candidates]
+
+    for candidate in candidate_dicts:
+        for key in ("underlying", "side", "direction", "structure"):
+            if candidate[key] != intent_dict[key]:
+                raise EntryContractError(
+                    f"Stage B candidate {candidate['candidate_id']} {key} does not match intent")
+    payload = {
+        "intent_id": supplied_intent_id,
+        "intent": intent_dict,
+        "candidates": candidate_dicts,
+    }
+    return payload, candidate_list, dict(zip(candidate_ids, candidate_list))
+
+
+def select_candidate(endpoint: str, model: str, intent: StageAIntent,
+                     candidates: List[RuntimeCandidate], timeout: int = 300,
+                     thinking: str = "disabled", return_raw: bool = False,
+                     return_cot: bool = False, return_identity: bool = False,
+                     intent_id: Optional[str] = None):
+    """Stage B: select one supplied runtime candidate, or return None for terminal decline.
+
+    The model sees only the immutable intent plus 3-5 already filtered runtime candidates.  The
+    strict parser returns a supplied ID or None; this wrapper resolves that ID back to the original
+    RuntimeCandidate object so downstream code stays bound to its exact ordered conIds.  It never
+    reconstructs or substitutes a contract.
+    """
+    payload, candidate_list, by_id = _stage_b_payload(intent, candidates, intent_id)
+    try:
+        user_content = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise EntryContractError(f"Stage B input is not canonical JSON: {exc}") from exc
+    think = _resolve_thinking(thinking)
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": STAGE_B_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": 12000 if think == "enabled" else 400,
+        "temperature": 0.0,
+        "thinking": think,
+        **_thinking_kwargs(think),
+    }
+    posted = _post_json(endpoint, body, timeout, return_identity=return_identity)
+    content, cot, identity = _two_stage_message(posted, return_identity)
+    selected_id = parse_stage_b(content, candidate_list)
+    selected = None if selected_id is None else by_id.get(selected_id)
+    if selected_id is not None and selected is None:
+        # parse_stage_b owns this membership check; keep the wrapper fail-closed if its contract ever
+        # regresses instead of returning an unbound identifier to the money path.
+        raise EntryContractError("Stage B parser returned an unsupplied candidate_id")
+    return _two_stage_return(
+        selected, content, cot, identity, return_raw=return_raw, return_cot=return_cot,
+        return_identity=return_identity)
+
+
 def propose(endpoint: str, model: str, market_context: str, timeout: int = 300,
             recommend: bool = False, thinking: str = None, return_raw: bool = False,
             return_cot: bool = False, return_identity: bool = False):
@@ -626,12 +1137,13 @@ def propose(endpoint: str, model: str, market_context: str, timeout: int = 300,
         "max_tokens": mt,
         "temperature": 0.4,
         "thinking": think,
+        **_thinking_kwargs(think),
     }
     posted = _post_json(endpoint, body, timeout, return_identity=return_identity)
     d, identity = posted if return_identity else (posted, None)
     _msg = d["choices"][0]["message"]
     content = _msg.get("content") or ""
-    cot = _msg.get("reasoning_content") or None  # [m3cot] separate CoT field; None if endpoint stripped it
+    cot = _read_cot(_msg)  # [m3cot] separate CoT field; None if endpoint stripped it
     ideas = parse_ideas(content)  # PARSING UNCHANGED: runs on the clean `content` exactly as before
     if return_identity:
         return (ideas, content, cot, identity)
@@ -641,11 +1153,11 @@ def propose(endpoint: str, model: str, market_context: str, timeout: int = 300,
 
 
 SINGLE_PROMPT = (
-    "You are an options swing-trading strategist for a SMALL (~$1,000) account. The user just added "
+    "You are an options swing-trading strategist for a SMALL account whose exact net liquidation value is stated in this brief -- size every trade from THAT figure, never from a remembered one. The user just added "
     "@@TICKER@@ to their watchlist and wants your SINGLE best option trade idea on @@TICKER@@ right "
     "now -- ONLY @@TICKER@@, no other names. Decide direction (bullish/bearish) and structure "
     "yourself from the market context. Score conviction HONESTLY 1-10; if you have no real edge on "
-    "@@TICKER@@ today, score it low -- do not inflate. " + _UNIVERSE + "\n" + _REGIME + "\n" + _SCORING + "\n" + _CONTRACT
+    "@@TICKER@@ today, score it low -- do not inflate. " + _UNIVERSE + "\n" + _REGIME + "\n" + _DOCTRINE + "\n" + _SCORING + "\n" + _CONTRACT
 )
 
 
@@ -671,12 +1183,13 @@ def propose_one(endpoint: str, model: str, market_context: str, ticker: str, tim
         "max_tokens": 24000 if thinking == "enabled" else 2000,
         "temperature": 0.4,
         "thinking": thinking,
+        **_thinking_kwargs(thinking),
     }
     posted = _post_json(endpoint, body, timeout, return_identity=return_identity)
     d, identity = posted if return_identity else (posted, None)
     _msg = d["choices"][0]["message"]
     content = _msg.get("content") or ""          # clean answer (parsing target, unchanged)
-    cot = _msg.get("reasoning_content") or None  # [m3cot] separate CoT field; None if endpoint stripped it
+    cot = _read_cot(_msg)  # [m3cot] separate CoT field; None if endpoint stripped it
     ideas = [i for i in parse_ideas(content)
              if i.underlying.upper() == ticker.upper()]
     ideas.sort(key=lambda i: -i.conviction)
@@ -692,8 +1205,9 @@ DISCOVER_PROMPT = (
     "You are scouting NEW options swing-trade CANDIDATES for a small US account -- names to put on "
     "a watchlist to research, NOT trades to place now. From today's market context, suggest up to 5 "
     "LIQUID US large-cap stocks or ETFs worth a look (momentum, catalyst, sector rotation). EXCLUDE "
-    "any name already being watched (listed below), and avoid biotech / pharma and Elon-Musk-linked "
-    "names (SPCX is the ONE permitted Elon-derivative name). One short reason each.\n"
+    "any name already being watched (listed below), and avoid Elon-Musk-linked "
+    "names (SPCX is the ONE permitted Elon-derivative name). Flag any name with a scheduled "
+    "binary catalyst (FDA decision, trial readout) in its reason. One short reason each.\n"
     'Respond with ONLY this JSON: {"candidates":[{"ticker":"<SYM>","reason":"<short>"}]}'
 )
 _TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
@@ -718,6 +1232,7 @@ def discover_names(endpoint: str, model: str, market_context: str, exclude, time
         "max_tokens": 12000 if thinking == "enabled" else 700,
         "temperature": 0.6,
         "thinking": thinking,
+        **_thinking_kwargs(thinking),
     }
     d = _post_json(endpoint, body, timeout)
     obj = _extract_json(d["choices"][0]["message"].get("content") or "") or {}

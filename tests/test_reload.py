@@ -1,6 +1,6 @@
 """Take-profit-and-reload loop (2026-07-03).
 
-Encodes the operator's serial-reload exit style as a fill-gated, human-approved SUGGESTION (never an
+Encodes Trevor's serial-reload exit style as a fill-gated, human-approved SUGGESTION (never an
 auto-fire). Covered here:
   * reload verb parse (position_manager) -- only on take_profit, backward-compatible.
   * ExitTrigger carries reload metadata; _apply_decision attaches it only to take_profit.

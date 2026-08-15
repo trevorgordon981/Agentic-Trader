@@ -19,8 +19,8 @@
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>StandardOutPath</key>
-  <string>/path/to/home/exitmgr-app/logs/protective-service.log</string>
+  <string>/path/to/home</string>
   <key>StandardErrorPath</key>
-  <string>/path/to/home/exitmgr-app/logs/protective-service.error.log</string>
+  <string>/path/to/home</string>
 </dict>
 </plist>

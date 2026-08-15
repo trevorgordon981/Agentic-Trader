@@ -19,7 +19,10 @@ from typing import Iterable, Mapping, Optional, Sequence, Tuple
 from exitmgr import risk
 
 
-DEFAULT_APPROVAL_TTL_SECONDS = 300
+# 1800s (2026-08-14): at 300s three correctly-sized, fully-gated trades expired unclicked
+# in a single session. This is the ceiling on the human window; auto_approve_within_gates
+# is what removes the wait entirely for proposals the gate already cleared.
+DEFAULT_APPROVAL_TTL_SECONDS = 1800
 DEFAULT_MATERIAL_PRICE_PCT = 0.03
 DEFAULT_NBBO_MAX_AGE_SECONDS = 10.0
 

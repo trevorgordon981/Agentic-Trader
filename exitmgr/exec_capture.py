@@ -1,10 +1,10 @@
-"""External-fill capture (2026-07-03): fold EVERY IBKR account execution -- including the operator's
+"""External-fill capture (2026-07-03): fold EVERY IBKR account execution -- including Trevor's
 MANUAL / direct-in-TWS trades -- into the trade_dataset.v2 training corpus.
 
 WHY THIS EXISTS
 ---------------
 The v2 capture layer (trade_capture.py + ExitManager._log_trade_dataset) only records trades that
-flow through Alfred: an entered decision or a manager-placed close. the operator's real edge is MANUAL
+flow through Alfred: an entered decision or a manager-placed close. Trevor's real edge is MANUAL
 trading (orders he punches straight into TWS / the mobile app). Those fills never touch Alfred, so
 they were INVISIBLE to the dataset. This module pulls the account's executions directly from IBKR
 (READ-ONLY: reqExecutionsAsync + the bundled commissionReport) and appends any NON-app-origin fill
@@ -24,7 +24,7 @@ DESIGN
     order Alfred places -- including the trader's rotated ids -- carries a non-zero clientId). A
     TWS/mobile MANUAL order always reports clientId==0, so clientId==0 (with no dataset match) is the
     honest, robust manual signal. Non-zero unknown clientIds are treated as app-origin so an Alfred
-    fill is NEVER mis-tagged as the operator's manual trade.
+    fill is NEVER mis-tagged as Trevor's manual trade.
   * pairing: manual fills are grouped by contract (conId) and paired open<->close using IBKR's own
     per-fill realizedPNL as the authoritative "this fill CLOSED something" signal. A fully-closed
     round trip becomes ONE `kind:"trade"` row with a REAL entry debit (opening fills) + realized P&L
@@ -45,6 +45,7 @@ Entry points:
                                             each exit cycle going forward.
   * capture_external_fills_blocking(...) -- thin sync wrapper for CLI / cron use.
 """
+import asyncio
 import json
 import os
 import shutil
@@ -696,10 +697,14 @@ async def fetch_fills(ib, lookback_days: int = 7) -> List[dict]:
     call in this module. Returns normalized fill dicts. Never raises (returns [] on error)."""
     try:
         ef = _exec_filter(lookback_days)
-        fills = await ib.reqExecutionsAsync(ef)
+        # BOUNDED (2026-08-13): same call that wedged manager.py's terminal lookup tonight. The
+        # except below already returns [] on error, and asyncio.TimeoutError is an Exception, so
+        # a stall now degrades to "no fills this pass" instead of hanging the caller forever.
+        _FILLS_TIMEOUT_S = 30
+        fills = await asyncio.wait_for(ib.reqExecutionsAsync(ef), _FILLS_TIMEOUT_S)
     except Exception as e:
         try:
-            print(f"[WARN] reqExecutionsAsync failed: {e}")
+            print(f"[WARN] reqExecutionsAsync failed: {str(e) or type(e).__name__}")
         except Exception:
             pass
         return []

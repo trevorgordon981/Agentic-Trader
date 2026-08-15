@@ -159,6 +159,18 @@ class ExitTrigger:
     # existing trigger. reload_conviction is the MODEL's read (1-10) of continuation strength.
     reload: bool = False
     reload_conviction: Optional[float] = None
+    # SHORT (CREDIT) POSITIONS (2026-07-26, ADDITIVE -- both default to the LONG reading, so every
+    # existing trigger construction and every existing consumer is byte-for-byte unchanged).
+    #   is_short     -- True IFF this trigger came from the evaluate_short_* family. A consumer
+    #                   that signs P&L, sizes an order, or picks a BUY/SELL action MUST branch on
+    #                   this; `pnl_pct` below is already short-signed, and closing this position
+    #                   is a BUY, not a SELL.
+    #   entry_credit -- the CREDIT RECEIVED at entry, in dollars, always positive. It is the
+    #                   short's basis. `entry_debit` above carries the SAME number for a short
+    #                   (it is the dataclass's generic "basis dollars" field) -- but a reader must
+    #                   not infer "we paid this" from it. When is_short is True, cash moved IN.
+    is_short: bool = False
+    entry_credit: Optional[float] = None
 
 
 def evaluate_profit_target(
@@ -386,6 +398,336 @@ def evaluate_trailing_stop(
     return None
 
 
+# =========================================================== SHORT (CREDIT) POSITIONS
+# (2026-07-26.)  A SOLD option is the P&L MIRROR of a bought one, and every bug this section
+# exists to prevent descends from one fact:
+#
+#       A SHORT POSITION GAINS WHEN THE OPTION PRICE **FALLS**.
+#
+# Every rule above reads "price up = good".  Handing a short to them does not merely fail, it
+# INVERTS.  A cash-secured put that has decayed $4.00 -> $0.40 is a +90% WIN (the textbook
+# "buy it back at 10% of credit" close); evaluate_stop() reads that same tape as a -90% LOSS
+# and fires the protective stop -- buying a winner back at the worst moment and paying the
+# spread to do it.  That inversion is the single highest-risk detail in the short path.
+#
+# These are therefore SEPARATE, EXPLICITLY-NAMED functions rather than a `short=True` flag
+# threaded through the long ones.  A caller cannot reach them by accident, a reviewer cannot
+# mistake which direction a given function reasons in, and the long rules stay byte-identical.
+#
+# BASIS.  A long's basis is the DEBIT PAID (cash out).  A short's basis is the CREDIT RECEIVED
+# (cash in): `entry_credit`, ALWAYS A POSITIVE DOLLAR AMOUNT.  Per share it is
+# entry_credit / (100 * contracts).  It is NEVER the journal's `debit` field -- reading a debit
+# off a credit row is exactly the mistake that made construction.open_book_items() add a CSP's
+# max loss to the long-premium book.  A missing/non-positive credit yields None (no trigger),
+# never a fabricated basis.
+#
+# P&L.   gain_per_share = credit_per_share - current_price          (price falls -> gain)
+#        cost_to_close  = current_price * 100 * contracts           (cash OUT to buy it back)
+#        pnl_pct        = (entry_credit - cost_to_close) / entry_credit * 100
+#
+# QUANTITY.  Every function here accepts the position quantity in EITHER sign and uses
+# abs(quantity) as the contract count.  Direction is carried by the FUNCTION IDENTITY, never by
+# an argument's sign, so a caller passing the broker's -1 and a caller passing 1 get the same
+# correct answer.  Zero is still "no position" -> None.
+#
+# NOT IMPLEMENTED HERE, deliberately: scale-out.  A partial buy-to-close is mechanically valid
+# but the manager's trim bookkeeping (state.scaled_out, runner sizing) is long-shaped, and an
+# untested partial path on real money is worse than no partial path.  A short takes full-exit
+# rules only.
+
+
+def is_short_quantity(quantity) -> bool:
+    """True when `quantity` denotes a SOLD position.  The one predicate every caller that might
+    be handed either book should branch on before choosing a rule family or an order action."""
+    try:
+        return int(quantity) < 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _short_credit_per_share(entry_credit, quantity) -> Optional[float]:
+    """Positive per-share credit received, or None when the basis is unusable.
+
+    None is a REFUSAL, not a zero: with no honest basis there is no honest stop or target, and
+    fabricating one would arm a trigger against a number nobody received."""
+    try:
+        contracts = abs(int(quantity))
+    except (TypeError, ValueError):
+        return None
+    if contracts <= 0:
+        return None
+    try:
+        credit = float(entry_credit)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(credit) or credit <= 0:
+        return None
+    cps = credit / (100.0 * contracts)
+    return cps if cps > 0 and math.isfinite(cps) else None
+
+
+def short_pnl_pct(current_price: float, entry_credit: float, quantity: int) -> float:
+    """Short P&L as a percentage of the credit received.
+
+    POSITIVE when the option price has FALLEN (we can buy it back for less than we sold it).
+    This is the exact sign inversion of calculate_pnl_pct(); the two must never be swapped.
+    0.0 when the basis or price is unusable (mirrors calculate_pnl_pct's unusable-input return)."""
+    cps = _short_credit_per_share(entry_credit, quantity)
+    if cps is None:
+        return 0.0
+    try:
+        px = float(current_price)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(px):
+        return 0.0
+    contracts = abs(int(quantity))
+    credit = float(entry_credit)
+    cost_to_close = px * 100 * contracts
+    return (credit - cost_to_close) / credit * 100.0
+
+
+def _short_trigger(trigger_type: str, current_price: float, entry_credit: float,
+                   quantity: int, message: str) -> ExitTrigger:
+    """Build a short ExitTrigger with the basis/value/P&L fields filled in the SHORT sense.
+
+    `current_value` is the COST TO CLOSE (cash out to buy it back), not a mark-to-market asset
+    value -- for a short there is no asset, there is an obligation.  `entry_debit` carries the
+    credit because it is the dataclass's generic basis field; `is_short`/`entry_credit` are what
+    tell a consumer which way round it is."""
+    contracts = abs(int(quantity))
+    px = float(current_price)
+    credit = float(entry_credit)
+    return ExitTrigger(
+        con_id=0,  # set by the caller, exactly like the long family
+        trigger_type=trigger_type,
+        current_price=px,
+        entry_debit=credit,
+        current_value=px * 100 * contracts,
+        pnl_pct=short_pnl_pct(px, credit, contracts),
+        message=message,
+        is_short=True,
+        entry_credit=credit,
+    )
+
+
+def evaluate_short_profit_target(
+    current_price: float,
+    entry_credit: float,
+    quantity: int,
+    profit_target_pct: float,
+) -> Optional[ExitTrigger]:
+    """Buy-to-close at a profit: fires once enough of the credit has DECAYED AWAY.
+
+    target_price = credit_per_share * (1 - profit_target_pct/100); fires when the price has
+    fallen TO OR BELOW it.  profit_target_pct=80 on a $4.00 credit targets a $0.80 buyback.
+    Note the direction: `<=`, the mirror of the long target's `>=`."""
+    cps = _short_credit_per_share(entry_credit, quantity)
+    if cps is None:
+        return None
+    try:
+        px = float(current_price)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(px) or px < 0:
+        return None
+    target_price = max(0.0, cps * (1 - float(profit_target_pct) / 100.0))
+    if px <= target_price:
+        return _short_trigger(
+            "profit_target", px, entry_credit, quantity,
+            f"Short profit target hit: price={px:.4f} <= target={target_price:.4f} "
+            f"(credit={cps:.4f}/sh; the credit has decayed {float(profit_target_pct):.0f}%)",
+        )
+    return None
+
+
+def evaluate_short_stop(
+    current_price: float,
+    entry_credit: float,
+    quantity: int,
+    stop_pct: float,
+) -> Optional[ExitTrigger]:
+    """Protective stop for a short: fires when buying it back has grown EXPENSIVE.
+
+    stop_price = credit_per_share * (1 + stop_pct/100); fires when the price has RISEN to or
+    above it.  stop_pct=100 on a $4.00 credit stops out at an $8.00 buyback (the classic
+    "close at 2x credit" CSP stop).  Direction is `>=`, the mirror of the long stop's `<=` --
+    and a profitable short (price BELOW the credit) can never satisfy it."""
+    cps = _short_credit_per_share(entry_credit, quantity)
+    if cps is None:
+        return None
+    try:
+        px = float(current_price)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(px) or px < 0:
+        return None
+    stop_price = cps * (1 + float(stop_pct) / 100.0)
+    if px >= stop_price:
+        return _short_trigger(
+            "stop", px, entry_credit, quantity,
+            f"Short stop hit: price={px:.4f} >= stop={stop_price:.4f} "
+            f"(credit={cps:.4f}/sh; buyback costs {float(stop_pct):.0f}% more than collected)",
+        )
+    return None
+
+
+def evaluate_short_time_stop(
+    current_price: float,
+    entry_credit: float,
+    quantity: int,
+    days_to_expiry: Optional[int],
+    time_stop_days: int,
+) -> Optional[ExitTrigger]:
+    """DTE-based close for a short.  The DTE test itself is direction-free; only the reported
+    P&L had to be inverted (which is why this cannot just reuse evaluate_time_stop)."""
+    if days_to_expiry is None:
+        return None
+    if _short_credit_per_share(entry_credit, quantity) is None:
+        return None
+    if days_to_expiry <= time_stop_days:
+        return _short_trigger(
+            "time_stop", current_price, entry_credit, quantity,
+            f"Short time stop hit: DTE={days_to_expiry} <= {time_stop_days}",
+        )
+    return None
+
+
+def evaluate_short_trailing_stop(
+    current_price: float,
+    entry_credit: float,
+    quantity: int,
+    trough_since_arm: Optional[float] = None,
+    activation_gain_pct: float = 0.0,
+    giveback_fraction: float = 0.0,
+    *,
+    armed: bool = False,
+) -> Optional[ExitTrigger]:
+    """MIRROR of evaluate_trailing_stop for a short -- protects DECAY already banked.
+
+    A long's favourable extreme is a price HIGH, so its ratchet is a PEAK that only moves UP and
+    its protected level is a FLOOR the price falls INTO.  A short's favourable extreme is a price
+    LOW, so the ratchet is a TROUGH that only moves DOWN and the protected level is a CEILING the
+    price rises INTO.  Every comparison is flipped:
+
+        best_gain     = credit_per_share - trough_since_arm         (long: peak - entry)
+        trigger_price = trough_since_arm + best_gain * giveback     (long: peak - gain*giveback)
+        fires when      current_price >= trigger_price              (long: <=)
+
+    giveback_fraction=0.4 keeps at least 60% of the banked decay either way.
+
+    ARMING IS NOT DECIDED HERE, exactly as on the long side (Sol audit R5 R1): the caller passes
+    the persisted `armed` flag and the post-arm ratchet.  Unarmed => no trailing exit exists and
+    the protective stop alone governs.  `trough_since_arm` is the LOWEST price seen since arming;
+    a caller that passes a lifetime peak, or a long's peak_since_arm, will get nonsense -- the
+    parameter is named `trough` so that mistake is visible at the call site."""
+    if not armed:
+        return None
+    if trough_since_arm is None:
+        return None
+    cps = _short_credit_per_share(entry_credit, quantity)
+    if cps is None:
+        return None
+    try:
+        px = float(current_price)
+        trough = float(trough_since_arm)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(px) and math.isfinite(trough)) or px < 0 or trough < 0:
+        return None
+
+    # Secondary price guard, mirrored: the trough must be at or BELOW the activation price
+    # (i.e. enough of the credit had decayed), where the long requires peak >= activation.
+    activation_price = cps * (1 - float(activation_gain_pct) / 100.0)
+    if trough > activation_price:
+        return None
+
+    best_gain = cps - trough
+    if best_gain <= 0:
+        return None
+    max_giveback = best_gain * float(giveback_fraction)
+    trigger_price = trough + max_giveback
+
+    if px >= trigger_price:
+        return _short_trigger(
+            "trailing_stop", px, entry_credit, quantity,
+            f"Short trailing stop hit: price={px:.4f} >= trigger={trigger_price:.4f} "
+            f"(trough_since_arm={trough:.4f}, credit={cps:.4f}/sh, "
+            f"keep {(1 - float(giveback_fraction)):.0%} of banked decay)",
+        )
+    return None
+
+
+def evaluate_short_position(
+    con_id: int,
+    symbol: str,
+    quantity: int,
+    entry_credit: float,
+    current_price: float,
+    days_to_expiry: Optional[int],
+    rules: RulesConfig,
+    trail_armed: bool = False,
+    trough_since_arm: Optional[float] = None,
+) -> Optional[ExitTrigger]:
+    """Evaluate every active exit rule for a SHORT position; highest-priority trigger or None.
+
+    Structurally identical to evaluate_position (same rule gates, same priority map) so the two
+    stay reviewable side by side -- but every rule it calls is from the evaluate_short_* family,
+    and the basis is `entry_credit`, not a debit.  Scale-out is deliberately absent (see the
+    section header).  Returns None when the credit basis is unusable: no honest basis, no
+    trigger, and the caller is expected to surface that as UNMANAGED rather than as protected."""
+    triggers: List[ExitTrigger] = []
+
+    if rules.profit_target_pct is not None and rules.profit_target_pct > 0:
+        trigger = evaluate_short_profit_target(
+            current_price, entry_credit, quantity, rules.profit_target_pct
+        )
+        if trigger:
+            trigger.con_id = con_id
+            triggers.append(trigger)
+
+    if rules.stop_pct is not None and rules.stop_pct > 0:
+        trigger = evaluate_short_stop(
+            current_price, entry_credit, quantity, rules.stop_pct
+        )
+        if trigger:
+            trigger.con_id = con_id
+            triggers.append(trigger)
+
+    if rules.time_stop_days is not None and rules.time_stop_days > 0:
+        trigger = evaluate_short_time_stop(
+            current_price, entry_credit, quantity, days_to_expiry, rules.time_stop_days
+        )
+        if trigger:
+            trigger.con_id = con_id
+            triggers.append(trigger)
+
+    if rules.trailing.enabled and trail_armed and trough_since_arm is not None:
+        trigger = evaluate_short_trailing_stop(
+            current_price, entry_credit, quantity, trough_since_arm,
+            rules.trailing.activation_gain_pct,
+            rules.trailing.giveback_fraction,
+            armed=True,
+        )
+        if trigger:
+            trigger.con_id = con_id
+            triggers.append(trigger)
+
+    if triggers:
+        # Same priority map as the long side; scale_out simply never appears.
+        priority = {
+            "profit_target": 1,
+            "trailing_stop": 2,
+            "stop": 3,
+            "scale_out": 4,
+            "time_stop": 5,
+        }
+        triggers.sort(key=lambda t: priority.get(t.trigger_type, 99))
+        return triggers[0]
+
+    return None
+
+
 def evaluate_position(
     con_id: int,
     symbol: str,
@@ -398,6 +740,7 @@ def evaluate_position(
     already_trimmed: bool = False,
     trail_armed: bool = False,
     peak_since_arm: Optional[float] = None,
+    entry_credit: Optional[float] = None,
 ) -> Optional[ExitTrigger]:
     """
     Evaluate all active exit rules for a position.
@@ -413,7 +756,36 @@ def evaluate_position(
     to unarmed/None so a caller that has not been wired up can never accidentally fire a trail.
     `peak_price` is the monotonic LIFETIME peak: it is kept for audit/MFE reporting and is
     deliberately NOT used to arm the trail or to set its floor.
+
+    SHORT ROUTING (2026-07-26).  A NEGATIVE `quantity` is a SOLD position and is routed to
+    evaluate_short_position, whose rules are P&L-inverted (a short gains when the price FALLS).
+    Before this, a short fell through every `quantity <= 0` guard below and this function
+    returned None -- which the manager's _enforce_airtight_stop then reported as "protected".
+    That was a FALSE SAFETY SIGNAL: nothing was armed at all.  `quantity > 0` reaches the
+    original long body below completely unchanged, and `quantity == 0` still returns None.
+    A short REQUIRES `entry_credit` (dollars collected, positive); without it there is no honest
+    basis, so this refuses LOUDLY and returns None rather than silently pretending to protect.
+    `peak_since_arm` is reinterpreted as the post-arm TROUGH for a short -- the favourable
+    extreme of a short is a price LOW.
     """
+    if is_short_quantity(quantity):
+        if _short_credit_per_share(entry_credit, quantity) is None:
+            print(f"[WARN] con_id={con_id} ({symbol}): SHORT position qty={quantity} has no usable "
+                  f"entry_credit basis (got {entry_credit!r}); NO exit rule can be evaluated. "
+                  f"This position is UNMANAGED -- it is NOT protected by a stop.")
+            return None
+        return evaluate_short_position(
+            con_id=con_id,
+            symbol=symbol,
+            quantity=quantity,
+            entry_credit=entry_credit,
+            current_price=current_price,
+            days_to_expiry=days_to_expiry,
+            rules=rules,
+            trail_armed=trail_armed,
+            trough_since_arm=peak_since_arm,
+        )
+
     triggers: List[ExitTrigger] = []
 
     # Profit target (full exit)

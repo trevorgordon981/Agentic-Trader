@@ -3,7 +3,14 @@
 `format_context` is pure (testable). `fetch_universe_quotes` does the IB I/O and is called by
 the orchestrator; failures there fall back to a no-quotes brief rather than crashing the cycle.
 """
+import asyncio
 from typing import Dict, List
+
+# BOUNDED BROKER READS (2026-08-13). An unbounded `await ib.*Async()` wedged the exit
+# loop for 6+ minutes tonight with every position unevaluated. Same guard applied here.
+# A timeout raises into the caller's existing error handling; a hang has no handler.
+_IB_CALL_TIMEOUT_S = 30
+
 
 
 def format_context(quotes: Dict[str, dict], universe: List[str], today: str,
@@ -41,8 +48,8 @@ def usable_price(px) -> bool:
 async def fetch_universe_quotes(ib, symbols: List[str]) -> Dict[str, dict]:
     """Qualify each underlying as a US stock, fetch tickers, compute % change vs prior close."""
     from exitmgr.ibkr import Stock
-    qc = await ib.qualifyContractsAsync(*[Stock(s, "SMART", "USD") for s in symbols])
-    tickers = await ib.reqTickersAsync(*[c for c in qc if getattr(c, "conId", None)])
+    qc = await asyncio.wait_for(ib.qualifyContractsAsync(*[Stock(s, "SMART", "USD") for s in symbols]), _IB_CALL_TIMEOUT_S)
+    tickers = await asyncio.wait_for(ib.reqTickersAsync(*[c for c in qc if getattr(c, "conId", None)]), _IB_CALL_TIMEOUT_S)
     out: Dict[str, dict] = {}
     for tk in tickers:
         sym = getattr(tk.contract, "symbol", None)

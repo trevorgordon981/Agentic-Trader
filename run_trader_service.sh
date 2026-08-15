@@ -19,6 +19,10 @@ export M3_PRIORITY_TOKEN_FILE="${M3_PRIORITY_TOKEN_FILE:-$HOME/.config/m3-servin
 export TRADER_LLM_PRIORITY=0
 export TRADER_REQUIRE_PRIORITY_TOKEN=1
 export TRADER_REQUIRE_RUNTIME_IDENTITY=1
+# Constrain Stage A to the entry-contract JSON schema at DECODE time (vLLM/xgrammar).
+# Measured on deepseek-v4-flash: duplicate-JSON-key contract failures 2/10 cycles -> 0/10.
+export TRADER_STRUCTURED_OUTPUT=1
+
 export TRADER_CAPTURE_EXIT_IDENTITY=1
 exec "$HOME/ib-grader-venv/bin/python" run_trader.py --arm --loop --mode entry \
   --interval 1200 --protective-interval 30

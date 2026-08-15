@@ -11,28 +11,26 @@ Two schedules share this one script:
 
 De-dup: a state file makes alerts edge-triggered -- one ':rotating_light:' when the gateway
 goes DOWN, one ':white_check_mark:' when it comes back UP. No repeat spam while it stays down.
-clientId 96 (no clash with 88/93/95/87/90)."""
+clientId 930 -- 96 was ALSO position_monitor.py's, and that collision made the
+10-min intraday probe lose the race with IBKR error 326 ('client id is already in
+use'), which this script could not distinguish from a logged-out gateway. It was
+emitting FALSE gateway-DOWN alerts. 930-939 is reserved for health probes
+(trader=1, protective=2500+, dd_consider=972, shadow=947)."""
 import argparse, asyncio, json, os, sys, urllib.request
 from datetime import datetime, time as dtime
 sys.path.insert(0, os.path.expanduser('~/exitmgr-app'))
 from exitmgr.connection import IBConnection
+from exitmgr import alerting
 
-CHANNEL = 'C0XXXXXXXXX'  # #trading-alerts
+CLIENT_ID = 930
 STATE = os.path.expanduser('~/exitmgr-app/.gateway_health_state.json')
 
 def slack(msg):
-    tok = None
-    try:
-        for l in open(os.path.expanduser('~/.hermes/.env')):
-            if l.startswith('SLACK_BOT_TOKEN='):
-                tok = l.split('=', 1)[1].strip().strip('"').strip("'"); break
-        if not tok: return
-        urllib.request.urlopen(urllib.request.Request(
-            'https://slack.com/api/chat.postMessage',
-            data=json.dumps({'channel': CHANNEL, 'text': msg}).encode(),
-            headers={'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'}), timeout=10)
-    except Exception as e:
-        print('slack post failed:', e)
+    """Post to #trading-alerts, verifying delivery. Returns True only if Slack
+    said ok:true. Falls back to #error-logs so a problem with the alerts channel
+    cannot mute a live-money gateway alarm outright."""
+    return alerting.post(msg, alerting.alerts_channel(), label='gateway_health',
+                         fallback_channel=alerting.error_channel())
 
 def read_state():
     try:
@@ -55,7 +53,7 @@ def market_open_now():
 
 async def probe():
     """Return (healthy: bool, detail: str)."""
-    conn = IBConnection(host='127.0.0.1', port=4001, client_id=96)
+    conn = IBConnection(host='127.0.0.1', port=4001, client_id=CLIENT_ID)
     ok = await conn.connect()  # single attempt, 10s handshake timeout
     if not ok:
         return False, 'API connect failed (logged out / unreachable)'
@@ -75,16 +73,24 @@ async def main(intraday):
     prev = read_state().get('status')
     if healthy:
         if prev == 'down':
-            slack(':white_check_mark: *IBKR Gateway back UP* and serving accounts. Trading can resume.')
-            print('RECOVERY posted')
+            if slack(':white_check_mark: *IBKR Gateway back UP* and serving accounts. Trading can resume.'):
+                print('RECOVERY posted')
+            else:
+                print('RECOVERY ALERT UNDELIVERED', file=sys.stderr)
         else:
             print('OK:', detail)
         write_state('up'); return 0
     # unhealthy
     if prev != 'down':
-        slack(':rotating_light: *IBKR Gateway DOWN* (%s). Do 2FA / restart now via `~/studio-screen.sh` -- '
+        delivered = slack(':rotating_light: *IBKR Gateway DOWN* (%s). Do 2FA / restart now via `~/studio-screen.sh` -- '
               'no trades can fill until it is back. (Likely IBKR forced 2FA; auto-restart cannot bypass it.)' % detail)
-        print('ALERT posted:', detail)
+        if delivered:
+            print('ALERT posted:', detail)
+        else:
+            # Do NOT record 'down': the de-dup state would suppress every future
+            # retry of an alert that was never actually delivered.
+            print('GATEWAY DOWN BUT ALERT UNDELIVERED:', detail, file=sys.stderr)
+            return 1
     else:
         print('still down (de-duped):', detail)
     write_state('down'); return 1

@@ -29,7 +29,7 @@ INPUT  (read-only; no model, no IBKR, no orders)
       labels.win / outcome
   We do NOT invent a join key -- we read the fields the dataset already joined.
 
-OUTPUT  (PROPOSE-ONLY by default; the operator reviews before it sizes real money)
+OUTPUT  (PROPOSE-ONLY by default; Trevor reviews before it sizes real money)
   * prints the per-bucket table + the overall gate verdict
   * --out PATH  writes a proposed calibration JSON blob (default under data/)
   * --write-config (default OFF) would stage the mapping into config.yaml trading:
@@ -408,7 +408,7 @@ def report(bucket_mult, info):
                      {kk: bucket_mult.get(bb, 1.0) for bb, lv in BUCKET_LEVELS.items() for kk in lv}.items())}))
     if all(abs(v - 1.0) < 1e-9 for v in bucket_mult.values()):
         lines.append("RESULT: FLAT everywhere (no gated edge) -> sizing UNCHANGED vs today.")
-    lines.append("NOTE: PROPOSE-ONLY. Real-money application needs the operator's explicit opt-in "
+    lines.append("NOTE: PROPOSE-ONLY. Real-money application needs Trevor's explicit opt-in "
                  "(review this blob, set config.yaml trading.conviction_size_multipliers, and wire "
                  "run_trader.py like conviction_size_curve).")
     lines.append("=" * 84)
@@ -434,7 +434,7 @@ def build_blob(bucket_mult, conviction_map, info, dataset_path):
         "bucket_notes": info["bucket_notes"],
         "conviction_size_multipliers": {int(k): v for k, v in conviction_map.items()},
         "note": ("PROPOSE-ONLY. Empty/flat => risk.py sizing byte-identical to today. Apply only "
-                 "after the operator reviews: set config.yaml trading.conviction_size_multipliers AND "
+                 "after Trevor reviews: set config.yaml trading.conviction_size_multipliers AND "
                  "wire it into run_trader.py's RiskLimits (mirror conviction_size_curve)."),
     }
 

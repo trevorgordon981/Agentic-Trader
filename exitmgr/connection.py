@@ -1,6 +1,7 @@
 """IB connection and market data management using ib_async."""
 
 import asyncio
+import os
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 
@@ -53,6 +54,10 @@ class IBConnection:
         self.host = host
         self.port = port
         self.client_id = client_id
+        # Pool is derived from the ORIGINAL id so each loop rotates inside its own
+        # disjoint range and can never land on another job's clientId.
+        self._base_client_id = int(client_id) if str(client_id).isdigit() else 0
+        self._rotation_idx = 0
         # 1=live (needs paid subscription), 3=delayed (free; ~15min lag). Default delayed so an
         # unsubscribed account gets usable quotes instead of Error 10089 + NaN tickers.
         self.market_data_type = market_data_type
@@ -62,6 +67,9 @@ class IBConnection:
         # On Error 1100 the uplink drops but our 127.0.0.1 TCP socket stays open, so
         # isConnected() lies True. The errorEvent handler flips this so is_healthy() is honest.
         self._uplink_ok = True
+        # Set when a broker call is refused; forces the next health check to fail so the
+        # loop repairs the link instead of trusting a stale 'healthy' verdict.
+        self._link_fault = False
 
     async def connect(self, retries: int = 0, retry_delay: float = 30.0, force: bool = False) -> bool:
         """Establish connection to IB Gateway/TWS.
@@ -85,9 +93,10 @@ class IBConnection:
             # Error 326 "client id already in use" and the reconnect (and any pending exit
             # order) fails every retry. Account/positions are clientId-independent, so rotate
             # to a fresh high id that won't collide with the other jobs' ids.
-            import random as _rnd
-            self.client_id = _rnd.randint(1000, 9000)
-            print(f"[INFO] reconnect: rotating to fresh clientId={self.client_id} (avoids Error 326)")
+            self.client_id = self._next_rotation_id()
+            n = self._record_rotation()
+            print(f"[INFO] reconnect: rotating to fresh clientId={self.client_id} "
+                  f"(avoids Error 326; rotation {n} today)")
         if self._connected:
             return True
 
@@ -95,14 +104,19 @@ class IBConnection:
         while True:
             self.ib = IB()
             try:
-                await self.ib.connectAsync(
+                # ib_async already applies timeout=10 below; this outer bound is a BACKSTOP
+                # (2026-08-13) for the case where the library timeout does not fire -- the one
+                # failure mode here is "the reconnect loop never returns".
+                _CONNECT_BACKSTOP_S = 30
+                await asyncio.wait_for(self.ib.connectAsync(
                     host=self.host,
                     port=self.port,
                     clientId=self.client_id,
                     timeout=10,
-                )
+                ), _CONNECT_BACKSTOP_S)
                 self._connected = True
                 self._uplink_ok = True
+                self._link_fault = False
                 # (re)subscribe the uplink-health handler on every fresh IB() instance.
                 try:
                     self.ib.errorEvent += self._on_error
@@ -113,7 +127,7 @@ class IBConnection:
                       f"(client_id={self.client_id}, market_data_type={self.market_data_type})")
                 return True
             except Exception as e:
-                print(f"[ERROR] Failed to connect to IB (attempt {attempt+1}/{retries+1}): {e}")
+                print(f"[ERROR] Failed to connect to IB (attempt {attempt+1}/{retries+1}): {str(e) or type(e).__name__}")
                 self._connected = False
                 try:
                     if self.ib:
@@ -143,20 +157,100 @@ class IBConnection:
         """ib_async errorEvent handler. Tracks the gateway<->IBKR UPLINK so is_healthy()
         can tell a stale link from a live one (isConnected() can't). MUST NOT raise.
         1100 = connectivity LOST; 1300 = socket dropped/reset; 2110 = connectivity restored
-        but data farm broken -> treat as not-ok. 1102 = connectivity RESTORED -> ok."""
+        but data farm broken -> treat as not-ok. 1102 = RESTORED (data kept) -> ok.
+        2104/2106/2158/2119 = market-data / HMDS / sec-def farm OK -> ALSO restore: IBKR
+        answers a 2110 with a farm-OK code, never with 1102, which is why the flag was
+        cleared 232x lifetime and restored only 52x.
+        1101 = RESTORED but data subscriptions dropped -> ALSO ok here (quotes are
+        snapshot-fetched per cycle); leaving it unhandled stuck the flag False forever."""
         try:
             if errorCode in (1100, 1300, 2110):
                 self._uplink_ok = False
                 print(f"[WARN] IBKR uplink DOWN (code {errorCode}): {errorString}")
-            elif errorCode == 1102:
+            # 2119 ('farm is CONNECTING') is transitional, NOT up -- excluded on
+            # purpose; 2104 follows within seconds when the farm truly comes up.
+            elif errorCode in (1102, 2104, 2106, 2158):
                 self._uplink_ok = True
                 print(f"[INFO] IBKR uplink RESTORED (code {errorCode}): {errorString}")
+            elif errorCode == 1101:
+                # RESTORED, but IBKR dropped our market-data SUBSCRIPTIONS (2026-08-13). Before
+                # this branch existed, a 1101 left _uplink_ok stuck False forever -- is_healthy()
+                # then failed every cycle and forced a reconnect, which is what produced 115
+                # clientId rotations in one day and put SMCI's trailing stop into a
+                # "Not connected to IB" window.
+                # Safe to treat as restored HERE because quotes are snapshot-fetched per cycle via
+                # reqTickersAsync; no streaming subscription survives a cycle to be lost. If
+                # streaming is ever added, this branch must also re-subscribe.
+                self._uplink_ok = True
+                print(f"[INFO] IBKR uplink RESTORED, data subs dropped (code {errorCode}): "
+                      f"{errorString} -- quotes are re-requested per cycle, continuing")
         except Exception:
             pass
 
+    _ROTATION_POOL_SIZE = 4
+    _ROTATION_COUNT_PATH = os.path.expanduser("~/.local/var/exitmgr/link-rotations.json")
+
+    def _rotation_pool(self):
+        """Four ids reserved to THIS connection, disjoint from every other job's.
+
+        base*10 + 4000 keeps the entry loop (1 -> 4010-4013) and the protective loop
+        (189 -> 5890-5893) apart, and clear of daily_recommend (93), exec_capture (170),
+        close_symbol (95) and the link watchdog (9731)."""
+        start = 4000 + (self._base_client_id * 10)
+        if start < 1000 or start > 8990:          # pathological base -> fold back into range
+            start = 4000 + (abs(hash(self._base_client_id)) % 4000)
+        return [start + i for i in range(self._ROTATION_POOL_SIZE)]
+
+    def _next_rotation_id(self) -> int:
+        pool = self._rotation_pool()
+        cid = pool[self._rotation_idx % len(pool)]
+        self._rotation_idx += 1
+        return cid
+
+    def _record_rotation(self) -> int:
+        """Count rotations per day. 122 in one day (2026-08-14) meant the link was failing its
+        health check constantly; single digits is normal. Persisted so the watchdog can publish
+        it and alert on a rotation storm BEFORE an exit fails to transmit. Best-effort."""
+        try:
+            from datetime import date
+            import json as _json
+            today = str(date.today())
+            data = {}
+            try:
+                with open(self._ROTATION_COUNT_PATH) as fh:
+                    data = _json.load(fh)
+            except Exception:
+                data = {}
+            if data.get("date") != today:
+                data = {"date": today, "count": 0}
+            data["count"] = int(data.get("count", 0)) + 1
+            os.makedirs(os.path.dirname(self._ROTATION_COUNT_PATH), exist_ok=True)
+            tmp = self._ROTATION_COUNT_PATH + ".tmp"
+            with open(tmp, "w") as fh:
+                _json.dump(data, fh)
+            os.replace(tmp, self._ROTATION_COUNT_PATH)
+            return data["count"]
+        except Exception:
+            return -1
+
     def is_healthy(self) -> bool:
-        """Cheap, non-blocking liveness: live socket AND uplink reported up."""
-        return bool(self.ib and self.ib.isConnected() and self._uplink_ok)
+        """Cheap, non-blocking liveness: live socket AND uplink reported up.
+
+        MUST agree with _require_link(). On 2026-08-14 it did not: this tested
+        ib.isConnected() while every broker call tested self._connected, so when the two
+        diverged the loop saw a HEALTHY link and never reconnected while every call raised.
+        3.5h wedge through the open, 436 failures, three stop orders lost. Do not let these
+        two predicates drift apart again."""
+        return bool(self.ib and self.ib.isConnected()
+                    and self._uplink_ok and not self._link_fault)
+
+    def _require_link(self):
+        """Single gate for every broker call. Raising here also ARMS a reconnect: a call that
+        was refused is itself evidence the link is bad, so the next ensure_connected() must
+        fail and repair rather than reporting healthy."""
+        if not self._connected or not self.ib or not self.ib.isConnected():
+            self._link_fault = True       # cleared only by a successful connect()
+            raise RuntimeError("Not connected to IB")
 
     async def ensure_connected(self, probe: bool = True, timeout: float = 5.0) -> bool:
         """Active liveness check. Returns True only if the link is genuinely usable.
@@ -225,10 +319,15 @@ class IBConnection:
         appears, and without this the assignment is indistinguishable from a manual buy-back.
         Stock is NEVER fed to the option management path (its close is not an option order).
         """
-        if not self._connected or not self.ib:
-            raise RuntimeError("Not connected to IB")
+        self._require_link()
 
-        positions = await self.ib.reqPositionsAsync()
+        # BOUNDED (2026-08-12). This await had NO timeout. After an IBKR 1100/1102 uplink
+        # flap the broker never sent the terminating event, so this coroutine awaited
+        # forever -- hanging the protective loop for 84 minutes with three open positions
+        # and NO stop evaluation running. launchd KeepAlive cannot help: the process stays
+        # alive, parked in kevent. A bounded wait degrades that to "this cycle failed",
+        # which the caller already handles and the next 30s cycle retries.
+        positions = await asyncio.wait_for(self.ib.reqPositionsAsync(), 30)
 
         result: Dict[int, PositionData] = {}
         for pos in positions:
@@ -314,10 +413,15 @@ class IBConnection:
             the BAG's own conId (0/unusable) -- so the combo close matches the journaled long leg
             the idempotency check keys on.
         """
-        if not self._connected or not self.ib:
-            raise RuntimeError("Not connected to IB")
+        self._require_link()
 
-        trades = await self.ib.reqAllOpenOrdersAsync()
+        # BOUNDED (2026-08-12). This await had NO timeout. After an IBKR 1100/1102 uplink
+        # flap the broker never sent the terminating event, so this coroutine awaited
+        # forever -- hanging the protective loop for 84 minutes with three open positions
+        # and NO stop evaluation running. launchd KeepAlive cannot help: the process stays
+        # alive, parked in kevent. A bounded wait degrades that to "this cycle failed",
+        # which the caller already handles and the next 30s cycle retries.
+        trades = await asyncio.wait_for(self.ib.reqAllOpenOrdersAsync(), 30)
         _short_legs = {int(c) for c in (short_leg_con_ids or [])}
 
         result: Dict[int, OrderData] = {}
@@ -389,8 +493,7 @@ class IBConnection:
         Returns dict mapping con_id to quote data (bid, ask, last, mark).
         Skips contracts with NaN/stale data.
         """
-        if not self._connected or not self.ib:
-            raise RuntimeError("Not connected to IB")
+        self._require_link()
 
         if not con_ids:
             return {}
@@ -406,13 +509,35 @@ class IBConnection:
 
         # Qualify the conId-only contracts FIRST -- reqTickers on unqualified contracts hangs/times
         # out; qualifying makes option quotes actually stream (restores mechanical TP/SL evaluation).
+        # BOUNDED (2026-08-13). Both reads below were unbounded. The exit engine calls this every
+        # cycle, so a stalled broker read here leaves EVERY position unevaluated -- observed live
+        # tonight as a 6-minute wedge with read/kevent at the stack leaves. A timeout degrades to
+        # "no quotes this cycle" (an existing, tested path that simply skips and retries in 30s),
+        # which is strictly better than never returning.
+        _QUOTE_FETCH_TIMEOUT_S = 30
         try:
-            qc = await self.ib.qualifyContractsAsync(*contracts)
+            qc = await asyncio.wait_for(
+                self.ib.qualifyContractsAsync(*contracts), _QUOTE_FETCH_TIMEOUT_S)
             contracts = [c for c in qc if getattr(c, "conId", None)] or contracts
+        except asyncio.TimeoutError:
+            print(f"[WARN] qualify timed out after {_QUOTE_FETCH_TIMEOUT_S}s in fetch_quotes; "
+                  f"continuing with unqualified contracts")
         except Exception as e:
             print(f"[WARN] qualify failed in fetch_quotes: {e}")
         # Request tickers
-        tickers = await self.ib.reqTickersAsync(*contracts)
+        try:
+            tickers = await asyncio.wait_for(
+                self.ib.reqTickersAsync(*contracts), _QUOTE_FETCH_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # Do NOT hang the exit engine. No quotes -> the manager's existing
+            # "No valid quote ... skipping" path runs, the cycle finishes, and we retry next cycle.
+            print(f"[ERROR] reqTickers timed out after {_QUOTE_FETCH_TIMEOUT_S}s for "
+                  f"{len(contracts)} contracts; returning no quotes this cycle (stops re-evaluate "
+                  f"on the next cycle)")
+            return {}
+        except Exception as e:
+            print(f"[ERROR] reqTickers failed in fetch_quotes ({e}); returning no quotes this cycle")
+            return {}
 
         result: Dict[int, dict] = {}
         for ticker in tickers:
@@ -463,8 +588,7 @@ class IBConnection:
         Place an order using ib's async order placement.
         Returns the order with orderId filled in.
         """
-        if not self._connected or not self.ib:
-            raise RuntimeError("Not connected to IB")
+        self._require_link()
 
         # ib_async: placeOrder is SYNCHRONOUS and returns a Trade immediately
         from exitmgr.order_lock import order_mutation_lock
@@ -478,8 +602,7 @@ class IBConnection:
         ib_async normally performs the same allocation inside ``placeOrder``.  Exposing it one
         step earlier lets the exit manager fsync the exact client-scoped identity first.
         """
-        if not self._connected or not self.ib:
-            raise RuntimeError("Not connected to IB")
+        self._require_link()
         client = getattr(self.ib, "client", None)
         get_req_id = getattr(client, "getReqId", None)
         if not callable(get_req_id):

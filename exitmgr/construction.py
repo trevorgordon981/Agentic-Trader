@@ -8,7 +8,7 @@ on a $13.62 stock); and 82-103% of the pot was in premium at times.
 
 These are PURE functions (no IBKR, offline-testable) enforcing the rulebook wherever orders
 are constructed (daily_recommend.py + exitmgr/trader.py). Every threshold lives in
-config.yaml under `construction:` (see exitmgr.config.ConstructionConfig) so the operator tunes
+config.yaml under `construction:` (see exitmgr.config.ConstructionConfig) so Trevor tunes
 numbers there, never here.
 """
 import json
@@ -177,16 +177,54 @@ def pick_expiry_for_side(expirations, target_dte, side=None, cons=None, today=No
                        prefer_dte_max=b.prefer_dte_max, today=today, max_dte=b.max_dte)
 
 
-# --------------------------------------------------------------- TP/SL clamp (gate A2)
+# ------------------------------------------------- take-profit / stop (gate A2)
+#
+# DOCTRINE-ONLY TAKE-PROFIT (2026-07-26, Sol audit R5 section R2; ruling
+# dataset-v8-build-20260725/RULING_TAKE_PROFIT.md).
+#
+#   Trevor: "+20% is doctrine, not a clamp -- a potential exit when the thesis has changed AND
+#   value has been given back, never a mechanical target."
+#
+# THIS MODULE NO LONGER MANUFACTURES A TAKE-PROFIT. Three mechanical paths were removed together
+# (Sol is explicit that killing the tier table alone was insufficient):
+#   1. caps.tp_tiers -> tp_tier_for_pot -> clamp_tp_sl, which at the live net-liq (~$1,893)
+#      resolved the floor tier and stamped tp_pct 0.20 onto EVERY order;
+#   2. the global rules.profit_target_pct fallback (was 30.0, now null in config.yaml);
+#   3. the mechanical +20% rules.scale_out partial exit (now disabled in config.yaml).
+#
+# +20% is now PROMPT EVIDENCE for the model, not a consumer threshold. A green, thesis-intact
+# trade is a hold/trail; a broken thesis at a loss is a cut (governed by the UNCHANGED -30%
+# stop); a changed thesis plus a real giveback from a positive peak may take profit -- and that
+# is a model-selected action with its own contract, never arithmetic installed at entry.
+#
+# The ONLY numeric automatic take-profit that may still exist is an EXPLICITLY supplied, distant
+# catastrophe backstop in the band below. It is validated, never manufactured.
+TP_BACKSTOP_MIN_PCT = 100.0
+TP_BACKSTOP_MAX_PCT = 500.0
+
+# JOURNAL MIGRATION / VERSION FLAG (R2 requirement 4). Journal entries written BEFORE this change
+# carry a mechanical tier/global target (the live book held 15/20/40/60/75/100). Those numbers must
+# never silently reactivate when the manager reloads an open position after a restart, so a
+# journalled take-profit is honoured ONLY when the entry is stamped with the current policy AND
+# the value is an explicit distant backstop. Anything else reads as "no target".
+# See journal_take_profit_pct().
+TP_POLICY_CURRENT = "explicit-only-v2"
+
 
 def tp_tier_for_pot(net_liq, tiers, fallback_max, fallback_default):
-    """Pot-tiered take-profit ceiling + default (2026-07-03). Returns (tp_max_pct, tp_pct) in
-    FRACTION units (0.35 == 35%), matching cons.tp_max_pct / cons.tp_pct.
+    """SUPERSEDED / INERT (2026-07-26, Sol audit R5 R2). Kept only so the historical entry wiring
+    keeps importing and so its arithmetic stays under test; it can no longer install a target.
 
+    Two independent things now defang it:
+      * `caps.tp_tiers` has been REMOVED from config.yaml, so every production caller passes an
+        empty list and receives the flat fallback;
+      * `clamp_tp_sl` / `optional_take_profit_pct` no longer read `cons.tp_pct` or
+        `cons.tp_max_pct` at all, so even a re-added tier table cannot synthesize a take-profit.
+    DO NOT re-wire this into a take-profit. Account size is not an exit signal.
+
+    Historical contract, unchanged: returns (tp_max_pct, tp_pct) in FRACTION units (0.35 == 35%).
     Picks the HIGHEST tier row whose min_pot <= net_liq; below the lowest tier the lowest row is
-    used (the `< $2,500` floor row). `tiers` is an ordered list of dicts
-    {min_pot, tp_max_pct, tp_pct}. Scales ONLY the take-profit side -- the caller must leave
-    tp_min_pct and sl_pct (the protective stop) untouched.
+    used. Scales ONLY the take-profit side -- it never touched, and still never touches, sl_pct.
 
     FAIL-SAFE, never up-sizes on missing data: empty/None tiers, or a missing/None/NaN net_liq,
     returns the flat (fallback_max, fallback_default) unchanged. Never raises -- a malformed row is
@@ -218,37 +256,114 @@ def tp_tier_for_pot(net_liq, tiers, fallback_max, fallback_default):
     return chosen[1], chosen[2]
 
 
-def clamp_tp_sl(tp_pct, sl_pct, cons):
-    """Clamp sell levels into the audit-backed band. PERCENT units in/out (30.0 = 30%).
+def clamp_stop_pct(sl_pct, cons):
+    """Clamp the PROTECTIVE STOP. PERCENT units in/out (30.0 == 30%), positive magnitude.
 
-    TP: model value clamped into [tp_min_pct, tp_max_pct]; missing/0 -> default tp_pct.
-    (75-100% targets were touched 0/9 times; +25-35% would have recovered ~$590 of ~$800.)
-    SL: missing/0 -> default |sl_pct|; a model stop may be TIGHTER (smaller) than the
-    default but never looser (tightened from the old -50%).
+    THIS IS THE AIRTIGHT LIMB AND IT IS UNCHANGED. The body below is a byte-for-byte lift of the
+    stop half of the pre-R2 `clamp_tp_sl`; R2 removed the take-profit half and nothing else.
+    `tests/test_no_mechanical_tp.py::TestThirtyPercentStopIsByteForByteUnchanged` pins both the
+    source bytes and the behaviour against a frozen reference over an exhaustive input grid.
 
-    ACCEPTED INVERTED REWARD:RISK ON SMALL POTS (INTENTIONAL -- do NOT "fix"): once the pot-tier
-    default TP (config caps.tp_tiers, applied by the caller via tp_tier_for_pot) is 0.20-0.25 on a
-    sub-$5k pot, the resulting default TP can sit BELOW the 30% stop, so reward < risk by design.
-    the operator's deliberate call: bank fast to climb out of down days while the stop still holds at 30%.
-    Intentionally NO post-clamp R:R re-check here -- this clamp must not reject or re-widen a trade
-    just because the accepted small-pot TP is below the stop. (See also config.yaml caps.tp_tiers.)
+    SL: missing/0 -> default |cons.sl_pct|; a model stop may be TIGHTER (smaller) than the
+    default but never looser (tightened from the old -50%). A garbage/hair-trigger value floors
+    at 5%. Never raises.
     """
-    lo = float(cons.tp_min_pct) * 100.0
-    hi = float(cons.tp_max_pct) * 100.0
-    tp_def = float(cons.tp_pct) * 100.0
     sl_def = abs(float(cons.sl_pct)) * 100.0
-    try:
-        tp_in = float(tp_pct or 0.0)
-    except (TypeError, ValueError):
-        tp_in = 0.0
     try:
         sl_in = float(sl_pct or 0.0)
     except (TypeError, ValueError):
         sl_in = 0.0
-    tp = tp_def if tp_in <= 0 else max(lo, min(hi, tp_in))
     sl = sl_def if sl_in <= 0 else min(sl_def, sl_in)
     sl = max(5.0, sl)  # never a hair-trigger stop from a garbage model value
-    return round(tp, 1), round(sl, 1)
+    return round(sl, 1)
+
+
+def optional_take_profit_pct(tp_pct):
+    """Validate an OPTIONAL, EXPLICIT take-profit. Returns (tp_or_None, refusal_note).
+
+    R2 requirement 3: "keep the airtight stop clamp unchanged, but do not synthesize a TP. If an
+    explicit distant catastrophe backstop remains permitted, validate only an explicitly supplied
+    100-500% value; never manufacture one."
+
+    Therefore:
+      * None / absent / 0 / "" / False        -> (None, "")           no target, nothing to log
+      * a value inside [100, 500]             -> (value, "")          explicit distant backstop
+      * ANY other number (incl. 20, 30, 75)   -> (None, <reason>)     REFUSED, and the caller
+        must log the reason -- a rejected take-profit is logged explicitly, never silently
+        rewritten into something else.
+      * garbage / NaN                         -> (None, <reason>)
+
+    Note what is deliberately absent: `cons` is not a parameter. There is no configuration, pot
+    size, tier row or default anywhere in this function that could conjure a number. The only way
+    out with a value is to have supplied one.
+    """
+    if tp_pct is None:
+        return None, ""
+    try:
+        v = float(tp_pct)
+    except (TypeError, ValueError):
+        return None, f"take_profit refused: non-numeric value {tp_pct!r} (no target installed)"
+    if v != v:  # NaN
+        return None, "take_profit refused: NaN (no target installed)"
+    if v <= 0:
+        return None, ""
+    if v < TP_BACKSTOP_MIN_PCT or v > TP_BACKSTOP_MAX_PCT:
+        return None, (
+            f"take_profit +{v:g}% NOT installed -- doctrine-only take-profit (Sol audit R5 R2 / "
+            f"RULING_TAKE_PROFIT.md). A percentage is not an exit signal; a take-profit needs a "
+            f"changed thesis AND a giveback from peak. Only an explicit "
+            f"{TP_BACKSTOP_MIN_PCT:g}-{TP_BACKSTOP_MAX_PCT:g}% catastrophe backstop may be a "
+            f"numeric automatic exit.")
+    return round(v, 1), ""
+
+
+def journal_take_profit_pct(journal_entry):
+    """Read the take-profit of an OPEN-position journal entry, through the R2 migration gate.
+
+    R2 requirement 4: "Existing open-journal tier values need an audited migration/version flag so
+    they cannot silently reactivate after restart."
+
+    Journal lines written before R2 carry a MECHANICAL target -- the pot-tier stamp at entry, or
+    the old global 30% fallback (the live book held 15 / 20 / 40 / 60 / 75 / 100). Those lines are
+    unstamped, so this returns None for every one of them: on a restart they reload with NO
+    automatic profit target, exactly as if they had been opened today. No journal data is
+    rewritten; the migration is read-side and therefore cannot corrupt the audit record.
+
+    A value survives ONLY if BOTH hold:
+      * the entry is stamped `tp_policy == TP_POLICY_CURRENT` (written by the post-R2 entry path);
+      * the value passes `optional_take_profit_pct` (an explicit 100-500% distant backstop).
+
+    Returns Optional[float] in PERCENT units.
+    """
+    je = journal_entry or {}
+    try:
+        policy = je.get("tp_policy")
+    except AttributeError:
+        return None
+    if policy != TP_POLICY_CURRENT:
+        return None
+    tp, _note = optional_take_profit_pct(je.get("profit_target_pct"))
+    return tp
+
+
+def clamp_tp_sl(tp_pct, sl_pct, cons):
+    """Resolve the sell levels for an entry. Returns (Optional[take_profit_pct], stop_pct).
+
+    SPLIT under Sol audit R5 R2: this is now a thin composition of the two independent limbs.
+      * the STOP goes through `clamp_stop_pct` -- unchanged, always a number, airtight;
+      * the TAKE-PROFIT goes through `optional_take_profit_pct` -- and is **None** unless the
+        caller explicitly supplied a distant 100-500% catastrophe backstop.
+
+    The first element is therefore OPTIONAL and callers must handle None. Nothing here reads
+    `cons.tp_pct` / `cons.tp_min_pct` / `cons.tp_max_pct` any more, so neither a pot tier nor a
+    construction default can put a profit target on an order. PERCENT units in/out.
+
+    (The superseded "accepted inverted reward:risk on small pots" note that used to live here is
+    gone with the mechanism it defended: there is no longer a manufactured small-pot TP to sit
+    below the stop. See config.yaml and RULING_TAKE_PROFIT.md.)
+    """
+    tp, _note = optional_take_profit_pct(tp_pct)
+    return tp, clamp_stop_pct(sl_pct, cons)
 
 
 # --------------------------------------------------------------- structure sanity (gate A3)

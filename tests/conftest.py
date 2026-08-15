@@ -132,3 +132,45 @@ def temp_journal_file(tmp_path):
 """
     journal_path.write_text(journal_content)
     return str(journal_path)
+
+
+# ---------------------------------------------------------------- Slack containment (2026-08-13)
+# Running the exit regression posted FABRICATED "EXIT DECISION" cards to Trevor's real Slack --
+# SMCI at -39.8%, SPCX at -366.1% (impossible: a debit spread bottoms at -100%). They carried real
+# con_ids, so they read as though live positions had been cut. Individual tests do patch
+# alerting.post, and cards still escaped, so the guard belongs at the SUITE boundary.
+#
+# Session-scoped + autouse: no test can reach the network. Tests that assert on posting apply
+# their own function-scoped monkeypatch, which takes precedence over this.
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True, scope="session")
+def _block_real_slack():
+    """Refuse every real Slack post for the whole session unless ALLOW_TEST_SLACK=1."""
+    import os as _os
+    if _os.environ.get("ALLOW_TEST_SLACK") == "1":
+        yield
+        return
+    try:
+        from exitmgr import alerting as _alerting
+    except Exception:
+        yield
+        return
+
+    _real = getattr(_alerting, "post", None)
+    _blocked = []
+
+    def _refuse(text, channel_id=None, *a, **k):
+        _blocked.append((channel_id, (text or "")[:120]))
+        return True          # mimic a successful post so dedupe/retry logic behaves normally
+
+    _alerting.post = _refuse
+    try:
+        yield
+    finally:
+        if _real is not None:
+            _alerting.post = _real
+        if _blocked:
+            print("\n[conftest] blocked %d real Slack post(s) during the test run "
+                  "(set ALLOW_TEST_SLACK=1 to permit)" % len(_blocked))

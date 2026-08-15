@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build the operator's daily journal for the Alfred RAG "memory" domain by extracting
+Build Trevor's daily journal for the Alfred RAG "memory" domain by extracting
 key facts from Alfred's conversation history.
 
 Every run, for each target day, it reads that day's messages from
@@ -29,8 +29,28 @@ from datetime import date, datetime, timedelta
 
 STATE_DB = os.path.expanduser("~/.hermes/state.db")
 OUT_DIR = os.path.expanduser("~/rag-journal-stage")
-LLM_ENDPOINT = "http://127.0.0.1:8082/v1/chat/completions"
-LLM_MODEL = "/path/to/model"
+def _configured_llm():
+    """Endpoint/model from the ONE source of truth (exitmgr config `trading` block).
+
+    Was hardcoded to the custom M3 server on :8082, which serves nothing since the 2026-08-10
+    cutover to deepseek-v4-flash -- the ai.alfred.rag-journal job was exiting 255 as a result.
+    Env overrides still win.
+    """
+    try:
+        import sys as _sys
+        _app = os.path.expanduser("~/exitmgr-app")
+        if _app not in _sys.path:
+            _sys.path.insert(0, _app)
+        from exitmgr.config import load_config
+        cfg = load_config(os.environ.get("EXITMGR_CONFIG") or os.path.join(_app, "config.yaml"))
+        return getattr(cfg, "llm_endpoint", None), getattr(cfg, "llm_model", None)
+    except Exception:
+        return None, None
+
+
+_CFG_ENDPOINT, _CFG_MODEL = _configured_llm()
+LLM_ENDPOINT = os.environ.get("LLM_ENDPOINT") or _CFG_ENDPOINT or "http://127.0.0.1:8082/v1/chat/completions"
+LLM_MODEL = os.environ.get("LLM_MODEL") or _CFG_MODEL or "local-model"
 
 MAX_MSG_CHARS = 2000           # truncate any single message
 MAX_TRANSCRIPT_CHARS = 150000  # total budget sent to the model (keep most recent if over)
@@ -49,9 +69,9 @@ def _date_block(target):
 
 
 SYSTEM_PROMPT = (
-    "You maintain the operator's daily journal. You are given timestamped excerpts from "
+    "You maintain Trevor's daily journal. You are given timestamped excerpts from "
     "his assistant Alfred's conversations on a single day. Extract the concrete "
-    "facts, events, decisions, and changes that actually happened — what the operator "
+    "facts, events, decisions, and changes that actually happened — what Trevor "
     "did, decided, learned, built, traded, or experienced. Be specific and factual.\n\n"
     "Output GitHub-flavored markdown grouped under only the relevant headings from: "
     "## Health, ## Trading, ## Infra & Homelab, ## Decisions, ## Personal, ## Learnings. "

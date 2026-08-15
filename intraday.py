@@ -10,7 +10,7 @@ import yaml
 
 from exitmgr.ibkr import IB
 from exitmgr.account import get_pot_snapshot
-from exitmgr import research, strategist
+from exitmgr import entry_safety, research, strategist
 import daily_recommend as DR
 import portfolio as PF
 
@@ -53,7 +53,8 @@ async def cycle(ib):
     # the day's events -> enriched brief
     data = await research.gather(ib, names, single_names=names)
     brief = research.build_brief(today=_now().date().isoformat(), quotes={}, universe=names,
-                                 allow_any_name=True, **data)
+                                 allow_any_name=True, net_liq=pot.net_liq,
+                                 available_funds=pot.available_funds, **data)
     out = {"exits": [], "entries": [], "cash": round(pot.available_funds), "net_liq": round(pot.net_liq)}
 
     # (1) DISCRETIONARY EXITS — review the book against today's tape
@@ -74,14 +75,19 @@ async def cycle(ib):
     # (2) NEW ENTRIES — scout the day's events for high-conviction setups
     ideas = []
     import time as _t
-    for _att in range(3):                          # M3 single-gen contention -> be patient, not latency-critical
-        try:
-            ideas = strategist.propose(TR.get("llm_endpoint"), TR.get("llm_model"), brief, timeout=1800, recommend=True)
-            out.pop("propose_error", None)
-            break
-        except Exception as e:
-            out["propose_error"] = str(e)
-            _t.sleep(45)
+    _account_gate = entry_safety.account_snapshot_valid(pot)
+    if not _account_gate.allowed:
+        out["propose_error"] = "account snapshot invalid: " + "; ".join(_account_gate.reasons)
+    else:
+        for _att in range(3):                      # M3 contention -> patient, not latency-critical
+            try:
+                ideas = strategist.propose(TR.get("llm_endpoint"), TR.get("llm_model"), brief,
+                                           timeout=1800, recommend=True)
+                out.pop("propose_error", None)
+                break
+            except Exception as e:
+                out["propose_error"] = str(e)
+                _t.sleep(45)
     for idea in sorted(ideas, key=lambda i: -i.conviction):
         if idea.conviction < ENTRY_MIN_CONVICTION:
             continue

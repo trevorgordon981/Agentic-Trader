@@ -10,9 +10,17 @@ PAID sources (marketdata.app, Parallel.ai) are TTL-cached to a file so the daily
 15-min trader loop share one fetch and we don't re-pay every cycle (ENRICH_CACHE_TTL_S, default
 30 min). Everything degrades to an empty section on any error — never blocks a trading cycle.
 """
+import asyncio
 import hashlib, json, os, time, urllib.request
 from datetime import date, timedelta
 from typing import List, Optional
+
+# BOUNDED BROKER READS (2026-08-13). A stalled qualify/reqTickers used to hang the whole
+# entry build; worse, it aged its own quotes past the Stage B freshness window so the
+# intent died as "0 prefiltered candidates". Tighter than the protective path's 30s:
+# these are latency-sensitive and a missed entry costs an opportunity, not a position.
+_IB_READ_TIMEOUT_S = 20
+
 
 CACHE_DIR = os.path.expanduser("~/.cache/exitmgr-research")
 TTL = int(os.environ.get("ENRICH_CACHE_TTL_S", "1800"))
@@ -46,7 +54,8 @@ async def movers(ib, want=6) -> Optional[dict]:
     for label, code in (("gainers", "TOP_PERC_GAIN"), ("losers", "TOP_PERC_LOSE"), ("active", "MOST_ACTIVE")):
         try:
             sub = ScannerSubscription(instrument="STK", locationCode="STK.US.MAJOR", scanCode=code)
-            data = await ib.reqScannerDataAsync(sub, [], filt)
+            data = await asyncio.wait_for(
+                ib.reqScannerDataAsync(sub, [], filt), _IB_READ_TIMEOUT_S)
             out[label] = [d.contractDetails.contract.symbol for d in data[:want]]
         except Exception:
             out[label] = []
@@ -181,8 +190,10 @@ def _cache_write(key, val):
 async def _opt_one_ib(ib, sym):
     import datetime as _dt, statistics as _st
     from exitmgr.ibkr import Option, Stock, pick_chain, strikes_near, underlying_price
-    stk = (await ib.qualifyContractsAsync(Stock(sym, "SMART", "USD")))[0]
-    params = await ib.reqSecDefOptParamsAsync(sym, "", "STK", stk.conId)
+    stk = (await asyncio.wait_for(
+        ib.qualifyContractsAsync(Stock(sym, "SMART", "USD")), _IB_READ_TIMEOUT_S))[0]
+    params = await asyncio.wait_for(
+        ib.reqSecDefOptParamsAsync(sym, "", "STK", stk.conId), _IB_READ_TIMEOUT_S)
     p = pick_chain(params, sym)
     if not p or not p.expirations or not p.strikes:
         return None
@@ -207,10 +218,12 @@ async def _opt_one_ib(ib, sym):
         two-sided markets only -- a one-sided or crossed book is not a price."""
         ks = strikes_near(p.strikes, spot, per_side=per_side)
         conts = [Option(sym, expiry, k, r, "SMART") for k in ks for r in ("C", "P")]
-        q = [c for c in await ib.qualifyContractsAsync(*conts) if getattr(c, "conId", None)]
+        q = [c for c in await asyncio.wait_for(
+                 ib.qualifyContractsAsync(*conts), _IB_READ_TIMEOUT_S)
+             if getattr(c, "conId", None)]
         if not q:
             return 0.0, 0.0, [], {}
-        tks = await ib.reqTickersAsync(*q)
+        tks = await asyncio.wait_for(ib.reqTickersAsync(*q), _IB_READ_TIMEOUT_S)
         cv = pv = 0.0
         ivs = []
         quotes = {}

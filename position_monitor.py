@@ -15,7 +15,9 @@ Actual exits remain the exit-manager's job (auto stop/target/time-stop) or
 Master Gordon's explicit call — this monitor only watches and reports.
 
 Uses the app's own IBConnection (clientId 96; status=87, quote=86, trader=88,
-close=91, daily-rec=93, daily-summary=95 are all taken).
+close=91, daily-rec=93, daily-summary=95 are all taken). NOTE 2026-08-12:
+gateway_health_alert.py also used 96 and was moved to 930 -- 96 is this
+monitor's; do not re-issue it.
 """
 import asyncio
 import datetime as dt
@@ -27,12 +29,15 @@ import urllib.request
 sys.path.insert(0, os.path.expanduser("~/exitmgr-app"))
 from exitmgr.connection import IBConnection
 from exitmgr.account import get_pot_snapshot
+from exitmgr import alerting
 
 HOST, PORT, CLIENT_ID = "127.0.0.1", 4001, 96
 JOURNAL = os.path.expanduser("~/exitmgr-app/trades.log")
-POSITIONS_CH = "C0XXXXXXXXX"   # #trading-positions  (heartbeat)
-ALERTS_CH = "C0XXXXXXXXX"      # #trading-alerts     (escalation)
-the operator = "U0XXXXXXXXX"
+# Destinations come from config.yaml at runtime (see exitmgr/alerting.py) so a
+# repeat of the 2026-07 placeholder scrub cannot silently mute this monitor.
+POSITIONS_CH = alerting.positions_channel()   # #trading-positions  (heartbeat)
+ALERTS_CH = alerting.alerts_channel()         # #trading-alerts     (escalation)
+TREVOR = sorted(alerting.approver_ids())[0]
 
 NEAR_STOP_FRAC = 0.8    # flag when uPnL <= -0.8 * stop_pct
 NEAR_TARGET_FRAC = 0.9  # flag when uPnL >= 0.9 * profit_target_pct
@@ -40,20 +45,9 @@ EXPIRING_DTE = 1        # flag when <= 1 day to expiry
 
 
 def slack(text, channel):
-    try:
-        tok = None
-        for l in open(os.path.expanduser("~/.hermes/.env")):
-            if l.startswith("SLACK_BOT_TOKEN="):
-                tok = l.split("=", 1)[1].strip().strip('"').strip("'"); break
-        if not tok:
-            print("no slack token"); return
-        urllib.request.urlopen(urllib.request.Request(
-            "https://slack.com/api/chat.postMessage",
-            data=json.dumps({"channel": channel, "text": text}).encode(),
-            headers={"Authorization": "Bearer " + tok,
-                     "Content-Type": "application/json"}), timeout=10)
-    except Exception as e:
-        print("slack fail:", e)
+    """Post and verify. Returns True only if Slack said ok:true; an escalation
+    that Slack rejected is logged loudly to stderr (-> position-monitor.err)."""
+    return alerting.post(text, channel, label="position_monitor")
 
 
 def load_journal():
@@ -200,7 +194,7 @@ def main():
     slack(head + "\n" + body, POSITIONS_CH)
 
     if alerts:
-        msg = (f"<@{the operator}> :rotating_light: *Thesis/level erosion — review for exit:*\n"
+        msg = (f"<@{TREVOR}> :rotating_light: *Thesis/level erosion — review for exit:*\n"
                + "\n".join("• " + a for a in alerts)
                + "\n\nClose one now: reply here, or I can run "
                  "`close_symbol.py --symbol XXX --confirm`.")

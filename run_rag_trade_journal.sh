@@ -3,6 +3,9 @@
 # sync it to the RAG box (rag-host), and trigger an incremental re-index.
 set -euo pipefail
 cd "$HOME/exitmgr-app"
+# rag-host hosts the RAG API; this curl runs FROM studio, so localhost was wrong and
+# curl exited 7 (couldn-t connect) which set -e turned into the job exiting 7.
+# rag-news is unaffected because it runs its curl through ssh, where localhost is right.
 NODE4=localhost
 
 python3 rag_trade_journal.py

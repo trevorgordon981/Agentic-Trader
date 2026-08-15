@@ -18,35 +18,47 @@ caps:
   max_orders_per_cycle: 5
   max_orders_per_day: 20
   max_notional_per_day: 50000.0
-  # POT-TIERED TAKE-PROFIT RUNNER CEILING (2026-07-03). Scale the TP ceiling (runner leash) +
-  # default target with account size: bank profits fast when the pot is small, let runners run
-  # longer as the account grows. Consumed at ENTRY by construction.tp_tier_for_pot via
-  # daily_recommend.py + exitmgr/trader.py -- picks the HIGHEST row whose min_pot <= net_liq.
-  # ONLY the take-profit side scales; the protective STOP is never touched by any tier. Values are
-  # FRACTIONS (0.60 == 60%). Monotonic, capped at a 60% ceiling. Below the lowest row uses the
-  # `< $2,500` floor row. Clear/empty this list => full NO-OP = today's flat +30% behavior.
-  # ACCEPTED INVERTED REWARD:RISK ON SMALL POTS (INTENTIONAL -- do NOT "fix" this): on pots under
-  # ~$5,000 the default take-profit (tp_pct 0.20-0.22) sits BELOW the -30% protective stop, i.e.
-  # reward < risk by design. the operator's deliberate call: bank profits fast to climb out of down days
-  # while the stop still holds firm at -30%. This is NOT a bug and must NOT trigger a post-clamp R:R
-  # re-check or any widening of the small-pot tp rows / tightening of the stop. (Mirrored by code
-  # comments in exitmgr/construction.py clamp_tp_sl and exitmgr/risk.py's reward:risk gate.)
-  tp_tiers:
-    - {min_pot: 0,      tp_max_pct: 0.25, tp_pct: 0.20}   # < $2,500 : ceiling 25% / default 20%
-    - {min_pot: 2500,   tp_max_pct: 0.30, tp_pct: 0.22}   # >= $2,500 : 30% / 22%
-    - {min_pot: 5000,   tp_max_pct: 0.35, tp_pct: 0.25}   # >= $5,000 : 35% / 25%
-    - {min_pot: 7500,   tp_max_pct: 0.40, tp_pct: 0.28}   # >= $7,500 : 40% / 28%
-    - {min_pot: 10000,  tp_max_pct: 0.45, tp_pct: 0.32}   # >= $10,000 : 45% / 32%
-    - {min_pot: 25000,  tp_max_pct: 0.50, tp_pct: 0.38}   # >= $25,000 : 50% / 38%
-    - {min_pot: 50000,  tp_max_pct: 0.55, tp_pct: 0.45}   # >= $50,000 : 55% / 45%
-    - {min_pot: 100000, tp_max_pct: 0.60, tp_pct: 0.50}   # >= $100,000 : 60% / 50% (max ceiling)
+  # POT-TIERED TAKE-PROFIT RUNNER CEILING -- REMOVED 2026-07-26.
+  #
+  # This block used to hold `tp_tiers`, a table keyed on account size that scaled a take-profit
+  # ceiling + DEFAULT target, consumed at ENTRY by construction.tp_tier_for_pot. At the live pot
+  # (~$1,893) it resolved the `< $2,500` floor row and stamped a +20% profit target onto EVERY
+  # order. A position that ran +300% was sold at +20% by arithmetic, with no reference to whether
+  # anything had changed.
+  #
+  # Trevor's ruling (dataset-v8-build-20260725/RULING_TAKE_PROFIT.md, 2026-07-26):
+  #   "+20% is doctrine, not a clamp -- a potential exit when the thesis has changed AND value has
+  #    been given back, never a mechanical target."
+  # Implemented per Sol audit R5 section R2, which is explicit that removing this table ALONE was
+  # insufficient: the global rules.profit_target_pct fallback and the mechanical +20%
+  # rules.scale_out encoded the same forbidden doctrine and were removed in the same change.
+  #
+  # THE SUPERSEDED NOTE THAT USED TO SIT HERE: it declared the small-pot inverted reward:risk
+  # (a 20-25% take-profit sitting BELOW the -30% stop) deliberate, and instructed that it must NOT
+  # be "fixed" or re-checked. That instruction is VOID -- it was protecting the mechanism this
+  # ruling abolishes. There is no longer a manufactured take-profit of any size to invert against.
+  #
+  # DO NOT RE-ADD tp_tiers, and do not reintroduce a numeric default anywhere on the entry path.
+  # Account size is not an exit signal. +20% is evidence the MODEL may weigh, never a level the
+  # code installs. The only numeric automatic exits that remain are the -30% maximum-loss stop
+  # (unchanged, below) and an EXPLICITLY supplied 100-500% catastrophe backstop
+  # (construction.optional_take_profit_pct). Profit protection on a winner now comes from the
+  # confirmed trailing stop (rules.trailing, Sol audit R5 R1), which is why R2 was sequenced to
+  # ship only after that trail was live and tested.
 rules:
   # 2026-07-01 constructor rework (journal audit n=9): +75-100% targets were touched 0/9
   # times while +20-35% MFE was reached by 4/8 -> default TP +30% / stop -30%. Time stop
   # moved DTE 3 -> 10: both direction-RIGHT losers died of short DTE, one force-dumped at
   # DTE<=3 expired at full value 3 days later. Keep time_stop_days == construction.dte_exit_threshold.
-  profit_target_pct: 30.0     # full-exit target (runner cap). LEFT UNCHANGED from the 7/1
-                              #   audit: +75-100% targets were touched 0/9 -> no point raising it.
+  # GLOBAL TAKE-PROFIT FALLBACK -- DISABLED 2026-07-26 (null), Sol audit R5 R2, path 2 of 3.
+  # This was 30.0 and was reached by every `je.get("profit_target_pct") or
+  # config.rules.profit_target_pct` read in the manager, so removing the pot tiers alone would
+  # have left a mechanical +30% full exit on every position that lacked a journalled target.
+  # null = there is NO automatic profit target. A winner is governed by the model's judgment
+  # (thesis changed AND value given back) plus the confirmed trailing stop; a loser is governed by
+  # the -30% stop below. Setting this back to a number re-arms mechanical profit-taking across the
+  # whole book in one line -- don't, without re-reading RULING_TAKE_PROFIT.md.
+  profit_target_pct: null
   stop_pct: 30.0
   time_stop_days: 10
   exit_market_orders: true
@@ -57,20 +69,24 @@ rules:
   # `tune_exit_floor.py --write`. (SEAM: to reach a LIVE OrderManager, manager.py must also pass
   # exit_slippage_floor=cfg.rules.exit_slippage_floor -- flagged, not yet wired.)
   exit_slippage_floor: 0.50
-  # SCALE-OUT + TRAILING (2026-07-02 #1-ROI audit fix, Finding 1). Turned ON per the operator's
-  # greenlight, but every number below is an UNVALIDATED PRIOR -- eyeball before trading
-  # resumes (exits cannot be data-validated until the live MFE/MAE logging accrues).
-  # Mechanism: bank half the position at +20% (the band the book historically round-trips
-  # from), then trail the runner protecting realized gains, so a +25%+ peak that fades no
-  # longer round-trips to nothing.
+  # MECHANICAL +20% SCALE-OUT -- DISABLED 2026-07-26 (Sol audit R5 R2, path 3 of 3).
+  # This trimmed half the position the moment gain hit +20%. Sol's finding: it is the SAME
+  # forbidden doctrine encoded as a partial exit -- a bare percentage banking a winner with no
+  # reference to whether the thesis changed or whether anything had been given back. Killing the
+  # pot tiers and the global fallback while leaving this armed would have left the ruling
+  # half-implemented and a +20% trim still firing on every runner.
+  # The gain-protection job it was doing now belongs to the CONFIRMED trailing stop below
+  # (two consecutive qualifying closes, Sol audit R5 R1) -- which is why R2 shipped only after
+  # that trail was live. A future model-SELECTED trim would need its own explicit action and
+  # contract; it must not come back as a threshold here.
   scale_out:
-    enabled: true
-    first_target_pct: 20.0    # PRIOR: trim at +20% (below the +30% full target)
-    trim_fraction: 0.5        # PRIOR: take 50% off, let 50% run (needs qty>=2 to leave a runner)
+    enabled: false            # 2026-07-26: was true. Mechanical partial take-profit, removed.
+    first_target_pct: 20.0    # inert while disabled; kept so the shape of the removed rule is legible
+    trim_fraction: 0.5        # inert while disabled
   trailing:
     enabled: true             # PRIOR: was false -- now ON
     # 2026-07-26 RESTORED TO 20.0 (Sol audit R5 section R1, ruling path (a)).
-    # the operator asked for arming at +15% ("make sure the trailing stop gets triggered once a position
+    # Trevor asked for arming at +15% ("make sure the trailing stop gets triggered once a position
     # gets to 15% up") but he chose that number TOGETHER WITH multi-session confirmation. The
     # confirmation mechanism did not exist yet, so 15.0 on disk was early arming WITHOUT the
     # safety that justified it.
@@ -102,7 +118,7 @@ construction:
   # 2026-07-01 trade-construction rulebook (evidence: journal audit 6/12-7/1). Tune HERE,
   # not in code -- consumed by exitmgr/construction.py via daily_recommend + exitmgr/trader.
   min_dte: 25                # DTE floor at entry; shorter model ideas get ADJUSTED up (journal-annotated)
-  # 2026-07-26 (the operator): raised 170 -> 800. construction.py:48 computes
+  # 2026-07-26 (Trevor): raised 170 -> 800. construction.py:48 computes
   #   eff_target = min(max(tgt, min_dte), max(prefer_dte_max, min_dte))
   # so prefer_dte_max is a HARD CEILING on the model's requested DTE. At 170 EVERY long-dated
   # request collapsed: 365->170, 497->170, 638->170, 795->170 -- i.e. production silently deleted
@@ -129,7 +145,7 @@ construction:
   sl_pct: -0.30              # default stop = -30% of debit (model stops may be tighter, never looser)
   max_premium_pct: 0.25      # premium per trade <= 25% of net-liq (downsizes qty first, then rejects);
                              #   matches risk.py max_trade_pct 0.25 and the C25 sizing bands
-  max_deployed_pct: 0.40     # TOTAL deployed premium <= 40% of net-liq; coupled to the
+  max_deployed_pct: 0.60     # TOTAL deployed premium <= 40% of net-liq; coupled to the
                              #   4%/day portfolio-decay cap at the hard DTE<=10 exit boundary
   max_decay_pct_per_day: 0.01            # (debit/DTE)/net-liq <= 1%/day per trade
   max_portfolio_decay_pct_per_day: 0.04  # portfolio theta-decay total <= 4%/day
@@ -137,6 +153,18 @@ construction:
   fill_alarm_minutes: 15     # unfilled-order Slack alarm threshold during RTH
   delta_min: 0.55            # long-leg target-delta band (rejects lottery far-OTM legs)
   delta_max: 0.65
+  # Stage B NBBO freshness (2026-08-13). A build takes ~30s of sequential IBKR round trips; the
+  # old hardcoded 10s discarded the whole candidate set and 91% of intents died as
+  # "0 prefiltered candidates". Not the fill-safety gate -- reprice_binding re-quotes and
+  # re-validates the selected contract at submission.
+  stage_b_quote_max_age_s: 45.0
+  # REQUIRED, percent units: ((ask-bid)/midpoint)*100. 25.0 matches the existing
+  # decision-card liquidity gate maximum_relative_spread of 0.25.
+  max_entry_spread_pct: 25.0
+  # TWO-LEG combos cross BOTH legs' spreads, so the same liquidity reads ~2x wider than a single
+  # leg. The single-leg 25% discarded every candidate on the live ORCL chain (a $280 spread showed
+  # 38.3%). 45% is that same standard rescaled for a two-leg quote (2026-08-13).
+  max_combo_spread_pct: 45.0
   spread_width_max_pct: 0.08 # no-IV fallback: spread width <= 8% of spot
   strike_near_spot_pct: 0.03 # no-IV fallback: long strike within 3% of spot
   # EARNINGS BLACKOUT (2026-07-03 gate A5): a DEBIT held through an earnings print is an
@@ -157,13 +185,20 @@ construction:
   assignment_block_hard: false     # false => WARN only (default); true => hard-reject
   assignment_cushion_days: 0       # extra cushion days beyond expiry also treated as at-risk
 trading:
+  # AUTO-APPROVE (2026-08-14). Four correctly-sized trades cleared every risk gate today and
+  # THREE expired unclicked in Slack (approved:true, reasons:[], $210-$223 against a $1,184
+  # per-trade cap). The gates are what encode the risk policy; the Slack tap was adding
+  # latency, not safety. Submission still rebuilds from a fresh account/chain/NBBO and
+  # re-runs every hard gate, so this removes the human tap and no risk check.
+  auto_approve_within_gates: true
+
   slack_channel: C0XXXXXXXXX
   summary_channel: C0XXXXXXXXX
   alerts_channel: C0XXXXXXXXX
   error_channel: C0XXXXXXXXX   # #error-logs -- unfilled-order fill alarms (2026-07-01)
   approver_ids:
   - U0XXXXXXXXX
-  llm_endpoint: http://127.0.0.1:8082/v1/chat/completions
+  llm_endpoint: http://localhost:8888/v1/chat/completions
   llm_model: /path/to/model
   manage_positions: true
   # 2026-07-26: added the affordability-screened universe. At a ~$1,893 account with a 25%%
@@ -171,6 +206,19 @@ trading:
   # 0.40*spot*vol*100 <= cap. That admits cheap names (incl. high-vol ones) and excludes
   # expensive or high-notional ones. Recompute the set when net-liq changes -- the ceiling
   # is a function of account size, not a fixed price.
+  # 2026-07-26: +8 ADDITIONS, ZERO REMOVALS. Trevor keeps every high-volatility name.
+  # These were selected on spot x vol, not share price -- a 365-DTE 0.60-delta call costs about
+  # 0.40*spot*vol*sqrt(T)*100, so what makes a name affordable is LOW VOLATILITY, not a low
+  # quote. Measured 365-DTE 0.60-delta debits vs the $473.25 per-trade cap at $1,893 net liq:
+  #   GRAB $47 (36% vol) · SNAP $108 (62%) · NWL $120 (59%) · CHPT $162 (79%)
+  #   KVUE $167 (22%)    · HBAN $194 (28%) · KEY  $222 (24%)
+  # All clear the tighter $250 corpus rule too. They add consumer-defensive, financials and
+  # communication-services exposure to a list that was concentrated in speculative tech/energy.
+  # NOT added: ASTS. At $56.20 with 116% realized vol its 365-DTE 0.60-delta debit is ~$2,599 --
+  # 5.5x the per-trade cap. Under $60 a share, unaffordable as an option. Revisit near ~$12k net liq.
+  # PFE added 2026-07-26 by Trevor's ruling, with the sector ban removed in the same change:
+  # $214 debit, 22% vol, and ZERO -10% sessions in the entire price cache (worst day -7.7%) --
+  # the same risk class as KMI and T, not MRNA.
   approved_names: [SPY, QQQ, IWM, AAPL, MSFT, NVDA]  # placeholder -- real ~400-name universe scrubbed (strategy)
   allow_model_names: true
   # ApeWisdom supplies an ephemeral source of candidate TICKERS for the morning slate.
@@ -184,10 +232,14 @@ trading:
     research_limit: 8
   blocked_names:
   - EXAMPLE_TICKER   # placeholder -- original block-list scrubbed
-  blocked_sector_keywords:
-  - biotech
-  - drug manufacturers
-  - pharmaceutical
+  # 2026-07-26 (Trevor): sector ban REMOVED. It blocked the safer half of healthcare while the
+  # approved list already carried far riskier names -- measured, large-cap pharma averages 0.1
+  # down-10% sessions/yr (PFE: ZERO in the whole cache, worst day -7.7%) against 5.7/yr for the
+  # names already approved. The hazard being guarded is a scheduled binary event gapping through
+  # a stop, which is now stated as a sizing/timing rule in strategist._UNIVERSE rather than as a
+  # sector exclusion. Left EMPTY, not deleted: profile_eligible() still enforces it, so a future
+  # sector can be blocked by adding one line here without touching code.
+  blocked_sector_keywords: []
   # CORRELATION / SECTOR CONCENTRATION CAP (2026-07-03). Caps aggregate premium-at-risk across a
   # CORRELATED cluster so three separate semis (NVDA+AMD+MU) can't sail through the single-name-agg
   # cap as three names while being one macro bet. max_sector_agg_pct = fraction-of-pot ceiling on
@@ -195,7 +247,7 @@ trading:
   # binds (>=0.36 would be dead, since the whole non-index book is already 0.36-capped); ~2x the
   # 0.12 soft per-trade cap lets ~two soft-sized correlated names coexist but blocks a third
   # concentrating the same bet. Only binds in non-`confident` mode, like the single-name-agg cap.
-  max_sector_agg_pct: 0.25
+  max_sector_agg_pct: 0.40
   # sector_map: STATIC, hand-editable symbol -> cluster id. The pragmatic no-network source of truth
   # (a live correlation/beta feed is a future upgrade). Unmapped symbols cluster only with THEIR OWN
   # name (no clustering => behaves as before). Empty map => the sector cap is a full no-op. Edit
@@ -273,7 +325,7 @@ trading:
   # gordon-gauntlet/calibration_gate.py (min-sample + discrimination) so thin data can NEVER up-size.
   # conviction(1-10) -> multiplier on the per-trade SOFT size: >1 up-sizes a genuinely-outperforming
   # bucket (bounded so it never exceeds the hard ceiling), <1 down-sizes an underperformer, 1.0 flat.
-  # Left EMPTY until the operator reviews a proposal AND opts in -- to size real money you ALSO must wire it
+  # Left EMPTY until Trevor reviews a proposal AND opts in -- to size real money you ALSO must wire it
   # into run_trader.py's RiskLimits (mirror conviction_size_curve). Empty/absent => full no-op.
   # conviction_size_multipliers: {}
   max_trade_pct: 0.25

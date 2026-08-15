@@ -10,6 +10,7 @@ Hard invariants:
     real order, not just the idea.
   * Every proposal, gate decision, resolution, approval, and fill is appended to the audit log.
 """
+import dataclasses
 import asyncio
 import json
 import time
@@ -21,18 +22,36 @@ from typing import Dict, List, Optional, Set
 from exitmgr.account import get_pot_snapshot
 from exitmgr.risk import (
     RiskLimits, OpenPosition, ProposedTrade, GateDecision, evaluate_trade, day_pnl_pct,
+    INDEX_UNDERLYINGS,
 )
 from exitmgr.strategist import (
-    propose, TradeIdea,
+    propose, propose_intents, select_candidate, TradeIdea,
     # THE structure allow-list and its choke point are IMPORTED, never re-declared here.
     # Two copies of a safety list can drift out of step, and a drifted allow-list is a
     # worse bug than a gate in the wrong place.
     DEBIT_STRUCTURES, _require_allowed_structure,
 )
+from exitmgr.entry_contract import StageAIntent, RuntimeCandidate
+from exitmgr.entry_builder import (
+    CandidateBinding, CandidateBuildError, build_entry_candidates,
+    bindings_for_stage_b, reprice_binding, select_binding,
+)
+from exitmgr.entry_reservation import (
+    EntryReservationLedger, ReservationDecision, reservation_as_dict,
+)
 from exitmgr import approval, construction, research, regime, slate_lock, trade_capture, reload_queue
 from exitmgr import entry_safety
+from exitmgr.entry_throttle import (
+    EntryThrottleStore, entry_day_open_counts, record_entry_open,
+)
 from dataclasses import replace as _replace_dc
 from exitmgr.config import ConstructionConfig
+
+# BOUNDED BROKER READS (2026-08-13). An unbounded `await ib.*Async()` wedged the exit
+# loop for 6+ minutes tonight with every position unevaluated. Same guard applied here.
+# A timeout raises into the caller's existing error handling; a hang has no handler.
+_IB_CALL_TIMEOUT_S = 30
+
 
 
 # ---------------------------------------------------------------- pure helpers (unit-tested)
@@ -105,9 +124,16 @@ def _market_open() -> bool:
 #                AVAILABLE AT SUBMIT TIME (not merely at proposal time).
 CREDIT_SIDE = "credit"
 CSP_STRUCTURE = "cash secured put"
-# the operator's ruling (RULING_CREDIT_CAP.md): total reserved collateral -- ALREADY-DEPLOYED plus this
+# Trevor's ruling (RULING_CREDIT_CAP.md): total reserved collateral -- ALREADY-DEPLOYED plus this
 # trade -- may never exceed 80% of net liquidation value.
 CREDIT_MAX_COLLATERAL_PCT = 0.80
+# Trevor's ruling (2026-07-27): a cash-secured put must earn at least this fraction of its
+# RESERVED COLLATERAL in premium. Until now this bar lived only in the strategist prompt, which
+# made the model its sole enforcement point -- a CSP earning $3 on $1,500 of collateral passed
+# every structural gate. Collateral, not the credit, is the capital at risk, so the bar is
+# expressed against collateral. Enforced in credit_structure_ok(), which every credit idea passes
+# through regardless of whether it came from the parser, a CLI structure string, or a reload ticket.
+CREDIT_MIN_PREMIUM_PCT = 0.0125
 # Credit DTE window (spec S3). Read from ConstructionConfig when the structure-aware floor lands;
 # these are the fallbacks so this path is never accidentally handed the 25-DTE DEBIT floor.
 CREDIT_MIN_DTE_DEFAULT = 3
@@ -163,6 +189,14 @@ def credit_structure_ok(idea) -> tuple:
                        f"${collateral:,.2f} - credit ${net_credit:,.2f}")
     if net_credit >= collateral:
         return False, "credit idea claims a credit >= its collateral (impossible for a CSP)"
+    # Trevor's ruling (2026-07-27, "the 1.25% bar belongs in code"): a CSP must EARN its collateral.
+    # Return-on-collateral is scale-invariant -- halving the contracts halves credit and collateral
+    # alike -- so a miss is rejected, never downsized: it is the wrong trade, not a too-large one.
+    roc = net_credit / collateral
+    if roc + 1e-9 < CREDIT_MIN_PREMIUM_PCT:
+        return False, (f"credit idea earns {roc:.3%} of its ${collateral:,.2f} collateral, under the "
+                       f"{CREDIT_MIN_PREMIUM_PCT:.2%} premium bar (needs "
+                       f"${collateral * CREDIT_MIN_PREMIUM_PCT:,.2f}, offers ${net_credit:,.2f})")
     return True, ""
 
 
@@ -293,6 +327,146 @@ def collateral_capacity(*, required: Optional[float], deployed: Optional[float],
     return entry_safety.SafetyResult(not reasons, tuple(reasons))
 
 
+@dataclass(frozen=True)
+class BrokerCollateralSnapshot:
+    total: float
+    visible_order_refs: frozenset
+    visible_con_ids: frozenset
+
+
+async def broker_csp_collateral_snapshot(
+        ib, audit_path: Optional[str] = None) -> Optional[BrokerCollateralSnapshot]:
+    """Cash already reserved by live short puts and our working sell-to-open puts.
+
+    Shared by continuous, daily-slate, and add-name. Any unreadable short-put reservation
+    returns ``None`` so every caller fails closed rather than treating an unknown book as empty.
+    """
+    total = 0.0
+    visible_order_refs = set()
+    visible_con_ids = set()
+    try:
+        positions = await asyncio.wait_for(ib.reqPositionsAsync(), _IB_CALL_TIMEOUT_S)
+        for pos in positions or []:
+            contract = getattr(pos, "contract", None)
+            quantity = _fnum(getattr(pos, "position", 0), None)
+            if contract is None or quantity is None or quantity >= 0:
+                continue
+            sec_type = str(getattr(contract, "secType", "") or "").upper()
+            if sec_type and sec_type not in ("OPT", "FOP"):
+                continue
+            right = str(getattr(contract, "right", "") or "").upper()[:1]
+            if right == "C":
+                if audit_path:
+                    audit(audit_path, "short_call_position_detected",
+                          symbol=str(getattr(contract, "symbol", "")),
+                          con_id=getattr(contract, "conId", None), quantity=quantity,
+                          note="INVARIANT 1 VIOLATION: account holds a short call")
+                continue
+            if right != "P":
+                continue
+            strike = _fnum(getattr(contract, "strike", None), None)
+            if strike is None or strike <= 0:
+                return None
+            total += strike * 100.0 * abs(quantity)
+            con_id = getattr(contract, "conId", None)
+            if isinstance(con_id, int) and con_id > 0:
+                visible_con_ids.add(con_id)
+    except Exception as exc:
+        if audit_path:
+            audit(audit_path, "deployed_collateral_error", stage="positions", error=str(exc))
+        return None
+    try:
+        orders = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), _IB_CALL_TIMEOUT_S)
+        terminal = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
+        for trade in orders or []:
+            order = getattr(trade, "order", None)
+            contract = getattr(trade, "contract", None)
+            status = getattr(getattr(trade, "orderStatus", None), "status", None)
+            if order is None or contract is None or status in terminal:
+                continue
+            if str(getattr(order, "action", "") or "").upper() != "SELL":
+                continue
+            order_ref = str(getattr(order, "orderRef", "") or "")
+            open_close = str(getattr(order, "openClose", "") or "").upper()
+            if open_close == "C" or order_ref.startswith("alfred-exit:"):
+                continue
+            if str(getattr(contract, "right", "") or "").upper()[:1] != "P":
+                continue
+            strike = _fnum(getattr(contract, "strike", None), None)
+            quantity = _fnum(getattr(order, "totalQuantity", 0), None)
+            if strike is None or strike <= 0 or quantity is None or quantity <= 0:
+                return None
+            total += strike * 100.0 * abs(quantity)
+            if order_ref.startswith("alfred-entry:"):
+                visible_order_refs.add(order_ref)
+            con_id = getattr(contract, "conId", None)
+            if isinstance(con_id, int) and con_id > 0:
+                visible_con_ids.add(con_id)
+    except Exception as exc:
+        if audit_path:
+            audit(audit_path, "deployed_collateral_error", stage="open_orders", error=str(exc))
+        return None
+    return BrokerCollateralSnapshot(
+        total=round(total, 2),
+        visible_order_refs=frozenset(visible_order_refs),
+        visible_con_ids=frozenset(visible_con_ids),
+    )
+
+
+async def broker_deployed_csp_collateral(ib, audit_path: Optional[str] = None) -> Optional[float]:
+    snapshot = await broker_csp_collateral_snapshot(ib, audit_path)
+    return None if snapshot is None else snapshot.total
+
+
+async def reserve_credit_entry(ib, r, order_ref: str, *, ledger: EntryReservationLedger,
+                               audit_path: Optional[str] = None):
+    """Atomically admit one CSP against a fresh account/broker observation.
+
+    Account and broker I/O intentionally happens outside both file locks.  The reservation
+    ledger then serializes only the final arithmetic/commit across the continuous and daily
+    processes, closing their check-then-place race without delaying protective exits.
+    """
+    def finish(decision, snap=None, broker=None):
+        if audit_path:
+            audit(audit_path, "credit_entry_reservation", **reservation_as_dict(decision))
+        return decision, snap, broker
+
+    required = required_collateral(getattr(r, "strike", None), getattr(r, "qty", None))
+    committed = capital_committed(r)
+    if required is None or abs(float(required) - float(committed)) > 0.01:
+        return finish(ReservationDecision(
+            False, False, "collateral_mismatch",
+            (f"recomputed collateral {required!r} does not match order ${committed:,.2f}",),
+            order_ref=order_ref))
+    try:
+        snap = await get_pot_snapshot(ib)
+    except Exception as exc:
+        return finish(ReservationDecision(
+            False, False, "account_snapshot_error", (str(exc),), order_ref=order_ref))
+    account_gate = entry_safety.account_snapshot_valid(snap)
+    if not account_gate.allowed:
+        return finish(ReservationDecision(
+            False, False, "account_snapshot_invalid", tuple(account_gate.reasons),
+            order_ref=order_ref), snap)
+    broker = await broker_csp_collateral_snapshot(ib, audit_path)
+    if broker is None:
+        return finish(ReservationDecision(
+            False, False, "broker_collateral_unverifiable",
+            ("deployed CSP collateral or broker visibility could not be verified",),
+            order_ref=order_ref), snap)
+    decision = await asyncio.to_thread(
+        ledger.reserve,
+        order_ref=order_ref,
+        con_id=getattr(getattr(r, "contract", None), "conId", None),
+        collateral_usd=committed,
+        net_liq=getattr(snap, "net_liq", None),
+        available_funds=getattr(snap, "available_funds", None),
+        broker_deployed_usd=broker.total,
+        visible_order_refs=broker.visible_order_refs,
+    )
+    return finish(decision, snap, broker)
+
+
 def credit_executable_price(r) -> float:
     """The SELL limit that crosses the final observed NBBO: we sell TO the bid.
     (entry_safety.executable_price is the BUY mirror -- it crosses at the ask.)"""
@@ -364,6 +538,41 @@ class Plan:
     action: str
 
 
+def _credit_limits(limits):
+    """RiskLimits for a CASH-SECURED PUT. Trevor's ruling 2026-07-27: "do 80% of the pot for CSPs".
+
+    A credit idea's gate `notional` is its RESERVED COLLATERAL, and until this change that
+    collateral was measured against a debit's caps -- max_trade_pct_hard 25%, single-name 36%,
+    sector 25%. At $1,893 that pinned one write to $473.25 (a $4.73 strike), so
+    CREDIT_MAX_COLLATERAL_PCT could never bind on a single write at ANY account size; it first bound
+    on the FOURTH concurrent CSP. Trevor's earlier "i dont care what name it enters or if it takes
+    up to 80% of the pot" is what authorizes lifting concentration as well as size -- lifting only
+    the per-trade cap would leave a CSP silently bound at 36% and the ruling inert.
+
+    Raise ONLY the three percentage caps, and only UPWARD -- `min` so a future tightening of any of
+    them below 80% still wins. Everything that actually secures the put is untouched and still
+    binds: the submit-time cash check (INVARIANT 2), the 80% TOTAL-collateral ceiling across all
+    open CSPs (INVARIANT 3 -- so one 80% write consumes the entire credit budget rather than adding
+    to it), the 5% cash buffer, available_funds, max_concurrent, the daily breaker, the blocklist,
+    and INVARIANT 1 (only a CSP may ever be submitted).
+
+    Debit ideas never reach this function.
+    """
+    pct = CREDIT_MAX_COLLATERAL_PCT
+    try:
+        return dataclasses.replace(
+            limits,
+            max_trade_pct=max(limits.max_trade_pct, pct),
+            max_trade_pct_hard=max(limits.max_trade_pct_hard, pct),
+            max_single_name_agg_pct=max(limits.max_single_name_agg_pct, pct),
+            max_sector_agg_pct=max(limits.max_sector_agg_pct, pct),
+        )
+    except Exception:
+        # Never fail an entry because the limits object is an unexpected shape: fall back to the
+        # ORIGINAL (tighter) limits. A refusal is a correct outcome; a silent widening is not.
+        return limits
+
+
 def plan_idea(idea: TradeIdea, *, net_liq: float, available_funds: float,
               positions: List[OpenPosition], baseline: float,
               approved_names: Set[str], limits: RiskLimits, regime=None) -> Plan:
@@ -387,7 +596,8 @@ def plan_idea(idea: TradeIdea, *, net_liq: float, available_funds: float,
         gate = evaluate_trade(
             trade, net_liq=net_liq, available_funds=available_funds,
             open_positions=positions, pot_day_start=baseline,
-            approved_names=approved_names, limits=limits, regime_info=regime,
+            approved_names=approved_names, limits=_credit_limits(limits),
+            regime_info=regime,
         )
         return Plan(idea, trade, gate, "needs_approval" if gate.approved else "gate_rejected")
     trade = ProposedTrade(idea.underlying, idea.est_debit_usd, idea.is_index, idea.conviction,
@@ -542,7 +752,8 @@ class Trader:
     def __init__(self, *, ib_conn, exit_manager, limits: RiskLimits, approved_names: Set[str],
                  endpoint: str, model: str, slack_token: str, slack_channel: str,
                  approver_ids: Set[str], baseline_path: str, audit_path: str,
-                 approve_timeout_s: int = 900, journal_path: str = "./trades.log",
+                 approve_timeout_s: int = 1800, journal_path: str = "./trades.log",
+                 auto_approve_within_gates: bool = False,
                  blocked_sector_keywords: Optional[List[str]] = None,
                  entry_limit_buffer_pct: float = 0.05,
                  construction_cfg: Optional[ConstructionConfig] = None,
@@ -551,6 +762,7 @@ class Trader:
                  config_path: str = "config.yaml",
                  trading_down_path: Optional[str] = None,
                  broker_order_lock=None,
+                 entry_reservation_ledger: Optional[EntryReservationLedger] = None,
                  max_orders_per_cycle: Optional[int] = None,
                  max_orders_per_day: Optional[int] = None,
                  max_notional_per_day: Optional[float] = None,
@@ -568,6 +780,7 @@ class Trader:
         self.config_path = config_path
         self.trading_down_path = trading_down_path
         self.broker_order_lock = broker_order_lock
+        self.entry_reservation_ledger = entry_reservation_ledger or EntryReservationLedger()
         # EXIT-CYCLE FAILURE STREAK (2026-07-03): consecutive run_cycle failures. After
         # _EXIT_FAIL_SUPPRESS_ENTRIES in a row, new entries are suppressed (a broken exit path must
         # not be compounded by opening MORE positions we then can't manage).
@@ -580,6 +793,7 @@ class Trader:
         self.approver_ids = approver_ids
         self.baseline_path, self.audit_path = baseline_path, audit_path
         self.approve_timeout_s = approve_timeout_s
+        self.auto_approve_within_gates = bool(auto_approve_within_gates)
         self.journal_path = journal_path
         self.blocked_sector_keywords = [k for k in (blocked_sector_keywords or []) if k.strip()]
         self.entry_limit_buffer_pct = float(entry_limit_buffer_pct)
@@ -742,7 +956,115 @@ class Trader:
                       notional=round(float(nd), 2))
         except Exception as _oe:
             audit(self.audit_path, "open_buy_fold_error", error=str(_oe))
+
+        # FOLD LIVE SHORT (CREDIT) POSITIONS -- CONCURRENCY, VALUED AT COLLATERAL (2026-07-26).
+        #
+        # `raw` above is get_positions() with NO keywords, i.e. LONG options only, so a filled
+        # cash-secured put contributed NOTHING to this book: risk.evaluate_trade check #4 counted
+        # it as zero open positions on every cycle after the fill, and max_concurrent could be
+        # exceeded by exactly the number of CSPs held.
+        #
+        # WHY IT IS DONE HERE AND NOT BY FLIPPING get_positions(include_short=True). The
+        # 2026-07-26 consumer audit measured what that would do: construction.open_book_items()
+        # keys the journal by con_id and reads `debit`, which a credit row deliberately sets to
+        # MAX LOSS -- so a single $175-credit CSP adds ~$49,825 to the LONG-PREMIUM deployment
+        # book, blows the deployed-% and theta caps, and rejects EVERY entry, credit and debit
+        # alike, for as long as the put is open. That book is fed from get_positions() directly
+        # (trader.run_once / _final_entry_checks), so it stays long-only and untouched; only THIS
+        # list, whose consumer is the risk gate, learns about the short.
+        #
+        # VALUATION. A CSP's capital at risk is the COLLATERAL pledged (strike * 100 * contracts),
+        # never its premium and never its journal `debit`. Preferred source is the journaled
+        # collateral_usd the trader itself reserved; then the broker strike; and if neither is
+        # readable the position is still COUNTED (that is the whole point) at a notional of 0.0,
+        # loudly audited, so an unknown size can never masquerade as a known one in caps #6/#6b.
+        #
+        # EXCLUDED, deliberately: short CALLS (a spread's short leg is already counted through its
+        # long leg's journaled net debit, and a naked call must not exist -- _deployed_collateral
+        # audits that separately), and any con_id that is a journaled spread's short_con_id.
+        try:
+            short_rows = await self.ib_conn.get_positions(include_short=True)
+            spread_legs, collateral_by_cid = self._journal_short_context()
+            for cid, pd in (short_rows or {}).items():
+                try:
+                    q = int(getattr(pd, "quantity", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if q >= 0:
+                    continue                                  # long leg: already in `out`
+                if str(getattr(pd, "sec_type", "OPT") or "OPT").upper() not in ("", "OPT", "FOP"):
+                    continue                                  # assigned stock is not a position here
+                if str(getattr(pd, "right", "") or "").upper()[:1] != "P":
+                    continue                                  # short call: see the note above
+                if int(cid) in spread_legs:
+                    continue                                  # counted via its long leg
+                sym = (getattr(pd, "symbol", "") or "").upper()
+                if not sym:
+                    continue
+                notional = collateral_by_cid.get(int(cid))
+                if notional is None:
+                    try:
+                        strike = float(getattr(pd, "strike", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        strike = 0.0
+                    notional = round(strike * 100 * abs(q), 2) if strike > 0 else None
+                if notional is None:
+                    notional = 0.0
+                    audit(self.audit_path, "short_collateral_unreadable", symbol=sym,
+                          con_id=int(cid), quantity=q,
+                          note="counted toward max_concurrent at $0 notional; strike and "
+                               "journaled collateral_usd both unreadable")
+                out.append(OpenPosition(sym, float(notional),
+                                        sym in {"SPY", "QQQ", "IWM"}, is_credit=True))
+                audit(self.audit_path, "short_position_folded", symbol=sym, con_id=int(cid),
+                      quantity=q, collateral=round(float(notional), 2))
+        except Exception as _se:
+            # A read failure UNDER-counts concurrency, which is the permissive direction, so it is
+            # never silent. The binding solvency gate for credit is _deployed_collateral(), which
+            # returns None (-> refuse) on the same failure.
+            audit(self.audit_path, "short_concurrency_read_error", error=str(_se))
         return out
+
+    def _journal_short_context(self):
+        """(spread_short_leg_con_ids, {con_id: collateral_usd}) read from trades.log.
+
+        Two things _open_positions needs that _load_journal_debits does not carry: which con_ids
+        are a debit spread's SHORT LEG (so a short that is half of a long structure is not counted
+        a second time), and the COLLATERAL a credit entry reserved (the honest notional for a CSP,
+        as opposed to `debit`, which on a credit row is MAX LOSS). Newest row per con_id wins,
+        matching _load_journal_debits. Never raises: an unreadable journal yields empty maps and
+        the broker strike is used instead."""
+        legs, collateral = set(), {}
+        try:
+            p = Path(self.journal_path)
+            if not p.exists():
+                return legs, collateral
+            for line in p.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sp = rec.get("spread") or {}
+                if sp.get("short_con_id") is not None:
+                    try:
+                        legs.add(int(sp["short_con_id"]))
+                    except (TypeError, ValueError):
+                        pass
+                cid, coll = rec.get("contract_id"), rec.get("collateral_usd")
+                if cid is None or coll is None:
+                    continue
+                try:
+                    c = float(coll)
+                    if c > 0:
+                        collateral[int(cid)] = round(c, 2)
+                except (TypeError, ValueError):
+                    continue
+        except Exception:
+            return legs, collateral
+        return legs, collateral
 
     async def _deployed_collateral(self) -> Optional[float]:
         """Collateral ALREADY reserved against the account, in dollars. `None` == UNVERIFIABLE,
@@ -805,8 +1127,11 @@ class Trader:
                     continue
                 if str(getattr(o, "action", "") or "").upper() != "SELL" or st in terminal:
                     continue
-                # only OUR entry orders reserve collateral; a resting SELL-to-CLOSE frees it.
-                if not str(getattr(o, "orderRef", "") or "").startswith("alfred-entry:"):
+                order_ref = str(getattr(o, "orderRef", "") or "")
+                open_close = str(getattr(o, "openClose", "") or "").upper()
+                # Every sell-to-open put consumes cash, including manual/external orders. An
+                # explicit sell-to-close frees a long and is the only safe exclusion.
+                if open_close == "C" or order_ref.startswith("alfred-exit:"):
                     continue
                 if str(getattr(c, "right", "") or "").upper()[:1] != "P":
                     continue
@@ -904,8 +1229,66 @@ class Trader:
             audit(self.audit_path, "close_inflight_state_error", error=str(_se))
         return names
 
+    def _book_detail(self, positions) -> dict:
+        """Per-underlying live state for the brief's Current-book section.
+
+        The strategist used to see only "$X at risk" per name, so it could not tell a winner from
+        a loser, how much time was left, or how close a stop was -- and therefore could not weigh
+        what it already owns when choosing the next move (Trevor, 2026-08-12). Sourced from data
+        that already exists: the exit manager's marks (P&L, DTE, days held, distance to stop) and
+        the trade journal (structure, intended hold, entry thesis).
+
+        Fail-soft by construction: any error yields {} and the brief renders exactly as before.
+        This is CONTEXT ONLY -- it grants no execution authority and does not touch exit logic.
+        """
+        try:
+            syms = {str(getattr(p, "underlying", "")).upper() for p in (positions or [])}
+            if not syms:
+                return {}
+            sm = getattr(self.exit_manager, "state_manager", None)
+            marks = dict(getattr(getattr(sm, "state", None), "mark_path", {}) or {})
+            journal = {}
+            try:
+                with open(self.journal_path) as fh:
+                    for line in fh:
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        cid = row.get("contract_id")
+                        if cid is not None:
+                            journal[str(cid)] = row
+            except Exception:
+                journal = {}
+            out = {}
+            for cid, series in marks.items():
+                if not series:
+                    continue
+                row = journal.get(str(cid)) or {}
+                sym = str(row.get("symbol") or "").upper()
+                if sym not in syms:
+                    continue
+                last = series[-1]
+                out[sym] = {
+                    "pnl_pct": last.get("pnl_pct"),
+                    "dte": last.get("dte"),
+                    "days_held": last.get("days_held"),
+                    "dist_to_sl_pct": last.get("dist_to_sl_pct"),
+                    "structure": row.get("structure") or (
+                        "%s/%s%s spread" % (row.get("strike"),
+                                            (row.get("spread") or {}).get("short_strike"),
+                                            row.get("right", ""))
+                        if row.get("spread") else None),
+                    "intended_hold_days": row.get("intended_hold_days"),
+                    "thesis": row.get("thesis"),
+                }
+            return out
+        except Exception:
+            return {}
+
     async def _market_context(self, positions: Optional[List[OpenPosition]] = None,
-                              day_pnl: Optional[float] = None) -> str:
+                              day_pnl: Optional[float] = None, *,
+                              net_liq: Optional[float] = None,
+                              available_funds: Optional[float] = None) -> str:
         from exitmgr.market import fetch_universe_quotes, format_context
         names = sorted({"SPY", "QQQ", "IWM"} | self.approved_names)
         today = str(datetime.now(timezone.utc).date())
@@ -927,14 +1310,19 @@ class Trader:
             self._regime = regime.classify_regime([ps.get("SPY"), ps.get("QQQ"), ps.get("IWM")], data.get("vix"))
             audit(self.audit_path, "regime", **(self._regime or {}))
             brief = research.build_brief(today=today, quotes=quotes, universe=names,
+                                         book_detail=self._book_detail(positions),
                                          allow_any_name=self.limits.allow_any_name,
-                                         book=positions, day_pnl_pct=day_pnl, **data)
+                                         book=positions, day_pnl_pct=day_pnl,
+                                         net_liq=net_liq, available_funds=available_funds,
+                                         **data)
             audit(self.audit_path, "strategist_brief", brief=brief)
             return brief
         except Exception as e:
             audit(self.audit_path, "research_error", error=str(e))
-            return format_context(quotes, names, today,
-                                  allow_any_name=self.limits.allow_any_name)
+            fallback = format_context(quotes, names, today,
+                                      allow_any_name=self.limits.allow_any_name)
+            return research.with_account_sizing_snapshot(
+                fallback, net_liq=net_liq, available_funds=available_funds)
 
     async def _drop_blocked_sectors(self, ideas):
         """Drop single-name ideas whose sector/industry matches a blocked keyword (e.g. biotech).
@@ -954,6 +1342,118 @@ class Trader:
             else:
                 kept.append(idea)
         return kept
+
+    @staticmethod
+    def _idea_from_stage_b(intent: StageAIntent, binding: CandidateBinding) -> TradeIdea:
+        """Bridge the frozen Stage A/B contract into the existing risk/approval carrier.
+
+        Every monetary field is copied from the selected executable candidate.  The model never
+        authors these values; attaching the binding makes later refreshes conId-exact.
+        """
+        resolved = binding.to_resolved_order(intent)
+        qty = int(resolved.qty)
+        is_credit_intent = intent.side == CREDIT_SIDE
+        debit_total = (0.0 if is_credit_intent else
+                       round(float(binding.candidate.one_contract_cost_usd) * qty, 2))
+        idea = TradeIdea(
+            underlying=intent.underlying,
+            is_index=intent.underlying.upper() in INDEX_UNDERLYINGS,
+            direction=intent.direction,
+            structure=intent.structure,
+            target_dte=int(intent.target_dte),
+            target_delta=float(intent.target_delta),
+            est_debit_usd=debit_total,
+            conviction=int(intent.conviction),
+            thesis=str(intent.thesis),
+            intended_hold_days=int(intent.intended_hold_days),
+            side=intent.side,
+            collateral_usd=(float(resolved.collateral_usd) if is_credit_intent else 0.0),
+            net_credit_usd=(float(resolved.net_credit_usd) if is_credit_intent else 0.0),
+            max_loss_usd=(float(resolved.credit_max_loss_usd) if is_credit_intent else 0.0),
+            strike=(float(resolved.strike) if is_credit_intent else 0.0),
+        )
+        idea.allocation_pct_net_liq = float(intent.allocation_pct_net_liq)
+        idea.alpha = str(intent.alpha)
+        idea._stage_a_intent = intent
+        idea._stage_b_binding = binding
+        return idea
+
+    async def _materialize_stage_b(self, intents, pot):
+        """Build priced candidates and obtain one exact Stage-B choice per intent."""
+        ideas = []
+        for index, intent in enumerate(intents or [], start=1):
+            intent_id = f"intent_{index}"
+            try:
+                deployed_credit = (await self._deployed_collateral()
+                                   if intent.side == CREDIT_SIDE else 0.0)
+                bindings = await build_entry_candidates(
+                    self.ib_conn.ib, intent, intent_id,
+                    net_liq=pot.net_liq, available_funds=pot.available_funds,
+                    cons=self.construction,
+                    deployed_credit_usd=deployed_credit,
+                    cash_buffer_pct=self.limits.cash_buffer_pct)
+            except Exception as exc:
+                audit(self.audit_path, "stage_b_candidate_error", intent_id=intent_id,
+                      underlying=getattr(intent, "underlying", None), error=str(exc))
+                continue
+            _pre_stage_b = len(bindings or [])
+            _max_age = float(getattr(self.construction, "stage_b_quote_max_age_s", 0)
+                             or entry_safety.DEFAULT_NBBO_MAX_AGE_SECONDS)
+            bindings = bindings_for_stage_b(bindings, max_age_seconds=_max_age)
+            # Make the staleness cull VISIBLE (2026-08-13). It used to happen silently, which is
+            # how a 91% starvation ("0 prefiltered candidates") went unnoticed across two days.
+            if _pre_stage_b and len(bindings) < _pre_stage_b:
+                print(f"[BUILD] {intent.underlying}: {_pre_stage_b - len(bindings)}/"
+                      f"{_pre_stage_b} candidates dropped for stale NBBO "
+                      f"(> {_max_age:.0f}s); {len(bindings)} survive")
+            if len(bindings) < 3:
+                audit(self.audit_path, "stage_b_skipped", intent_id=intent_id,
+                      underlying=intent.underlying,
+                      reason=f"only {len(bindings)} prefiltered candidates; requires 3")
+                continue
+            candidates = [binding.candidate for binding in bindings]
+            try:
+                # thinking="enabled": Stage B picks WHICH priced contract to buy, and it
+                # was running flat on select_candidate's `thinking="disabled"` default while
+                # Stage A reasoned -- so the selection's cot was captured as null too.
+                # Measured 2026-08-15, BFCL multi_turn_base native FC, n=200: Flash scores
+                # 63.00% thinking-off vs 75.00% thinking-on, a 12-point swing on exactly this
+                # shape of decision. The 1200s cycle absorbs the extra decode.
+                result = await asyncio.to_thread(
+                    select_candidate, self.endpoint, self.model, intent, candidates,
+                    intent_id=intent_id, return_raw=True, return_cot=True,
+                    return_identity=True, thinking="enabled")
+                selected = result
+                raw_b = cot_b = identity_b = None
+                if isinstance(result, tuple):
+                    selected = result[0] if result else None
+                    raw_b = result[1] if len(result) > 1 else None
+                    cot_b = result[2] if len(result) > 2 else None
+                    identity_b = result[3] if len(result) > 3 else None
+            except Exception as exc:
+                audit(self.audit_path, "stage_b_error", intent_id=intent_id,
+                      underlying=intent.underlying, error=str(exc))
+                continue
+            if selected is None:
+                audit(self.audit_path, "stage_b_declined", intent_id=intent_id,
+                      underlying=intent.underlying)
+                continue
+            selected_id = getattr(selected, "candidate_id", None)
+            binding = select_binding(bindings, selected_id)
+            if binding is None:
+                audit(self.audit_path, "stage_b_invalid_selection", intent_id=intent_id,
+                      underlying=intent.underlying, candidate_id=selected_id)
+                continue
+            idea = self._idea_from_stage_b(intent, binding)
+            idea._stage_b_candidates = tuple(candidates)
+            idea._stage_b_raw = raw_b
+            idea._stage_b_cot = cot_b
+            idea._stage_b_identity = identity_b
+            ideas.append(idea)
+            audit(self.audit_path, "stage_b_selected", intent_id=intent_id,
+                  underlying=intent.underlying, candidate_id=selected_id,
+                  candidates=len(candidates))
+        return ideas
 
     async def run_once(self, dry_run: bool, *, skip_exit_cycle: bool = False) -> None:
         # SOFT-MUTEX (2026-06-23): if the daily slate is mid-generation on the single-threaded
@@ -975,7 +1475,8 @@ class Trader:
             audit(self.audit_path, "model_deferred", reason="slate_active")
 
         positions = await self._open_positions()
-        context = await self._market_context(positions, dp)
+        context = await self._market_context(
+            positions, dp, net_liq=pot.net_liq, available_funds=pot.available_funds)
 
         # EXITS-FIRST (2026-06-26 reliability fix): manage stops/targets on open positions
         # BEFORE the slow/failure-prone strategist+approval path, so a hung model call (30-min
@@ -1013,7 +1514,11 @@ class Trader:
         #   * the exit cycle has failed N times in a row (don't pile on unmanageable positions).
         _entries_halted, _halt_reason = False, None
         _marker_gate = self._entry_markers_clear()
-        if not _marker_gate.allowed:
+        _account_gate = entry_safety.account_snapshot_valid(pot)
+        if not _account_gate.allowed:
+            _entries_halted = True
+            _halt_reason = "account_snapshot_invalid: " + "; ".join(_account_gate.reasons)
+        elif not _marker_gate.allowed:
             _entries_halted, _halt_reason = True, "; ".join(_marker_gate.reasons)
         elif getattr(self.exit_manager, "_reconcile_ok", True) is False:
             _entries_halted, _halt_reason = True, "reconcile_unsafe"
@@ -1031,21 +1536,27 @@ class Trader:
             ideas = []
         else:
             try:
-                # OFF-LOOP (2026-07-03): propose() is a BLOCKING HTTP call to the model server;
-                # run it in a worker thread so the IBKR event loop stays responsive.
+                # STAGE A: the model authors intent only.  It cannot guess a premium, strike,
+                # expiry, conId, or quantity.  The priced Stage-B candidates are built from IBKR
+                # immediately afterward and the same model may only select an immutable ID.
+                # thinking="enabled": the entry loop reasons explicitly. It defaulted to OFF
+                # (propose_intents only turns thinking on for recommend/ticker calls), so every
+                # live entry decision was made flat AND captured with cot=null -- the reasoning
+                # behind real-money entries was never recorded. The 1200s cycle absorbs the extra
+                # decode easily; strategist raises the token budget for this path to match.
                 _res = await asyncio.to_thread(
-                    propose, self.endpoint, self.model, context,
-                    return_cot=True, return_identity=True)
-                # robust to all shapes: (ideas, raw, cot) 3-tuple, (ideas, raw) 2-tuple, or a
-                # bare list (older/mocked propose). cot is optional/None-safe.
+                    propose_intents, self.endpoint, self.model, context,
+                    thinking="enabled", return_cot=True, return_identity=True)
+                # Robust to capture-enabled and minimal/mocked result shapes.
                 if isinstance(_res, tuple) and len(_res) == 4:
-                    ideas, _raw_strategist, _cot, _model_identity = _res
+                    intents, _raw_strategist, _cot, _model_identity = _res
                 elif isinstance(_res, tuple) and len(_res) == 3:
-                    ideas, _raw_strategist, _cot = _res
+                    intents, _raw_strategist, _cot = _res
                 elif isinstance(_res, tuple) and len(_res) == 2:
-                    ideas, _raw_strategist = _res
+                    intents, _raw_strategist = _res
                 else:
-                    ideas = _res
+                    intents = _res
+                ideas = await self._materialize_stage_b(intents, pot)
             except Exception as e:
                 audit(self.audit_path, "strategist_error", error=str(e))
                 ideas = []
@@ -1126,16 +1637,26 @@ class Trader:
         # day used elsewhere. Ceilings only ADD safety -- they skip an idea, never up-size one.
         _orders_this_cycle = 0
         _sm = getattr(self.exit_manager, "state_manager", None)
+        # LOST-UPDATE FIX (2026-08-12). The day-open counters used to be persisted INTO the shared
+        # exitmgr_state.json. StateManager loads that file exactly once per process (lazy `_state`,
+        # no reload path anywhere) and every save() re-serialises that process's WHOLE in-memory
+        # State -- so the entry process's save flushed an hours-old snapshot over every peak_price
+        # and in_flight close the protective loop had recorded since entry started, and the
+        # protective loop's own 30s save erased these counters right back. orders_opened /
+        # notional_opened are entry-only data, so they now live in their own small file with its own
+        # private lock. The protective loop never touches that file or that lock -- this cannot
+        # block or deadlock exit management. See exitmgr/entry_throttle.py.
+        _throttle_store = None
+        try:
+            if _sm is not None:
+                _throttle_store = EntryThrottleStore.for_state_path(_sm.state_path)
+        except Exception as _tse:
+            print(f"[WARN] entry throttle store unavailable (continuing): {_tse}")
 
         def _day_open_counts():
-            """(orders_opened_today, notional_opened_today) from persisted state; (0, 0.0) if absent."""
-            try:
-                ds = _sm.state.daily_stats.get(today) if _sm is not None else None
-                if ds is None:
-                    return 0, 0.0
-                return int(getattr(ds, "orders_opened", 0)), float(getattr(ds, "notional_opened", 0.0))
-            except Exception:
-                return 0, 0.0
+            """(orders_opened_today, notional_opened_today): MAX of the durable throttle file and
+            this process's in-memory State. Fail-conservative -- max() can only bind a cap sooner."""
+            return entry_day_open_counts(_sm, _throttle_store, today)
 
         # GUARDRAIL 1 (2026-07-03 order-state fix): the entry RISK gate must evaluate exposure off
         # the FRESH POST-EXIT book, NOT the stale `positions` fetched at the top of run_once BEFORE
@@ -1214,7 +1735,9 @@ class Trader:
 
             # Resolve the CONCRETE order BEFORE asking -- so the human approves the real order.
             try:
-                resolved = await self._resolve_order(idea, plan.gate.per_trade_cap)
+                resolved = await self._resolve_order(
+                    idea, plan.gate.per_trade_cap,
+                    net_liq=pot.net_liq, available_funds=pot.available_funds)
             except Exception as e:
                 audit(self.audit_path, "resolve_error", underlying=idea.underlying, error=str(e))
                 _cap_rej("resolve_error", str(e), gate=plan.gate)
@@ -1492,20 +2015,45 @@ class Trader:
                     f"Too large for this ${pot.net_liq:,.0f} pot.")
                 continue
 
-            ts = approval.post_proposal(self.slack_token, self.slack_channel, msg)
-            if not ts:
-                audit(self.audit_path, "slack_post_failed", underlying=idea.underlying)
-                continue
+            # AUTO-APPROVE (2026-08-14). The risk gate has already cleared this trade and
+            # sized it; waiting on a Slack tap adds latency, not safety. Skip the wait ONLY when
+            # the gate approved with ZERO reasons and capital at risk is inside the gate's own
+            # per-trade cap. Everything below still rebuilds from a fresh account/chain/NBBO and
+            # re-runs every hard gate, so this removes the human tap and no risk check.
+            _auto_ok = (self.auto_approve_within_gates
+                        and bool(getattr(plan.gate, "approved", False))
+                        and not list(getattr(plan.gate, "reasons", []) or [])
+                        and _est_gross > 0
+                        and _est_gross <= float(getattr(plan.gate, "per_trade_cap", 0) or 0))
+            if _auto_ok:
+                # Still post -- as a notification, not a request. The book must never change
+                # silently just because no human was in the loop.
+                approval.post_proposal(
+                    self.slack_token, self.slack_channel,
+                    ":robot_face: *AUTO-APPROVED (within risk gates)* — submitting now. "
+                    "_This is a receipt; no approval is being awaited._\n" + msg,
+                    seed_reactions=False)
+                audit(self.audit_path, "auto_approved", underlying=idea.underlying,
+                      order=order_summary(resolved), decision_id=resolved.decision_id,
+                      est_gross=round(_est_gross), per_trade_cap=round(
+                          float(getattr(plan.gate, "per_trade_cap", 0) or 0)))
+                _posted_at = time.monotonic()
+                decision = "approve"
+            else:
+                ts = approval.post_proposal(self.slack_token, self.slack_channel, msg)
+                if not ts:
+                    audit(self.audit_path, "slack_post_failed", underlying=idea.underlying)
+                    continue
             # OFF-LOOP (2026-07-03): await_approval BLOCKS (polls Slack + sleeps) for up to the
             # approve timeout; run it in a worker thread so the IBKR event loop / exit I/O isn't
             # starved for minutes while a human decides.
-            _posted_at = time.monotonic()
-            decision = await asyncio.to_thread(
-                approval.await_approval, self.slack_token, self.slack_channel, ts,
-                self.approver_ids, _approval_ttl)
-            audit(self.audit_path, "approval", underlying=idea.underlying,
-                  order=order_summary(resolved), decision=decision,
-                  decision_id=resolved.decision_id)
+                _posted_at = time.monotonic()
+                decision = await asyncio.to_thread(
+                    approval.await_approval, self.slack_token, self.slack_channel, ts,
+                    self.approver_ids, _approval_ttl)
+                audit(self.audit_path, "approval", underlying=idea.underlying,
+                      order=order_summary(resolved), decision=decision,
+                      decision_id=resolved.decision_id)
             if decision != "approve":
                 _cap_rej("approval", f"human decision: {decision}", resolved=resolved, gate=plan.gate)
                 continue
@@ -1562,7 +2110,8 @@ class Trader:
                     audit(self.audit_path, "reapproval_gate_blocked", underlying=idea.underlying,
                           decision_id=resolved.decision_id, reasons=_recheck_reasons)
                     continue
-                _changes2 = entry_safety.material_changes(fresh, fresh2)
+                _changes2 = (credit_material_changes(fresh, fresh2) if is_credit(fresh)
+                             else entry_safety.material_changes(fresh, fresh2))
                 if _changes2:
                     audit(self.audit_path, "reapproval_churn_blocked", underlying=idea.underlying,
                           decision_id=resolved.decision_id, changes=_changes2)
@@ -1653,9 +2202,15 @@ class Trader:
                     # so subsequent ideas (this cycle and later cycles today) see the updated ceiling.
                     _orders_this_cycle += 1
                     try:
-                        if _sm is not None:
-                            _sm.state.update_daily_open_stats(today, 1, _resolved_cost)
-                            _sm.save()
+                        # LOST-UPDATE FIX (2026-08-12): accrue in memory (so later ideas THIS cycle
+                        # see it, exactly as before) and persist to the ENTRY-ONLY throttle file.
+                        # Deliberately NO _sm.save() here -- that call flushed this process's stale
+                        # whole-State snapshot over the protective loop's peaks / in-flight closes.
+                        if not record_entry_open(_sm, _throttle_store, today, 1, _resolved_cost):
+                            print("[WARN] entry throttle counter NOT persisted (lock busy or I/O "
+                                  "error) -- the daily cap will under-count after a restart")
+                            audit(self.audit_path, "entry_throttle_persist_failed",
+                                  underlying=idea.underlying, date=today, cost=_resolved_cost)
                     except Exception as _ue:
                         print(f"[WARN] entry daily-stats update failed (continuing): {_ue}")
             except Exception as e:
@@ -1680,7 +2235,8 @@ class Trader:
                 positions=open_positions, baseline=baseline,
                 approved_names=self.approved_names, limits=self.limits,
                 regime=self._regime).gate
-            if not gate.approved:
+            _stage_b_bound = getattr(idea, "_stage_b_binding", None) is not None
+            if not gate.approved and not _stage_b_bound:
                 reasons.extend(gate.reasons)
             raw_positions = await self.ib_conn.get_positions()
             working_orders = await self.ib_conn.ib.reqAllOpenOrdersAsync()
@@ -1689,10 +2245,22 @@ class Trader:
             days = await asyncio.to_thread(research.days_to_earnings, idea.underlying)
             if days is None:
                 reasons.append("earnings date unavailable at approval time")
-            fresh = await self._resolve_order(idea, gate.per_trade_cap)
+            fresh = await self._resolve_order(
+                idea, gate.per_trade_cap,
+                net_liq=pot.net_liq, available_funds=pot.available_funds)
             if fresh is None:
                 reasons.append("fresh contract/NBBO resolution returned no order")
             else:
+                if _stage_b_bound:
+                    # Repricing updates the idea's runtime-authored dollars. Re-run the risk gate
+                    # on those exact fresh totals; the pre-requote values are not authoritative.
+                    gate = plan_idea(
+                        idea, net_liq=pot.net_liq, available_funds=pot.available_funds,
+                        positions=open_positions, baseline=baseline,
+                        approved_names=self.approved_names, limits=self.limits,
+                        regime=self._regime).gate
+                    if not gate.approved:
+                        reasons.extend(gate.reasons)
                 fresh.decision_id = original.decision_id
                 fresh.decision_revision = original.decision_revision
                 fresh.model_identity = original.model_identity
@@ -1816,8 +2384,8 @@ class Trader:
         ib = self.ib_conn.ib
         cons = self.construction
         strike = float(getattr(idea, "strike"))
-        stk = (await ib.qualifyContractsAsync(Stock(idea.underlying, "SMART", "USD")))[0]
-        params = await ib.reqSecDefOptParamsAsync(idea.underlying, "", "STK", stk.conId)
+        stk = (await asyncio.wait_for(ib.qualifyContractsAsync(Stock(idea.underlying, "SMART", "USD")), _IB_CALL_TIMEOUT_S))[0]
+        params = await asyncio.wait_for(ib.reqSecDefOptParamsAsync(idea.underlying, "", "STK", stk.conId), _IB_CALL_TIMEOUT_S)
         if not params:
             return None
         p = pick_chain(params, idea.underlying)
@@ -1849,8 +2417,8 @@ class Trader:
                   requested_dte=idea.target_dte, adjusted_dte=chosen_dte, min_dte=credit_min)
         spot = await underlying_price(ib, stk)
         # Qualify the option AT THE IDEA'S STRIKE -- exactly one contract, no substitution.
-        qualified = await ib.qualifyContractsAsync(
-            Option(idea.underlying, expiry, strike, "P", "SMART"))
+        qualified = await asyncio.wait_for(ib.qualifyContractsAsync(
+            Option(idea.underlying, expiry, strike, "P", "SMART")), _IB_CALL_TIMEOUT_S)
         contract = next((c for c in (qualified or []) if getattr(c, "conId", None)), None)
         if contract is None:
             audit(self.audit_path, "construction_rejected", underlying=idea.underlying,
@@ -1862,7 +2430,7 @@ class Trader:
             audit(self.audit_path, "construction_rejected", underlying=idea.underlying,
                   reason="qualified contract does not match the requested put strike")
             return None
-        tickers = await ib.reqTickersAsync(contract)
+        tickers = await asyncio.wait_for(ib.reqTickersAsync(contract), _IB_CALL_TIMEOUT_S)
         tk = next(iter(tickers or []), None)
         if tk is None:
             return None
@@ -1918,9 +2486,57 @@ class Trader:
             side=CREDIT_SIDE, collateral_usd=collateral, net_credit_usd=net_credit,
             credit_max_loss_usd=max_loss)
 
-    async def _resolve_order(self, idea: TradeIdea, per_trade_cap: float) -> Optional[ResolvedOrder]:
+    async def _resolve_order(self, idea: TradeIdea, per_trade_cap: float, *,
+                             net_liq: Optional[float] = None,
+                             available_funds: Optional[float] = None) -> Optional[ResolvedOrder]:
         """Select the concrete option contract from target DTE/delta and size it. Returns a
         ResolvedOrder (no order placed yet) or None if nothing usable. Validate on first live run."""
+        # Frozen Stage A/B path: reprice ONLY the selected conIds.  Running the legacy selector
+        # here would silently substitute a different contract after the model/human chose one.
+        binding = getattr(idea, "_stage_b_binding", None)
+        intent = getattr(idea, "_stage_a_intent", None)
+        if binding is not None or intent is not None:
+            if not isinstance(binding, CandidateBinding) or not isinstance(intent, StageAIntent):
+                return None
+            refreshed = binding
+            if net_liq is not None and available_funds is not None:
+                try:
+                    deployed_credit = (await self._deployed_collateral()
+                                       if intent.side == CREDIT_SIDE else 0.0)
+                    _rs = []
+                    refreshed = await reprice_binding(
+                        self.ib_conn.ib, binding, intent,
+                        net_liq=net_liq, available_funds=available_funds,
+                        cons=self.construction,
+                        deployed_credit_usd=deployed_credit,
+                        cash_buffer_pct=self.limits.cash_buffer_pct, reasons=_rs)
+                except Exception as _re:
+                    audit(self.audit_path, "reprice_failed",
+                          underlying=getattr(intent, "underlying", None), error=str(_re)[:200])
+                    return None
+            if refreshed is None:
+                # Record WHICH guard refused. Nine distinct paths previously collapsed into a
+                # silent None here, so a skipped entry left no trace of its cause (2026-08-12).
+                audit(self.audit_path, "reprice_refused",
+                      underlying=getattr(intent, "underlying", None),
+                      reason="; ".join(_rs) if _rs else "unspecified")
+                return None
+            # The immutable candidate ID must survive quote refresh; only price/qty may move.
+            if refreshed.candidate.candidate_id != binding.candidate.candidate_id:
+                audit(self.audit_path, "reprice_identity_changed",
+                      underlying=getattr(intent, "underlying", None))
+                return None
+            idea._stage_b_binding = refreshed
+            resolved = refreshed.to_resolved_order(intent)
+            if is_credit(resolved):
+                idea.strike = resolved.strike
+                idea.collateral_usd = resolved.collateral_usd
+                idea.net_credit_usd = resolved.net_credit_usd
+                idea.max_loss_usd = resolved.credit_max_loss_usd
+            else:
+                idea.est_debit_usd = round(
+                    float(refreshed.candidate.one_contract_cost_usd) * int(resolved.qty), 2)
+            return resolved
         # CREDIT (spec S2): one dispatch point, so the credit branch is reached through the SAME
         # method the proposal path AND the post-approval refresh path both call. There is no
         # second pipeline.
@@ -1940,8 +2556,8 @@ class Trader:
         from exitmgr.market import usable_price
         ib = self.ib_conn.ib
         right = "C" if idea.direction == "bullish" else "P"
-        stk = (await ib.qualifyContractsAsync(Stock(idea.underlying, "SMART", "USD")))[0]
-        params = await ib.reqSecDefOptParamsAsync(idea.underlying, "", "STK", stk.conId)
+        stk = (await asyncio.wait_for(ib.qualifyContractsAsync(Stock(idea.underlying, "SMART", "USD")), _IB_CALL_TIMEOUT_S))[0]
+        params = await asyncio.wait_for(ib.reqSecDefOptParamsAsync(idea.underlying, "", "STK", stk.conId), _IB_CALL_TIMEOUT_S)
         if not params:
             return None
         p = pick_chain(params, idea.underlying)
@@ -1967,8 +2583,8 @@ class Trader:
                   requested_dte=idea.target_dte, adjusted_dte=chosen_dte, min_dte=cons.min_dte)
         spot = await underlying_price(ib, stk)
         cands = [Option(idea.underlying, expiry, k, right, "SMART") for k in strikes_near(p.strikes, spot)]
-        qualified = await ib.qualifyContractsAsync(*cands)
-        tickers = await ib.reqTickersAsync(*[c for c in qualified if getattr(c, "conId", None)])
+        qualified = await asyncio.wait_for(ib.qualifyContractsAsync(*cands), _IB_CALL_TIMEOUT_S)
+        tickers = await asyncio.wait_for(ib.reqTickersAsync(*[c for c in qualified if getattr(c, "conId", None)]), _IB_CALL_TIMEOUT_S)
         # LONG-LEG DELTA BAND (gate A3): target ~0.55-0.65 delta -- a leg that is already
         # working, not a lottery ticket. The model's target_delta is clamped into the band.
         tgt_delta = construction.effective_delta(idea.target_delta, cons)
@@ -2103,6 +2719,11 @@ class Trader:
 
     async def _submit_order(self, r: ResolvedOrder):
         """Serialize BUY placement against the fast protective-exit mutation loop."""
+        # CSP admission performs account/broker I/O before taking the host-wide order-mutation
+        # lock. Its separate atomic reservation ledger prevents entry-entry races; only the final
+        # placeOrder is serialized with protective exits, so slow reads cannot delay a close.
+        if is_credit(r):
+            return await self._submit_order_unlocked(r)
         lock = self.broker_order_lock
         if lock is None:
             return await self._submit_order_unlocked(r)
@@ -2139,18 +2760,14 @@ class Trader:
                     "cash-secured put, not a multi-leg short structure")
             if int(r.qty) < 1:
                 raise RuntimeError("credit order has no positive quantity")
-            # INVARIANT 2, enforced HERE (submit time) against a fresh account read + a fresh
-            # short-position/working-order read. A proposal-time pass is NOT sufficient: cash can
-            # be spent by an exit, an assignment, or another entry between approval and submit.
-            capacity, detail = await self._credit_capacity(r)
-            audit(self.audit_path, "credit_collateral_check", stage="submit",
-                  underlying=r.underlying, decision_id=getattr(r, "decision_id", None),
-                  allowed=capacity.allowed, reasons=list(capacity.reasons), **detail)
-            if not capacity.allowed:
-                raise RuntimeError("collateral gate blocks submit: " + "; ".join(capacity.reasons))
-            if abs(float(detail["required"] or 0.0) - capital_committed(r)) > 0.01:
+            # Arithmetic identity first; the sole live submit-time account/book check is the
+            # atomic reserve_credit_entry() call below.
+            required = required_collateral(r.strike, r.qty)
+            if required is None:
+                raise RuntimeError("credit order has invalid collateral inputs")
+            if abs(float(required) - capital_committed(r)) > 0.01:
                 raise RuntimeError(
-                    f"collateral mismatch: recomputed ${detail['required']:,.2f} != approved "
+                    f"collateral mismatch: recomputed ${required:,.2f} != approved "
                     f"${capital_committed(r):,.2f}")
             _lmt_credit = credit_executable_price(r)   # we SELL, so we cross at the bid
             if not (_lmt_credit > 0):
@@ -2158,10 +2775,57 @@ class Trader:
             order = Order(action="SELL", orderType="LMT", lmtPrice=_lmt_credit,
                           totalQuantity=r.qty, tif="DAY")
             order.orderRef = entry_safety.decision_order_ref(r.decision_id)
+            reservation, _reservation_pot, _reservation_broker = await reserve_credit_entry(
+                self.ib_conn.ib, r, order.orderRef,
+                ledger=self.entry_reservation_ledger, audit_path=self.audit_path)
+            if not reservation.allowed:
+                raise RuntimeError(
+                    "collateral gate blocks submit: " + "; ".join(reservation.reasons))
+            if not reservation.should_place:
+                raise RuntimeError(
+                    f"credit reservation forbids duplicate placement ({reservation.status})")
             from exitmgr.order_lock import order_mutation_lock
-            with order_mutation_lock():
-                trade = self.ib_conn.ib.placeOrder(r.contract, order)
-            return await self._await_and_journal(trade, r)
+            place_invoked = False
+            pre_submit_error = None
+            try:
+                with order_mutation_lock():
+                    marker_now = self._entry_markers_clear()
+                    if not marker_now.allowed:
+                        pre_submit_error = (
+                            "entry markers block submit after reservation: "
+                            + "; ".join(marker_now.reasons))
+                    else:
+                        quote_now = entry_safety.nbbo_valid(r)
+                        if not quote_now.allowed:
+                            pre_submit_error = (
+                                "fresh NBBO blocks submit after reservation: "
+                                + "; ".join(quote_now.reasons))
+                    if pre_submit_error is None:
+                        # order_mutation_lock is held across this final money-boundary call.
+                        place_invoked = True
+                        trade = self.ib_conn.ib.placeOrder(r.contract, order)
+            except Exception as exc:
+                if not place_invoked:
+                    await asyncio.to_thread(self.entry_reservation_ledger.clear, order.orderRef)
+                    audit(self.audit_path, "credit_entry_reservation_cleared",
+                          order_ref=order.orderRef, status="definite_pre_submit_failure")
+                else:
+                    # Whether IBKR accepted an order whose API call raised is ambiguous. Retain
+                    # until broker reconciliation/TTL rather than risking a duplicate CSP.
+                    audit(self.audit_path, "credit_place_ambiguous_reservation_retained",
+                          order_ref=order.orderRef, error=str(exc))
+                raise
+            if pre_submit_error is not None:
+                await asyncio.to_thread(self.entry_reservation_ledger.clear, order.orderRef)
+                audit(self.audit_path, "credit_entry_reservation_cleared",
+                      order_ref=order.orderRef, status="definite_pre_submit_block")
+                raise RuntimeError(pre_submit_error)
+            status, reasons = await self._await_and_journal(trade, r)
+            if await asyncio.to_thread(
+                    self.entry_reservation_ledger.clear_for_status, order.orderRef, status):
+                audit(self.audit_path, "credit_entry_reservation_cleared",
+                      order_ref=order.orderRef, status=status)
+            return status, reasons
         # -------------------------------------------------------------- DEBIT: BUY to open
         # DEBIT STRUCTURE GATE, enforcement point #3 -- the debit mirror of the invariant-1
         # re-check the credit branch performs immediately above, at the money boundary. Every
@@ -2207,7 +2871,7 @@ class Trader:
         """Wait for a decisive IBKR status, then journal unless the order was rejected. Shared
         verbatim by the debit and credit branches -- there is ONE fill/journal path, not two."""
         live = {"Filled", "Submitted", "PreSubmitted"}
-        dead = {"Cancelled", "ApiCancelled", "Inactive"}
+        dead = {"Cancelled", "ApiCancelled", "Inactive", "Rejected"}
         for _ in range(24):  # up to ~12s for IBKR to ACK or REJECT
             await asyncio.sleep(0.5)
             if trade.orderStatus.status in live or trade.orderStatus.status in dead:

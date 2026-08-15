@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Daily trade-recommendation slate from MiniMax.
+"""Daily trade-recommendation slate from the configured strategist model.
+
+The backend is CONFIGURATION, not identity: read `trading.llm_endpoint` / `trading.llm_model`
+from config.yaml. Never name a specific model in code or in user-facing output -- a hardcoded
+"MiniMax" outlived the model by a day and taught the assistant a false fact about its own stack.
 
 Runs once a day (cron at market open). Asks the strategist in RECOMMEND mode for its best 1-3
 option ideas scored 1-10, prices each concrete contract via IBKR (needs the OPRA subscription),
@@ -11,6 +15,7 @@ and scores; YOU approve; this just carries it. clientId 93 (no clash with trader
 Usage: ~/ib-grader-venv/bin/python daily_recommend.py [--watch-mins 360]
 """
 import argparse
+import math
 import asyncio
 import json
 import os
@@ -25,12 +30,24 @@ import yaml
 from exitmgr.account import get_pot_snapshot
 from exitmgr.connection import IBConnection
 from exitmgr.ibkr import Stock, Option, Order, pick_chain, strikes_near, underlying_price
-from exitmgr.strategist import propose, discover_names, propose_one, TradeIdea
+from exitmgr.strategist import (
+    propose, discover_names, propose_one, propose_intents, select_candidate, TradeIdea,
+)
 from exitmgr.trader import (
-    ResolvedOrder, order_summary, contract_snapshot, audit, _trading_day,
+    Trader, ResolvedOrder, order_summary, contract_snapshot, audit, _trading_day,
     # The structure gate is IMPORTED from trader.py, which itself imports the allow-list from
     # strategist.py. One list, one gate, one place to change it -- this file declares neither.
     debit_structure_ok, _structure_implied_right, _require_allowed_structure,
+    is_credit, capital_at_risk, capital_committed, credit_executable_price,
+    credit_material_changes, credit_structure_ok, collateral_capacity,
+    required_collateral, broker_deployed_csp_collateral, _credit_limits,
+    reserve_credit_entry,
+)
+from exitmgr.entry_reservation import EntryReservationLedger
+from exitmgr.entry_contract import StageAIntent
+from exitmgr.entry_builder import (
+    CandidateBinding, build_entry_candidates, bindings_for_stage_b,
+    reprice_binding, select_binding,
 )
 from exitmgr import apewisdom, approval, construction, entry_safety, research, trade_capture, risk
 from exitmgr.config import ConstructionConfig, construction_from_dict
@@ -43,14 +60,30 @@ CLIENT_ID = 93
 # config (trading.cash_buffer_pct) in main(); the risk gate (exitmgr/risk.py) enforces the same on
 # the trader loop. 2026-06-22.
 CASH_BUFFER_PCT = 0.05
+DAILY_ENTRY_RESERVATIONS = EntryReservationLedger()
 
 # 2026-07-01 constructor rework: construction gates (min-DTE floor, TP/SL clamp, structure
 # sanity, premium/deployed/decay budgets). Overwritten from config.yaml `construction:` in
 # run(); the module-global style matches CASH_BUFFER_PCT above. CONN/JOURNAL_PATH let the
 # budget gates value the OPEN book (deployed premium + portfolio decay) from live positions.
 CONS = ConstructionConfig()
-# POT-TIERED TP RUNNER CEILING rows (caps.tp_tiers); set in run(). Empty => flat no-op.
-CAPS_TP_TIERS = []
+# (The pot-tiered TP runner ceiling that used to be read from caps.tp_tiers into a module global
+# here was REMOVED 2026-07-26 -- Sol audit R5 R2 / RULING_TAKE_PROFIT.md. Account size no longer
+# takes part in the exit decision at all, so there is nothing left to cache.)
+
+
+def _tp_level_text(tp_pct, tp_price):
+    """Render the take-profit half of a Slack sell-levels line. `tp_pct` is OPTIONAL and is None
+    on essentially every trade now (Sol audit R5 R2): there is no mechanical profit target, so say
+    so plainly rather than printing a number the code will not act on."""
+    if tp_pct is None:
+        return "take profit *none* (doctrine, not a clamp — the model decides on thesis + giveback)"
+    return f"take profit ~${tp_price:.2f} (+{tp_pct:.0f}%, explicit catastrophe backstop)"
+
+
+def _pct_text(v):
+    """`+30%`-style text for an OPTIONAL percent level; 'none' when absent."""
+    return "none" if v is None else f"{v:.0f}%"
 CONN = None            # the IBConnection, set in run()
 JOURNAL_PATH = "./trades.log"
 ERROR_CHANNEL = ""     # #error-logs -- unfilled-entry alarms; set from config in run()
@@ -58,7 +91,7 @@ FILLS_PATH = "./fills.log"  # entry-fill confirmations (SEPARATE file: trades.lo
                             # key newest-line-per-contract_id, so lifecycle lines can't go there)
 
 # 2026-07-03 gate H2: the sector/correlation cap (risk.py #6b) + single-name-agg cap (#6) only
-# ran on the autonomous trader path. The daily slate -- the operator's PRIMARY entry path -- never
+# ran on the autonomous trader path. The daily slate -- Trevor's PRIMARY entry path -- never
 # called risk.evaluate_trade, so the flagship concentration protection was dormant where trades
 # actually originate. We now SURFACE a warning (never hard-block; the human tap decides) if a
 # candidate would breach either cap. _RISK_LIMITS is loaded from config.yaml `trading:` in run()
@@ -122,7 +155,7 @@ def _concentration_notes(open_positions, underlying, candidate_debit, is_index, 
     of (warning_text, audit_kwargs); EMPTY when nothing breaches (so no head note is added and there
     is NO behavior change on an under-cap idea). Mirrors risk.py #6/#6b math exactly -- same $
     premium-at-risk basis, same caps, same 'index ETFs exempt' rule -- but is SURFACE-ONLY: the
-    slate has a human tap, so we warn and let the operator decide rather than hard-block."""
+    slate has a human tap, so we warn and let Trevor decide rather than hard-block."""
     notes = []
     u = (underlying or "").upper()
     if is_index or pot <= 0:
@@ -241,6 +274,15 @@ def _watch_entry_fills(placed_watch, token, audit_path):
             status = st.status
         except Exception:
             continue
+        if (w.get("credit_reservation")
+                and status in {"Cancelled", "ApiCancelled", "Inactive", "Rejected"}):
+            try:
+                if DAILY_ENTRY_RESERVATIONS.clear_for_status(w.get("order_ref"), status):
+                    audit(audit_path, "credit_entry_reservation_cleared",
+                          order_ref=w.get("order_ref"), status=status)
+            except Exception as exc:
+                audit(audit_path, "credit_entry_reservation_clear_error",
+                      order_ref=w.get("order_ref"), status=status, error=str(exc))
         if status == "Filled" and not w["filled_logged"]:
             _afp = getattr(st, "avgFillPrice", None)
             fill_px = float(_afp) if (_afp and _afp == _afp) else None
@@ -333,12 +375,26 @@ def user_directed_idea(args) -> TradeIdea:
     a different structure is the same mislabelling defect wearing a different hat."""
     direction = "bullish" if args.right.upper() == "C" else "bearish"
     structure = args.structure or ("long call" if direction == "bullish" else "long put")
+    # intended_hold_days was NEVER set on this route, so every user-directed fill journalled it
+    # as null (observed on the live SMCI entry 2026-08-12). That field is the DENOMINATOR of the
+    # 5-8x DTE doctrine check, so a null makes the position un-auditable after the fact -- and
+    # post-hoc DTE compliance is exactly how the previous book's losses were diagnosed
+    # (median dte_at_close was 0).
+    #
+    # --hold-days states it explicitly. Left unset, it is DERIVED as ceil(dte/8): the shortest
+    # hold for which the chosen DTE still satisfies the 8x ceiling, which also guarantees the
+    # recorded pair lands inside the 5-8x window. Derived, not invented -- it records the hold
+    # the doctrine implies for the DTE the user asked for, rather than fabricating an intent.
+    _hold = int(getattr(args, "hold_days", 0) or 0)
+    if _hold <= 0:
+        _hold = max(1, math.ceil(int(args.dte) / 8.0))
     idea = TradeIdea(underlying=args.ticker.upper(),
                      is_index=args.ticker.upper() in ("SPY", "QQQ", "IWM"),
                      direction=direction, structure=structure,
                      target_dte=args.dte, target_delta=args.delta,
                      est_debit_usd=0.0, conviction=int(args.conviction),
-                     thesis=args.thesis, profit_target_pct=args.tp, stop_pct=args.stop)
+                     thesis=args.thesis, profit_target_pct=args.tp, stop_pct=args.stop,
+                     intended_hold_days=_hold)
     ok, why = debit_structure_ok(idea)
     if not ok:
         raise ValueError("--structure %r refused. %s" % (structure, why))
@@ -437,6 +493,41 @@ async def _resolve(ib, idea, available, net_liq=None):
     """Pick the concrete option (nearest expiry to target DTE, strike by delta) and price it via
     OPRA. Single-leg long call/put; sizes to >=1 contract within available funds. None if it
     can't price or even one contract is unaffordable."""
+    # Frozen Stage A/B route. Requote only the selected conIds; never fall through to the legacy
+    # selector, which could silently substitute another strike or structure after Stage B.
+    binding = getattr(idea, "_stage_b_binding", None)
+    intent = getattr(idea, "_stage_a_intent", None)
+    if binding is not None or intent is not None:
+        if not isinstance(binding, CandidateBinding) or not isinstance(intent, StageAIntent):
+            return None, "invalid Stage-B binding"
+        try:
+            deployed_credit = (await broker_deployed_csp_collateral(ib)
+                               if intent.side == "credit" else 0.0)
+            _rs = []
+            refreshed = await reprice_binding(
+                ib, binding, intent, net_liq=net_liq,
+                available_funds=available, cons=CONS,
+                deployed_credit_usd=deployed_credit,
+                # All callers pass deployable_funds(), which already reserves the cash buffer.
+                cash_buffer_pct=0.0, reasons=_rs)
+        except Exception as exc:
+            return None, f"selected-candidate requote failed: {exc}"
+        if refreshed is None or refreshed.candidate.candidate_id != binding.candidate.candidate_id:
+            # Say WHICH of the nine guards refused. This used to be one opaque string, so a
+            # declined approval was indistinguishable from a protective block (2026-08-12).
+            _why = "; ".join(_rs) if _rs else "candidate identity changed on requote"
+            return None, "cannot place: %s" % _why
+        idea._stage_b_binding = refreshed
+        resolved = refreshed.to_resolved_order(intent)
+        if resolved.side == "credit":
+            idea.strike = resolved.strike
+            idea.collateral_usd = resolved.collateral_usd
+            idea.net_credit_usd = resolved.net_credit_usd
+            idea.max_loss_usd = resolved.credit_max_loss_usd
+        else:
+            idea.est_debit_usd = round(
+                refreshed.candidate.one_contract_cost_usd * resolved.qty, 2)
+        return resolved, None
     # STRUCTURE GATE (2026-07-26): the constructor's own check, the mirror of the one at the top
     # of trader._resolve_order(). Every debit order this process builds is built here, so an idea
     # that reached construction by any route -- including one added later -- is refused before a
@@ -587,6 +678,73 @@ def _daily_cap_rejected(stage, reason, idea, resolved):
         print(f"[WARN] daily-slate capture_rejected failed (continuing): {_re}")
 
 
+async def _materialize_stage_b(ib, intents, pot, tr, audit_path):
+    """Shared daily/add-name Stage B: same builder, fields, units, and decline as Trader."""
+    ideas = []
+    for index, intent in enumerate(intents or [], start=1):
+        intent_id = f"intent_{index}"
+        try:
+            deployed_credit = (await broker_deployed_csp_collateral(ib, audit_path)
+                               if intent.side == "credit" else 0.0)
+            bindings = await build_entry_candidates(
+                ib, intent, intent_id, net_liq=pot.net_liq,
+                available_funds=pot.available_funds, cons=CONS,
+                deployed_credit_usd=deployed_credit,
+                cash_buffer_pct=CASH_BUFFER_PCT)
+        except Exception as exc:
+            audit(audit_path, "stage_b_candidate_error", intent_id=intent_id,
+                  underlying=getattr(intent, "underlying", None), error=str(exc),
+                  route="daily_or_add_name")
+            continue
+        bindings = bindings_for_stage_b(
+            bindings, max_age_seconds=entry_safety.DEFAULT_NBBO_MAX_AGE_SECONDS)
+        if len(bindings) < 3:
+            audit(audit_path, "stage_b_skipped", intent_id=intent_id,
+                  underlying=intent.underlying,
+                  reason=f"only {len(bindings)} prefiltered candidates; requires 3",
+                  route="daily_or_add_name")
+            continue
+        candidates = [binding.candidate for binding in bindings]
+        try:
+            result = await asyncio.to_thread(
+                select_candidate, tr.get("llm_endpoint"), tr.get("llm_model"),
+                intent, candidates, intent_id=intent_id, return_raw=True,
+                return_cot=True, return_identity=True)
+            selected = result
+            raw_b = cot_b = identity_b = None
+            if isinstance(result, tuple):
+                selected = result[0] if result else None
+                raw_b = result[1] if len(result) > 1 else None
+                cot_b = result[2] if len(result) > 2 else None
+                identity_b = result[3] if len(result) > 3 else None
+        except Exception as exc:
+            audit(audit_path, "stage_b_error", intent_id=intent_id,
+                  underlying=intent.underlying, error=str(exc),
+                  route="daily_or_add_name")
+            continue
+        if selected is None:
+            audit(audit_path, "stage_b_declined", intent_id=intent_id,
+                  underlying=intent.underlying, route="daily_or_add_name")
+            continue
+        selected_id = getattr(selected, "candidate_id", None)
+        binding = select_binding(bindings, selected_id)
+        if binding is None:
+            audit(audit_path, "stage_b_invalid_selection", intent_id=intent_id,
+                  underlying=intent.underlying, candidate_id=selected_id,
+                  route="daily_or_add_name")
+            continue
+        idea = Trader._idea_from_stage_b(intent, binding)
+        idea._stage_b_candidates = tuple(candidates)
+        idea._stage_b_raw = raw_b
+        idea._stage_b_cot = cot_b
+        idea._stage_b_identity = identity_b
+        ideas.append(idea)
+        audit(audit_path, "stage_b_selected", intent_id=intent_id,
+              underlying=intent.underlying, candidate_id=selected_id,
+              candidates=len(candidates), route="daily_or_add_name")
+    return ideas
+
+
 async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pending,
                      label="Daily rec", audit_event="daily_rec_posted",
                      candidates=None, raw_strategist=None, market_context=None, regime=None,
@@ -594,20 +752,44 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
     """Resolve an idea to a concrete priced order, post it to #approvals with one-tap, and append it
     to `pending` so the watch loop manages approval/execution. Returns the Slack ts (or None).
     Shared by the daily slate and the same-day 'add a name -> suggest it now' path."""
+    _credit = is_credit(idea)
     deployable = deployable_funds(pot)  # available_funds minus the 5% cash reserve
     # PREMIUM CAP (2026-07-01 gate A4): no trade's premium may exceed max_premium_pct (15%)
     # of net-liq -- clamps BOTH the default slice and the full-size opt-in path (82-103% of
     # the pot was deployed at times; one gap-down = -27% account day).
-    _max_prem = construction.max_premium_budget(pot.net_liq, CONS)
-    if _max_prem > 0:
-        deployable = min(deployable, _max_prem)
-    cons_budget = min(deployable, default_pct * pot.net_liq)
+    if _credit:
+        _deployed_credit = await broker_deployed_csp_collateral(ib, audit_path)
+        if _deployed_credit is None:
+            _daily_cap_rejected("collateral", "deployed CSP collateral unverifiable", idea, None)
+            return None
+        deployable = min(
+            deployable,
+            max(0.0, 0.80 * pot.net_liq - _deployed_credit),
+        )
+    else:
+        _max_prem = construction.max_premium_budget(pot.net_liq, CONS)
+        if _max_prem > 0:
+            deployable = min(deployable, _max_prem)
+    _stage_b_bound = getattr(idea, "_stage_b_binding", None) is not None
+    cons_budget = deployable if _stage_b_bound else min(deployable, default_pct * pot.net_liq)
     resolved, why = await _resolve(ib, idea, cons_budget, net_liq=pot.net_liq)
     over_default = False
-    if not resolved:
+    if not resolved and not _stage_b_bound:
         # too pricey for the default slice -> offer it at full (buffer+premium-capped) size so you can opt in
         resolved, why = await _resolve(ib, idea, deployable, net_liq=pot.net_liq)
         over_default = resolved is not None
+    if resolved is not None and _credit:
+        _ok_credit, _why_credit = credit_structure_ok(idea)
+        if not _ok_credit:
+            _daily_cap_rejected("credit_structure", _why_credit, idea, resolved)
+            return None
+        _capacity = collateral_capacity(
+            required=required_collateral(resolved.strike, resolved.qty),
+            deployed=_deployed_credit, net_liq=pot.net_liq,
+            available_funds=pot.available_funds)
+        if not _capacity.allowed:
+            _daily_cap_rejected("collateral", _capacity.reasons, idea, resolved)
+            return None
     # RISK SCREEN (mirrors the trader loop): block genuinely oversized orders. This account is
     # long-debit-only (long calls/puts + debit spreads), so the real capital at risk is the NET
     # DEBIT (max loss = limit*100*qty), NOT the strike notional. The old screen measured strike
@@ -615,7 +797,7 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
     # cheap defined-risk debit spread (e.g. ORCL 162.5/160P @ $1.25 = $125 risk read as ~$32k).
     # Cap the actual max loss at 30x NetLiq; available-funds already bounds it to the pot.
     if resolved is not None and pot.net_liq:
-        _eg = resolved.limit * 100 * resolved.qty  # max loss / net debit = capital at risk
+        _eg = capital_at_risk(resolved)
         if _eg > 0.95 * 30 * pot.net_liq:
             audit(audit_path, "daily_rec_gross_rejected", underlying=idea.underlying,
                   order=order_summary(resolved), est_gross=round(_eg), cap=round(30 * pot.net_liq))
@@ -627,7 +809,7 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
             return None
     # BUDGET GATES (2026-07-01 gate A4): deployed premium <=40% of net-liq and theta decay
     # <=1%/day per trade / <=4%/day portfolio, valued against the live open book.
-    if resolved is not None and pot.net_liq:
+    if resolved is not None and pot.net_liq and not _credit:
         _debit = resolved.limit * 100 * resolved.qty
         ok_b, why_b = construction.check_budget(_debit, resolved.dte, pot.net_liq,
                                                 await _open_book(), CONS)
@@ -645,7 +827,7 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
     # via yfinance) lands within the holding horizon (on/before expiry + cushion). FAIL-OPEN
     # on unknown earnings: never hard-block, but flag it 'unchecked' below (not silent-clear).
     _earn_unchecked = False
-    if resolved is not None:
+    if resolved is not None and not _credit:
         _entry = datetime.now(timezone.utc).date()
         try:
             _edays = research.days_to_earnings(idea.underlying)
@@ -718,7 +900,7 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
         # A6: no ex-div date available for a spread -- assignment risk could NOT be checked.
         head += "_:grey_question: ex-dividend date unknown — early-assignment risk UNCHECKED_\n"
     # CONCENTRATION / CORRELATION WARNING (2026-07-03 gate H2, SURFACE-ONLY): the daily slate is
-    # the operator's PRIMARY entry path but never called risk.evaluate_trade, so the sector/correlation
+    # Trevor's PRIMARY entry path but never called risk.evaluate_trade, so the sector/correlation
     # cap (risk.py #6b) and single-name-agg cap (#6) never ran where trades originate. SURFACE (do
     # NOT hard-block) if ADDING this trade would breach either -- the human tap still decides,
     # mirroring the earnings-unchecked / ex-div-warn disposition above. FAIL-SAFE: any error logs
@@ -726,28 +908,38 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
     try:
         _cnotes = _concentration_notes(
             await _open_positions_for_risk(), idea.underlying,
-            resolved.limit * 100 * resolved.qty,   # max loss = capital at risk (same $ basis as risk.py)
+            capital_committed(resolved),
             idea.is_index, risk.effective_pot(pot.net_liq, _RISK_LIMITS.pot_cap_usd), _RISK_LIMITS)
         for _txt, _akw in _cnotes:
             head += f"_{_txt}_\n"
             audit(audit_path, "concentration_warning", order=order_summary(resolved), **_akw)
     except Exception as _ce:
         print(f"[WARN] concentration check failed for {getattr(idea, 'underlying', '?')} (continuing): {_ce}")
-    cost = resolved.limit * 100 * resolved.qty
-    # TP/SL CLAMP (2026-07-01 gate A2): +75-100% targets were touched 0/9 times while +20-35%
-    # MFE was reached by 4/8 -- clamp any model TP into the 25-35 band (default +30%); the
-    # stop defaults -30% (was -50%) and a model stop may only be TIGHTER.
-    # POT-TIERED TP CEILING (2026-07-03): scale ONLY the runner ceiling + default target with the
-    # LIVE pot; the model's TP still clamps into [tp_min, tp_max]. A per-call cons copy so the shared
-    # CONS singleton is never mutated. Stop (sl_pct) and tp_min are untouched. Empty tiers => no-op.
-    _tp_max, _tp_def = construction.tp_tier_for_pot(
-        pot.net_liq, CAPS_TP_TIERS, CONS.tp_max_pct, CONS.tp_pct)
-    _cons_tp = replace(CONS, tp_max_pct=_tp_max, tp_pct=_tp_def)
-    tp_pct, sl_pct = construction.clamp_tp_sl(idea.profit_target_pct, idea.stop_pct, _cons_tp)
-    tp_price = resolved.limit * (1 + tp_pct / 100.0)
-    sl_price = resolved.limit * (1 - sl_pct / 100.0)
+    cost = capital_committed(resolved)
+    # SELL LEVELS (2026-07-26, Sol audit R5 R2 / RULING_TAKE_PROFIT.md).
+    # The stop is clamped exactly as before: default -30%, a model stop may only be TIGHTER.
+    # The take-profit is now OPTIONAL and is normally None. The pot-tier ceiling that used to be
+    # applied here (construction.tp_tier_for_pot on the LIVE pot, then a per-call cons copy) is
+    # GONE -- at ~$1,893 it stamped +20% on every order. `tp_pct` may be None from here on; every
+    # consumer below must handle that. A refused take-profit is surfaced, never silently rewritten.
+    if _credit:
+        tp_pct, sl_pct, tp_price, sl_price = None, 0.0, None, None
+    else:
+        tp_pct, sl_pct = construction.clamp_tp_sl(
+            idea.profit_target_pct, idea.stop_pct, CONS)
+        _tp_note = construction.optional_take_profit_pct(idea.profit_target_pct)[1]
+        if _tp_note:
+            print(f"[TP] {idea.underlying}: {_tp_note}")
+            audit(audit_path, "take_profit_refused", underlying=idea.underlying,
+                  requested_profit_target_pct=idea.profit_target_pct, reason=_tp_note)
+        tp_price = (resolved.limit * (1 + tp_pct / 100.0)) if tp_pct is not None else None
+        sl_price = resolved.limit * (1 - sl_pct / 100.0)
     pct_pot = (cost / pot.net_liq * 100) if pot.net_liq else 0.0
-    if over_default:
+    if _credit:
+        size_line = (f"Collateral ~${cost:,.0f} (*{pct_pot:.0f}% of pot*); executable credit "
+                     f"~${resolved.net_credit_usd:,.0f}; max loss if assigned stock goes to zero "
+                     f"~${resolved.credit_max_loss_usd:,.0f}.")
+    elif over_default:
         size_line = (f":warning: ~${cost:,.0f} = *{pct_pot:.0f}% of pot* — ABOVE your {default_pct:.0%} "
                      f"default (1 contract is the smallest size). Tap :white_check_mark: only if you want this size.")
     else:
@@ -757,13 +949,24 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
     resolved.decision_id = decision_id
     resolved.decision_revision = 0
     resolved.model_identity = model_identity
-    msg = (head + f"*Order:* `{order_summary(resolved)}`\n"
-           f"{size_line} Max loss = the debit.\n"
-           f"*Sell levels (auto):* take profit ~${tp_price:.2f} (+{tp_pct:.0f}%) | "
-           f"stop ~${sl_price:.2f} (-{sl_pct:.0f}%)\n"
-           f":point_down: *Tap :white_check_mark: to BUY*, or REPLY to tweak: `full size`, levels (`tp 60 stop 30`), "
-           f"direction (`flip` / `make it bearish`), or `just the call` / `make it a spread`. :x: to skip.\n"
-           f"_Decision ID: `{decision_id}` — approval expires in 5 minutes._")
+    resolved.intended_hold_days = getattr(idea, "intended_hold_days", None)
+    resolved.thesis = str(getattr(idea, "thesis", "") or "")
+    if _stage_b_bound:
+        action_word = "SELL the cash-secured put" if _credit else "BUY"
+        msg = (head + f"*Order:* `{order_summary(resolved)}`\n"
+               f"{size_line}\n"
+               f":point_down: *Tap :white_check_mark: to {action_word}* or :x: to skip. "
+               f"Stage-B contract/structure/size edits are not accepted; a changed quote is "
+               f"shown for reapproval.\n"
+               f"_Decision ID: `{decision_id}` — approval expires in 5 minutes._")
+    else:
+        msg = (head + f"*Order:* `{order_summary(resolved)}`\n"
+               f"{size_line} Max loss = the debit.\n"
+               f"*Sell levels (auto):* {_tp_level_text(tp_pct, tp_price)} | "
+               f"stop ~${sl_price:.2f} (-{sl_pct:.0f}%)\n"
+               f":point_down: *Tap :white_check_mark: to BUY*, or REPLY to tweak: `full size`, levels (`tp 60 stop 30`), "
+               f"direction (`flip` / `make it bearish`), or `just the call` / `make it a spread`. :x: to skip.\n"
+               f"_Decision ID: `{decision_id}` — approval expires in 5 minutes._")
     ts = approval.post_proposal(token, channel, msg)
     if ts:
         pending.append((ts, resolved, tp_pct, sl_pct, idea, over_default,
@@ -782,7 +985,8 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
                 trade_capture.dataset_dir(JOURNAL_PATH), source="daily_slate",
                 symbol=idea.underlying, right=resolved.right, strike=resolved.strike,
                 expiry=resolved.expiry,
-                structure=("spread" if resolved.short_contract is not None else "single"),
+                structure=("cash secured put" if is_credit(resolved) else
+                           ("spread" if resolved.short_contract is not None else "single")),
                 con_id=None, chosen_idea=idea, candidates=candidates,
                 raw_strategist=raw_strategist, cot=cot, market_context=market_context, regime=regime,
                 technical_card=technical_card,
@@ -802,9 +1006,14 @@ async def _post_idea(ib, idea, pot, default_pct, token, channel, audit_path, pen
 
 
 async def run(args):
-    global CASH_BUFFER_PCT, CONS, CONN, JOURNAL_PATH, ERROR_CHANNEL, _RISK_LIMITS, CAPS_TP_TIERS
+    global CASH_BUFFER_PCT, CONS, CONN, JOURNAL_PATH, ERROR_CHANNEL, _RISK_LIMITS
     cfg = yaml.safe_load(open(args.config))
-    CAPS_TP_TIERS = (cfg.get("caps") or {}).get("tp_tiers") or []   # 2026-07-03 pot-tiered TP ceiling
+    # caps.tp_tiers is NOT read any more (2026-07-26, Sol audit R5 R2). If a tier table is ever
+    # re-added to config.yaml it is inert on this path -- refuse it loudly rather than let it look
+    # like it is doing something.
+    if (cfg.get("caps") or {}).get("tp_tiers"):
+        print("[WARN] config.yaml caps.tp_tiers is present but IGNORED — mechanical pot-tiered "
+              "take-profit was removed by Sol audit R5 R2 / RULING_TAKE_PROFIT.md. Delete it.")
     ibc, tr = cfg.get("ib", {}), cfg.get("trading", {})
     CASH_BUFFER_PCT = float(tr.get("cash_buffer_pct", 0.05))  # keep this % of NetLiq liquid
     CONS = construction_from_dict(cfg.get("construction"))    # 2026-07-01 constructor-rework gates
@@ -865,9 +1074,63 @@ async def run(args):
             # one raises ValueError instead of being proposed under a false name.
             _ud_idea = user_directed_idea(args)
             direction, structure = _ud_idea.direction, _ud_idea.structure
+
+            # MODEL THESIS ON A USER-DIRECTED NAME (2026-08-12).
+            # This route used to journal the CLI default string ("User-directed proposal.") as the
+            # thesis, discarding the reasoning the model actually had for the name. That matters
+            # twice: the brief now reads the entry thesis back to the strategist when it weighs the
+            # open book, so it was being handed a placeholder instead of its own reasoning; and a
+            # thesis is what you judge "is this still working?" against later.
+            #
+            # Trevor still directs WHAT to trade -- ticker, structure, DTE, delta are untouched.
+            # We only ask the model for its VIEW of the name, and record it honestly. A decline is
+            # surfaced rather than hidden: "the model would not endorse this name" is information
+            # you want BEFORE tapping, not a placeholder afterwards. Fail-soft: any error keeps the
+            # user's thesis and the trade proceeds exactly as before.
+            _ud_model_note = None
+            if not getattr(args, "no_model_thesis", False):
+                try:
+                    # Reuse the trader's most recent FULL research brief (written every 20 min
+                    # to audit.jsonl with price structure, VIX, events, headlines and the book).
+                    # Rebuilding one here would duplicate the whole research plumbing for a single
+                    # name; a <=20-minute-old brief is the same evidence the slate reasons from.
+                    _bfile, _brief_txt = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                      "audit.jsonl"), None
+                    with open(_bfile) as _bf:
+                        for _bl in _bf:
+                            try:
+                                _be = json.loads(_bl)
+                            except Exception:
+                                continue
+                            if _be.get("event") == "strategist_brief" and _be.get("brief"):
+                                _brief_txt = _be["brief"]
+                    if not _brief_txt:
+                        raise RuntimeError("no research brief available yet")
+                    # 2026-08-13: vLLM defaults thinking OFF, and without it the model
+                    # answers in ~7 tokens with an empty trade list.
+                    _mv = propose_intents(
+                        tr.get("llm_endpoint"), tr.get("llm_model"), _brief_txt,
+                        ticker=args.ticker.upper(), timeout=300,
+                        thinking="enabled")
+                    if _mv:
+                        _mi = _mv[0]
+                        _ud_idea.thesis = _mi.thesis or _ud_idea.thesis
+                        _ud_idea.conviction = int(_mi.conviction)
+                        if getattr(_mi, "intended_hold_days", None):
+                            _ud_idea.intended_hold_days = int(_mi.intended_hold_days)
+                        _ud_model_note = "model endorses (conviction %d)" % _mi.conviction
+                    else:
+                        _ud_idea.thesis = ("USER-DIRECTED. The model DECLINED to endorse %s on "
+                                           "today's evidence; this trade is Trevor's call, not "
+                                           "the model's. Original note: %s"
+                                           % (args.ticker.upper(), args.thesis))
+                        _ud_model_note = "model DECLINED to endorse this name"
+                except Exception as _mte:
+                    _ud_model_note = "model view unavailable (%s)" % str(_mte)[:80]
             ideas = [_ud_idea]
             audit(audit_path, "user_directed_proposal", underlying=args.ticker.upper(),
-                  direction=direction, structure=structure, dte=args.dte, delta=args.delta)
+                  direction=direction, structure=structure, dte=args.dte, delta=args.delta,
+                  model_view=_ud_model_note, thesis=_ud_idea.thesis[:300])
         else:
             _all = sorted({"SPY", "QQQ", "IWM"} | {n.upper() for n in tr.get("approved_names", [])})
             _core = ["SPY", "QQQ", "IWM"]; _watch = [n for n in _all if n not in _core]
@@ -884,6 +1147,49 @@ async def run(args):
             _ape_rows = _ape_quoted_rows[:_ape_limit]
             names = apewisdom.merge_research_universe(_base_names, _ape_rows)
             _ape_names = {r["ticker"] for r in _ape_rows}
+
+            # AFFORDABILITY SCREEN (2026-08-14). Drop names whose cheapest plausible debit
+            # spread cannot fit the per-trade cap, so a $1,600 underlying never consumes a
+            # proposal slot. Fails OPEN: if the account cannot be read we keep every name
+            # rather than guess a ceiling and silently starve discovery.
+            _afford_dropped = []
+            try:
+                _screen_pot = await get_pot_snapshot(ib)
+                _screen_cap = construction.max_premium_budget(
+                    getattr(_screen_pot, "net_liq", 0.0), CONS)
+            except Exception as _se:
+                _screen_cap = 0.0
+                print(f"[WARN] affordability screen skipped (account unreadable: {_se})")
+            if _screen_cap and _screen_cap > 0:
+                _CORE = {"SPY", "QQQ", "IWM"}
+                _kept = []
+                for _n in names:
+                    if _n in _CORE:
+                        _kept.append(_n)
+                        continue
+                    _last = (quotes.get(_n) or {}).get("last")
+                    try:
+                        _spot = float(_last)
+                    except (TypeError, ValueError):
+                        _kept.append(_n)          # unknown price -> let construction decide
+                        continue
+                    # 2% of notional ~= the cheap end of a real 0.60-delta spread
+                    if _spot > 0 and (_spot * 100.0 * 0.02) > _screen_cap:
+                        _afford_dropped.append((_n, round(_spot, 2)))
+                    else:
+                        _kept.append(_n)
+                if _afford_dropped:
+                    print("[SCREEN] affordability dropped %d name(s) over the $%.0f per-trade "
+                          "cap: %s" % (len(_afford_dropped), _screen_cap,
+                                       ", ".join("%s@$%.0f" % (t, p)
+                                                 for t, p in _afford_dropped)))
+                    audit(audit_path, "affordability_screen",
+                          per_trade_cap=round(_screen_cap, 2),
+                          dropped=[{"ticker": t, "spot": p} for t, p in _afford_dropped],
+                          kept=len(_kept))
+                names = _kept
+                _ape_names = {t for t in _ape_names if t in set(_kept)}
+            _afford_screen = True
             if _ape_feed is not None:
                 audit(audit_path, "apewisdom_research_universe",
                       candidates=sorted(_ape_names), count=len(_ape_names),
@@ -898,9 +1204,21 @@ async def run(args):
             except Exception as _book_error:
                 print(f"[WARN] slate book fetch failed (brief shows no positions): {_book_error}")
                 _slate_book = None
+            _brief_pot = await get_pot_snapshot(ib)
+            _brief_account = entry_safety.account_snapshot_valid(_brief_pot)
+            if not _brief_account.allowed:
+                reason = "; ".join(_brief_account.reasons)
+                audit(audit_path, "strategist_skipped", reason="account_snapshot_invalid: " + reason)
+                approval.post_proposal(
+                    token, channel,
+                    ":warning: *Daily slate skipped* — live account sizing data is invalid or "
+                    f"unavailable ({reason}). No model trade was requested.")
+                return 1
             brief = research.build_brief(
                 today=today, quotes=quotes, universe=names,
-                allow_any_name=True, book=_slate_book, **data)
+                allow_any_name=True, book=_slate_book,
+                net_liq=_brief_pot.net_liq,
+                available_funds=_brief_pot.available_funds, **data)
             _slate_price_stats = data.get("price_stats")  # the technical card fed to the model this slate
 
             # Morning discovery: scout NEW watchlist candidates worth researching (not trades to place).
@@ -950,19 +1268,27 @@ async def run(args):
                       apewisdom_candidates=[t for t, _ in ape_cands])
 
             try:
-                _res = propose(tr.get("llm_endpoint"), tr.get("llm_model"), brief,
-                               timeout=400, recommend=True, return_cot=True,
-                               return_identity=True)
-                # robust to all shapes: (ideas, raw, cot) 3-tuple, (ideas, raw) 2-tuple, or a
-                # bare list (older/mocked propose). cot is optional/None-safe.
+                _res = propose_intents(
+                    tr.get("llm_endpoint"), tr.get("llm_model"), brief,
+                    timeout=400, recommend=True, return_cot=True,
+                    return_identity=True,
+                    # 2026-08-13: THE fix for "DeepSeek recommends no trades". vLLM launches with
+                    # thinking OFF by default, so this call was returning {"trades": []} in ~7
+                    # tokens -- logged as strategist_error "empty model output" -- rather than
+                    # reasoning about the brief. SLATE_THINKING=disabled still overrides this.
+                    thinking="enabled")
+                # Stage A returns intent only. The shared IBKR builder and Stage B selection
+                # below are the same ones used by continuous Trader and add-name.
                 if isinstance(_res, tuple) and len(_res) == 4:
-                    ideas, _raw_slate, _slate_cot, _slate_identity = _res
+                    intents, _raw_slate, _slate_cot, _slate_identity = _res
                 elif isinstance(_res, tuple) and len(_res) == 3:
-                    ideas, _raw_slate, _slate_cot = _res
+                    intents, _raw_slate, _slate_cot = _res
                 elif isinstance(_res, tuple) and len(_res) == 2:
-                    ideas, _raw_slate = _res
+                    intents, _raw_slate = _res
                 else:
-                    ideas = _res
+                    intents = _res
+                ideas = await _materialize_stage_b(
+                    ib, intents, _brief_pot, tr, audit_path)
             except Exception as e:
                 audit(audit_path, "propose_error", error=str(e))
                 approval.post_proposal(token, channel,
@@ -980,7 +1306,7 @@ async def run(args):
             _slate_gen.__exit__(None, None, None)  # generation burst done -> release the soft-mutex
             if not ideas:
                 approval.post_proposal(token, channel,
-                    ":calendar: *Daily slate* — MiniMax has no tradeable idea today (genuinely nothing it would recommend).")
+                    ":calendar: *Daily slate* — no tradeable idea today (genuinely nothing the strategist would recommend).")
                 # RECORD-ONLY (v2): learn from the pass -- capture the NO_TRADE with the raw model
                 # output + the brief that fed it. Never raises into the slate path.
                 try:
@@ -1087,6 +1413,11 @@ async def run(args):
                             _one_brief = brief
                             _one_price_stats = _slate_price_stats
                             try:
+                                _one_pot = await get_pot_snapshot(ib)
+                                _one_account = entry_safety.account_snapshot_valid(_one_pot)
+                                if not _one_account.allowed:
+                                    raise RuntimeError(
+                                        "account snapshot invalid: " + "; ".join(_one_account.reasons))
                                 if tk in _ape_addable:
                                     # The social feed only nominated the ticker. Rebuild a fresh,
                                     # independent market brief before same-day trade consideration;
@@ -1101,22 +1432,35 @@ async def run(args):
                                     _one_brief = research.build_brief(
                                         today=str(datetime.now(timezone.utc).date()),
                                         quotes=_one_quotes, universe=_one_names,
-                                        allow_any_name=False, book=_one_book, **_one_data)
+                                        allow_any_name=False, book=_one_book,
+                                        net_liq=_one_pot.net_liq,
+                                        available_funds=_one_pot.available_funds,
+                                        **_one_data)
                                     _one_price_stats = _one_data.get("price_stats")
-                                with slate_active_guard():
-                                    _one = propose_one(tr.get("llm_endpoint"), tr.get("llm_model"), _one_brief, tk,
-                                                       timeout=400, return_cot=True,
-                                                       return_identity=True)
-                                # robust to all shapes: (idea, raw, cot) 3-tuple, (idea, raw) 2-tuple,
-                                # or a bare TradeIdea|None (older/mocked). cot is optional/None-safe.
-                                if isinstance(_one, tuple) and len(_one) == 4:
-                                    idea, _one_raw, _one_cot, _one_identity = _one
-                                elif isinstance(_one, tuple) and len(_one) == 3:
-                                    idea, _one_raw, _one_cot = _one
-                                elif isinstance(_one, tuple) and len(_one) == 2:
-                                    idea, _one_raw = _one
                                 else:
-                                    idea = _one
+                                    _one_brief = research.with_account_sizing_snapshot(
+                                        _one_brief, net_liq=_one_pot.net_liq,
+                                        available_funds=_one_pot.available_funds)
+                                with slate_active_guard():
+                                    _one = propose_intents(
+                                        tr.get("llm_endpoint"), tr.get("llm_model"),
+                                        _one_brief, ticker=tk, timeout=400,
+                                        return_cot=True, return_identity=True,
+                                        # PER TICKER: this loop pays ~3-7 min per name. Enabled
+                                        # anyway -- a 7-token empty answer is useless, not cheap.
+                                        thinking="enabled")
+                                if isinstance(_one, tuple) and len(_one) == 4:
+                                    _one_intents, _one_raw, _one_cot, _one_identity = _one
+                                elif isinstance(_one, tuple) and len(_one) == 3:
+                                    _one_intents, _one_raw, _one_cot = _one
+                                elif isinstance(_one, tuple) and len(_one) == 2:
+                                    _one_intents, _one_raw = _one
+                                else:
+                                    _one_intents = _one
+                                with slate_active_guard():
+                                    _one_ideas = await _materialize_stage_b(
+                                        ib, _one_intents, _one_pot, tr, audit_path)
+                                idea = _one_ideas[0] if _one_ideas else None
                             except Exception as e:
                                 audit(audit_path, "add_suggest_error", ticker=tk, error=str(e))
                                 continue
@@ -1171,6 +1515,18 @@ async def run(args):
                             or approval.decision_from_replies(replies, approver_ids, ts) == "approve")
                 if not approved:
                     continue
+                _stage_b_pending = getattr(idea, "_stage_b_binding", None) is not None
+                if _stage_b_pending and (ovr or full_size or qty_ovr or ov_tp or ov_sl):
+                    approval.post_proposal(
+                        token, channel,
+                        f":no_entry: *{r.underlying}* Stage-B terms were edited; nothing placed. "
+                        "Generate a fresh intent/candidate decision instead.")
+                    audit(audit_path, "stage_b_override_refused", underlying=r.underlying,
+                          decision_id=decision_id, structure_override=ovr,
+                          quantity_override=qty_ovr, full_size=full_size,
+                          tp_pct=ov_tp, sl_pct=ov_sl)
+                    done.add(ts)
+                    continue
                 _age = entry_safety.approval_expired(posted_at)
                 if not _age.allowed:
                     approval.post_proposal(token, channel,
@@ -1187,7 +1543,10 @@ async def run(args):
                 # BYPASS 3: the override is applied by apply_structure_override(), which runs
                 # the allow-list on the RESULT and relabels a structure the human's own direction
                 # override has just made stale (audited + shown, never silent).
-                effective_idea, _ovr_error, _ovr_note = apply_structure_override(idea, ovr)
+                if _stage_b_pending:
+                    effective_idea, _ovr_error, _ovr_note = idea, "", ""
+                else:
+                    effective_idea, _ovr_error, _ovr_note = apply_structure_override(idea, ovr)
                 nd, ns = effective_idea.direction, effective_idea.structure
                 if _ovr_error:
                     approval.post_proposal(token, channel,
@@ -1226,11 +1585,21 @@ async def run(args):
                     continue
 
                 _dep = deployable_funds(snap)
-                _mp = construction.max_premium_budget(snap.net_liq, CONS)
-                if _mp > 0:
-                    _dep = min(_dep, _mp)
-                avail = (_dep if (full_size or over_default)
-                         else min(_dep, default_pct * snap.net_liq))
+                if is_credit(effective_idea):
+                    _deployed_now = await broker_deployed_csp_collateral(ib, audit_path)
+                    if _deployed_now is None:
+                        audit(audit_path, "deployed_collateral_unverifiable",
+                              decision_id=decision_id)
+                        done.add(ts)
+                        continue
+                    _dep = min(_dep, max(0.0, 0.80 * snap.net_liq - _deployed_now))
+                    avail = _dep
+                else:
+                    _mp = construction.max_premium_budget(snap.net_liq, CONS)
+                    if _mp > 0:
+                        _dep = min(_dep, _mp)
+                    avail = (_dep if (_stage_b_pending or full_size or over_default)
+                             else min(_dep, default_pct * snap.net_liq))
                 try:
                     fresh_r, why2 = await _resolve(
                         ib, effective_idea, avail, net_liq=snap.net_liq)
@@ -1290,7 +1659,40 @@ async def run(args):
                         fresh_r.decision_id = decision_id
                         fresh_r.decision_revision = revision
                         fresh_r.model_identity = getattr(r, "model_identity", None)
-                eff_tp = max(20.0, min(500.0, ov_tp)) if ov_tp else tp_pct
+                # TAKE-PROFIT OVERRIDE (`tp 300` in the approval reply).
+                #
+                # 2026-07-26, TREVOR'S RULING: the 100-500% band applies to THE MODEL ONLY, not to
+                # him. Sol R5 R2's band exists to stop the CODE from manufacturing a target -- his
+                # ruling was "+20% is doctrine, not a clamp", and the thing being abolished is
+                # MECHANICAL installation, not human judgment. A human typing `tp 60` at the
+                # approval seam has just looked at the trade and decided; that is the judgment the
+                # doctrine defers to, not the mechanism it removes. Refusing it would have made the
+                # operator less able to act on his own book than the model is.
+                #
+                # So: honour any human-typed level, but make it LOUD and audited -- it is a
+                # deliberate departure from "winners run", and it must never be mistakable for the
+                # old automatic stamp. Sanity bounds only (>0, <=1000%); absurd input still refused.
+                if ov_tp:
+                    if ov_tp > 0 and ov_tp <= 1000.0:
+                        eff_tp = float(ov_tp)
+                        _band_note = construction.optional_take_profit_pct(ov_tp)[1]
+                        _outside = f" (outside the model's {_band_note})" if _band_note else ""
+                        approval.post_proposal(token, channel,
+                            f":pushpin: take-profit set to `{ov_tp:g}%` by human override{_outside}"
+                            f" — this trade will NOT run free.")
+                        audit(audit_path, "take_profit_override_accepted_human",
+                              underlying=fresh_r.underlying, profit_target_pct=eff_tp,
+                              outside_model_band=bool(_band_note), decision_id=decision_id)
+                    else:
+                        approval.post_proposal(token, channel,
+                            f":no_entry_sign: take-profit override `{ov_tp:g}` refused — "
+                            f"outside sanity bounds (0 < tp <= 1000).")
+                        audit(audit_path, "take_profit_override_refused",
+                              underlying=fresh_r.underlying, requested_profit_target_pct=ov_tp,
+                              reason="outside sanity bounds", decision_id=decision_id)
+                        eff_tp = tp_pct
+                else:
+                    eff_tp = tp_pct
                 # M4 (2026-07-09): a manual SL override may only TIGHTEN the stop (smaller max-loss
                 # %), never LOOSEN it past the 30% default. Ceiling 30 (was 90); floor 10.
                 eff_sl = max(10.0, min(30.0, ov_sl)) if ov_sl else sl_pct
@@ -1305,38 +1707,48 @@ async def run(args):
                         _block_reasons.extend(_baseline.reasons)
                     _nbbo = entry_safety.nbbo_valid(fresh_r)
                     _block_reasons.extend(_nbbo.reasons)
-                    _cost = entry_safety.executable_price(fresh_r) * fresh_r.qty * 100
+                    _credit_fresh = is_credit(fresh_r)
+                    _cost = capital_committed(fresh_r)
                     _gate = risk.evaluate_trade(
                         risk.ProposedTrade(
                             underlying=fresh_r.underlying, notional=_cost,
                             is_index=bool(effective_idea.is_index),
                             conviction=int(getattr(effective_idea, "conviction", 1)),
-                            is_long=(fresh_r.right == "C"),
-                            profit_target_pct=eff_tp, stop_pct=eff_sl),
+                            is_long=(False if _credit_fresh else fresh_r.right == "C"),
+                            profit_target_pct=(0.0 if _credit_fresh else eff_tp),
+                            stop_pct=(0.0 if _credit_fresh else eff_sl)),
                         net_liq=snap.net_liq, available_funds=snap.available_funds,
                         open_positions=_risk_positions,
                         pot_day_start=(_baseline if not isinstance(_baseline, entry_safety.SafetyResult)
                                        else 0.0),
                         approved_names={str(n).upper() for n in tr.get("approved_names", [])},
-                        limits=_RISK_LIMITS)
+                        limits=(_credit_limits(_RISK_LIMITS) if _credit_fresh else _RISK_LIMITS))
                     if not _gate.approved:
                         _block_reasons.extend(_gate.reasons)
-                    okf, whyf = construction.check_budget(
-                        _cost, fresh_r.dte, snap.net_liq,
-                        construction.open_book(_positions, JOURNAL_PATH), CONS)
-                    if not okf:
-                        _block_reasons.extend(whyf)
-                    _edays_final = await asyncio.to_thread(
-                        research.days_to_earnings, fresh_r.underlying)
-                    if _edays_final is None:
-                        _block_reasons.append("earnings date unavailable at approval time")
+                    if _credit_fresh:
+                        _deployed_final = await broker_deployed_csp_collateral(ib, audit_path)
+                        _collateral_final = collateral_capacity(
+                            required=required_collateral(fresh_r.strike, fresh_r.qty),
+                            deployed=_deployed_final, net_liq=snap.net_liq,
+                            available_funds=snap.available_funds)
+                        _block_reasons.extend(_collateral_final.reasons)
                     else:
-                        _entry_final = datetime.now(timezone.utc).date()
-                        _earn_final = _entry_final + timedelta(days=_edays_final)
-                        _earn_ok, _earn_why = construction.earnings_ok(
-                            _entry_final, fresh_r.expiry, _earn_final, CONS)
-                        if not _earn_ok:
-                            _block_reasons.append(_earn_why)
+                        okf, whyf = construction.check_budget(
+                            _cost, fresh_r.dte, snap.net_liq,
+                            construction.open_book(_positions, JOURNAL_PATH), CONS)
+                        if not okf:
+                            _block_reasons.extend(whyf)
+                        _edays_final = await asyncio.to_thread(
+                            research.days_to_earnings, fresh_r.underlying)
+                        if _edays_final is None:
+                            _block_reasons.append("earnings date unavailable at approval time")
+                        else:
+                            _entry_final = datetime.now(timezone.utc).date()
+                            _earn_final = _entry_final + timedelta(days=_edays_final)
+                            _earn_ok, _earn_why = construction.earnings_ok(
+                                _entry_final, fresh_r.expiry, _earn_final, CONS)
+                            if not _earn_ok:
+                                _block_reasons.append(_earn_why)
                 except Exception as _be:
                     _block_reasons.append(f"final risk/NBBO/earnings gate failed: {_be}")
                 if _block_reasons:
@@ -1365,26 +1777,37 @@ async def run(args):
                     _latest_nbbo = entry_safety.nbbo_valid(_latest_r)
                     if not _latest_nbbo.allowed:
                         raise RuntimeError("; ".join(_latest_nbbo.reasons))
-                    _latest_cost = entry_safety.executable_price(_latest_r) * 100 * _latest_r.qty
+                    _latest_credit = is_credit(_latest_r)
+                    _latest_cost = capital_committed(_latest_r)
                     _latest_gate = risk.evaluate_trade(
                         risk.ProposedTrade(
                             underlying=_latest_r.underlying, notional=_latest_cost,
                             is_index=bool(effective_idea.is_index),
                             conviction=int(getattr(effective_idea, "conviction", 1)),
-                            is_long=(_latest_r.right == "C"),
-                            profit_target_pct=eff_tp, stop_pct=eff_sl),
+                            is_long=(False if _latest_credit else _latest_r.right == "C"),
+                            profit_target_pct=(0.0 if _latest_credit else eff_tp),
+                            stop_pct=(0.0 if _latest_credit else eff_sl)),
                         net_liq=snap.net_liq, available_funds=snap.available_funds,
                         open_positions=_risk_positions,
                         pot_day_start=_baseline,
                         approved_names={str(n).upper() for n in tr.get("approved_names", [])},
-                        limits=_RISK_LIMITS)
+                        limits=(_credit_limits(_RISK_LIMITS) if _latest_credit else _RISK_LIMITS))
                     if not _latest_gate.approved:
                         raise RuntimeError("; ".join(_latest_gate.reasons))
-                    _latest_budget, _latest_budget_reasons = construction.check_budget(
-                        _latest_cost, _latest_r.dte, snap.net_liq,
-                        construction.open_book(_positions, JOURNAL_PATH), CONS)
-                    if not _latest_budget:
-                        raise RuntimeError("; ".join(_latest_budget_reasons))
+                    if _latest_credit:
+                        _latest_deployed = await broker_deployed_csp_collateral(ib, audit_path)
+                        _latest_capacity = collateral_capacity(
+                            required=required_collateral(_latest_r.strike, _latest_r.qty),
+                            deployed=_latest_deployed, net_liq=snap.net_liq,
+                            available_funds=snap.available_funds)
+                        if not _latest_capacity.allowed:
+                            raise RuntimeError("; ".join(_latest_capacity.reasons))
+                    else:
+                        _latest_budget, _latest_budget_reasons = construction.check_budget(
+                            _latest_cost, _latest_r.dte, snap.net_liq,
+                            construction.open_book(_positions, JOURNAL_PATH), CONS)
+                        if not _latest_budget:
+                            raise RuntimeError("; ".join(_latest_budget_reasons))
                     fresh_r = _latest_r
                 except Exception as _latest_error:
                     approval.post_proposal(token, channel,
@@ -1394,7 +1817,9 @@ async def run(args):
                     done.add(ts)
                     continue
 
-                _changes = list(entry_safety.material_changes(r, fresh_r))
+                _changes = list(
+                    credit_material_changes(r, fresh_r) if is_credit(r)
+                    else entry_safety.material_changes(r, fresh_r))
                 if revision == 0 and (ovr or full_size or qty_ovr or ov_tp or ov_sl):
                     _changes.append("human override changed approved terms")
                 if _changes:
@@ -1406,9 +1831,13 @@ async def run(args):
                               underlying=fresh_r.underlying, changes=_changes)
                         done.add(ts)
                         continue
+                    _exec_label = ("Executable SELL credit" if is_credit(fresh_r)
+                                   else "Executable BUY limit")
+                    _exec_price = (credit_executable_price(fresh_r) if is_credit(fresh_r)
+                                   else entry_safety.executable_price(fresh_r))
                     _remsg = (f":repeat: *Reapproval required — {fresh_r.underlying}*\n"
                               f"Refreshed order: `{order_summary(fresh_r)}`\n"
-                              f"Executable BUY limit: *${entry_safety.executable_price(fresh_r):.2f}*\n"
+                              f"{_exec_label}: *${_exec_price:.2f}*\n"
                               f"Changed: {'; '.join(_changes)}\n"
                               f":point_down: Tap :white_check_mark: again within 5 minutes to approve these exact terms.\n"
                               f"_Decision ID: `{decision_id}`, revision {revision + 1}_")
@@ -1455,12 +1884,22 @@ async def run(args):
                           reason=_why_submit)
                     done.add(ts)
                     continue
-                _lmt = entry_safety.executable_price(r)
+                if is_credit(r):
+                    if (str(r.right).upper()[:1] != "P" or r.short_contract is not None
+                            or str(r.structure).strip().lower() != "cash secured put"):
+                        audit(audit_path, "credit_structure_blocked_submit",
+                              decision_id=decision_id, underlying=r.underlying)
+                        done.add(ts)
+                        continue
+                    _lmt = credit_executable_price(r)
+                else:
+                    _lmt = entry_safety.executable_price(r)
                 try:
                     trade_capture.capture_decision(
                         trade_capture.dataset_dir(JOURNAL_PATH), source="daily_slate",
                         symbol=r.underlying, right=r.right, strike=r.strike, expiry=r.expiry,
-                        structure=("spread" if r.short_contract is not None else "single"),
+                        structure=("cash secured put" if is_credit(r) else
+                                   ("spread" if r.short_contract is not None else "single")),
                         con_id=getattr(r.contract, "conId", None), chosen_idea=effective_idea,
                         candidates=(capture_candidates or [effective_idea]),
                         raw_strategist=capture_raw, cot=capture_cot,
@@ -1475,21 +1914,70 @@ async def run(args):
                                       "tp_pct": eff_tp, "sl_pct": eff_sl})
                 except Exception as _capture_error:
                     print(f"[WARN] final decision capture failed (continuing): {_capture_error}")
-                order = Order(action="BUY", orderType="LMT", lmtPrice=_lmt,
+                order = Order(action=("SELL" if is_credit(r) else "BUY"),
+                              orderType="LMT", lmtPrice=_lmt,
                               totalQuantity=r.qty, tif="DAY")
                 order.orderRef = entry_safety.decision_order_ref(decision_id)
-                if r.short_contract is not None:
-                    combo = conn.create_combo_contract(
-                        r.underlying, [(r.contract.conId, "BUY"), (r.short_contract.conId, "SELL")])
-                    from exitmgr.order_lock import order_mutation_lock
+                _credit_reservation = None
+                if is_credit(r):
+                    _credit_reservation, _reservation_pot, _reservation_broker = \
+                        await reserve_credit_entry(
+                            ib, r, order.orderRef, ledger=DAILY_ENTRY_RESERVATIONS,
+                            audit_path=audit_path)
+                    if not _credit_reservation.allowed or not _credit_reservation.should_place:
+                        audit(audit_path, "credit_collateral_blocked_submit",
+                              decision_id=decision_id,
+                              status=_credit_reservation.status,
+                              reasons=_credit_reservation.reasons)
+                        done.add(ts)
+                        continue
+                _order_contract = (conn.create_combo_contract(
+                    r.underlying, [(r.contract.conId, "BUY"),
+                                   (r.short_contract.conId, "SELL")])
+                    if r.short_contract is not None and not is_credit(r) else r.contract)
+                from exitmgr.order_lock import order_mutation_lock
+                _place_invoked = False
+                _pre_submit_error = None
+                try:
                     with order_mutation_lock():
-                        trade = ib.placeOrder(combo, order)
-                else:
-                    from exitmgr.order_lock import order_mutation_lock
-                    with order_mutation_lock():
-                        trade = ib.placeOrder(r.contract, order)
+                        if _credit_reservation is not None:
+                            _markers_final = entry_safety.entry_markers_clear(
+                                config_path=args.config,
+                                kill_switch_path=(cfg.get("kill_switch") or {}).get("path"))
+                            if not _markers_final.allowed:
+                                _pre_submit_error = (
+                                    "entry markers block submit after reservation: "
+                                    + "; ".join(_markers_final.reasons))
+                            else:
+                                _quote_final = entry_safety.nbbo_valid(r)
+                                if not _quote_final.allowed:
+                                    _pre_submit_error = (
+                                        "fresh NBBO blocks submit after reservation: "
+                                        + "; ".join(_quote_final.reasons))
+                        if _pre_submit_error is None:
+                            # order_mutation_lock is held across this final money-boundary call.
+                            _place_invoked = True
+                            trade = ib.placeOrder(_order_contract, order)
+                except Exception as _place_error:
+                    if _credit_reservation is not None and not _place_invoked:
+                        await asyncio.to_thread(
+                            DAILY_ENTRY_RESERVATIONS.clear, order.orderRef)
+                        audit(audit_path, "credit_entry_reservation_cleared",
+                              order_ref=order.orderRef,
+                              status="definite_pre_submit_failure")
+                    elif _credit_reservation is not None:
+                        audit(audit_path, "credit_place_ambiguous_reservation_retained",
+                              order_ref=order.orderRef, error=str(_place_error))
+                    raise
+                if _pre_submit_error is not None:
+                    await asyncio.to_thread(DAILY_ENTRY_RESERVATIONS.clear, order.orderRef)
+                    audit(audit_path, "credit_entry_reservation_cleared",
+                          order_ref=order.orderRef, status="definite_pre_submit_block",
+                          reason=_pre_submit_error)
+                    done.add(ts)
+                    continue
                 # Wait for IBKR to ACK (live) or REJECT — never assume it landed (Error 201 etc.).
-                _reject_states = {"Cancelled", "ApiCancelled", "Inactive"}
+                _reject_states = {"Cancelled", "ApiCancelled", "Inactive", "Rejected"}
                 _live_states = {"PreSubmitted", "Submitted", "Filled"}
                 for _ in range(16):  # up to ~8s
                     await asyncio.sleep(0.5)
@@ -1498,6 +1986,9 @@ async def run(args):
                         break
                 st = trade.orderStatus.status
                 _reasons = [le.message for le in trade.log if getattr(le, "errorCode", 0)]
+                if _credit_reservation is not None:
+                    await asyncio.to_thread(
+                        DAILY_ENTRY_RESERVATIONS.clear_for_status, order.orderRef, st)
                 if st in _reject_states:
                     reason = _reasons[-1] if _reasons else f"order status {st}"
                     approval.post_proposal(token, channel,
@@ -1510,7 +2001,8 @@ async def run(args):
                     trade_capture.capture_decision(
                         trade_capture.dataset_dir(JOURNAL_PATH), source="daily_slate",
                         symbol=r.underlying, right=r.right, strike=r.strike, expiry=r.expiry,
-                        structure=("spread" if r.short_contract is not None else "single"),
+                        structure=("cash secured put" if is_credit(r) else
+                                   ("spread" if r.short_contract is not None else "single")),
                         con_id=getattr(r.contract, "conId", None), chosen_idea=effective_idea,
                         candidates=(capture_candidates or [effective_idea]),
                         raw_strategist=capture_raw, cot=capture_cot,
@@ -1534,15 +2026,30 @@ async def run(args):
                         break
                     await asyncio.sleep(0.5)
                 st = trade.orderStatus.status
+                if _credit_reservation is not None:
+                    await asyncio.to_thread(
+                        DAILY_ENTRY_RESERVATIONS.clear_for_status, order.orderRef, st)
+                if st in _reject_states:
+                    reason = _reasons[-1] if _reasons else f"order status {st} after ACK"
+                    audit(audit_path, "daily_rec_rejected_after_ack",
+                          underlying=r.underlying, order=order_summary(r),
+                          status=st, reason=reason)
+                    done.add(ts)
+                    continue
                 _afp = getattr(trade.orderStatus, "avgFillPrice", None)
                 _fill_px = float(_afp) if (st == "Filled" and _afp and _afp == _afp) else None
                 # COMMISSIONS + REAL BASIS (2026-07-03): actual entry fee + fill-based cost basis
                 # so realized P&L can be reported NET of fees and entry slippage is recorded.
                 # ADDITIVE; never raises into the order path; never fabricates a fee/price.
                 from exitmgr.order import commission_from_trade as _comm_from_trade, compute_entry_basis as _entry_basis
-                _est_debit = round(r.limit * 100 * r.qty, 2)
                 _entry_comm = _comm_from_trade(trade) if st == "Filled" else None
-                _efd, _eslip, _eslip_pct = _entry_basis(_est_debit, _fill_px, r.qty)
+                if is_credit(r):
+                    _est_debit = capital_at_risk(r)
+                    _efd = _eslip = _eslip_pct = None
+                else:
+                    _est_debit = round(r.limit * 100 * r.qty, 2)
+                    _efd, _eslip, _eslip_pct = _entry_basis(
+                        _est_debit, _fill_px, r.qty)
                 # Capture the strategist entry thesis for the durable journal record.
                 # Non-blocking: thesis capture must never interfere with placing the order.
                 try:
@@ -1556,16 +2063,26 @@ async def run(args):
                                             "short_strike": r.short_strike,
                                             "width": abs(r.short_strike - r.strike)}}
                                 if r.short_contract is not None else {})
-                    f.write(_j.dumps({"ts": datetime.utcnow().isoformat(),
+                    _journal = {"ts": datetime.utcnow().isoformat(),
                                       "decision_id": decision_id,
                                       "decision_revision": revision,
                                       "model_identity": getattr(r, "model_identity", None),
                                       "contract_id": r.contract.conId,
                                       "symbol": r.underlying, "right": r.right, "expiry": r.expiry,
                                       "strike": r.strike, "quantity": r.qty,
-                                      "debit": round(r.limit * 100 * r.qty, 2),
-                                      "profit_target_pct": eff_tp, "stop_pct": eff_sl,
+                                      "debit": (capital_at_risk(r) if is_credit(r) else
+                                                round(r.limit * 100 * r.qty, 2)),
+                                      "profit_target_pct": (None if is_credit(r) else eff_tp),
+                                      # R2 MIGRATION FLAG (2026-07-26, Sol audit R5 R2). Marks this
+                                      # line as written under the doctrine-only take-profit policy,
+                                      # so construction.journal_take_profit_pct will honour its
+                                      # value. Journal lines WITHOUT this stamp are pre-R2 and their
+                                      # take-profit (the pot-tier or global-fallback number) must
+                                      # never reactivate on a restart.
+                                      "tp_policy": construction.TP_POLICY_CURRENT,
+                                      "stop_pct": (None if is_credit(r) else eff_sl),
                                       "conviction": getattr(idea, "conviction", -1),
+                                      "intended_hold_days": getattr(r, "intended_hold_days", None),
                                       "thesis": _thesis_str,
                                       # 2026-07-01 ADDITIVE fields: fill verification + construction annotations
                                       "order_id": getattr(trade.order, "orderId", None),
@@ -1583,14 +2100,34 @@ async def run(args):
                                       "entry_iv": (r.entry_iv or None),
                                       "dte_at_entry": (r.dte or None),
                                       "dte_adjusted": bool(r.dte_adjusted),
-                                      **spread_j}, default=str) + "\n")
+                                      **spread_j}
+                    if is_credit(r):
+                        _journal.update({
+                            "side": "credit", "structure": "cash secured put",
+                            "action": "SELL", "quantity": -abs(int(r.qty)),
+                            "contracts": abs(int(r.qty)),
+                            "collateral_usd": capital_committed(r),
+                            "net_credit_usd": round(r.net_credit_usd, 2),
+                            "max_loss_usd": capital_at_risk(r),
+                            "assignment_possible": True,
+                        })
+                    f.write(_j.dumps(_journal, default=str) + "\n")
                 placed_watch.append({"trade": trade, "r": r, "t0": time.monotonic(),
                                      "decision_id": decision_id,
                                      "model_identity": getattr(r, "model_identity", None),
-                                     "alerted": False, "filled_logged": st == "Filled"})
+                                     "alerted": False, "filled_logged": st == "Filled",
+                                     "credit_reservation": is_credit(r),
+                                     "order_ref": order.orderRef})
                 tag = " _(your levels)_" if (ov_tp or ov_sl) else ""
-                approval.post_proposal(token, channel,
-                    f":white_check_mark: *Placed* `{order_summary(r)}` — exits +{eff_tp:.0f}% / -{eff_sl:.0f}%{tag}")
+                if is_credit(r):
+                    approval.post_proposal(
+                        token, channel,
+                        f":white_check_mark: *Placed* `{order_summary(r)}` — collateral and "
+                        "assignment lifecycle now managed from the journal.")
+                else:
+                    approval.post_proposal(token, channel,
+                        f":white_check_mark: *Placed* `{order_summary(r)}` — take profit "
+                        f"{_pct_text(eff_tp)} / stop -{eff_sl:.0f}%{tag}")
                 audit(audit_path, "daily_rec_executed", underlying=r.underlying, order=order_summary(r),
                       decision_id=decision_id,
                       profit_target_pct=eff_tp, stop_pct=eff_sl)
@@ -1637,8 +2174,17 @@ if __name__ == "__main__":
     ap.add_argument("--dte", type=int, default=30, help="target days-to-expiry (min-DTE floor 25 applies; prefer 25-45)")
     ap.add_argument("--delta", type=float, default=0.60, help="target option delta (clamped into the 0.55-0.65 band)")
     ap.add_argument("--structure", default="", help="override structure, e.g. 'call debit spread' (default: long call/put)")
-    ap.add_argument("--tp", type=float, default=0.0, help="take-profit %% (0 = global default +100%%)")
+    ap.add_argument("--tp", type=float, default=0.0,
+                    help="OPTIONAL explicit catastrophe backstop, 100-500%% (0 = none, the normal "
+                         "case). There is no longer a global/tiered default take-profit — see "
+                         "RULING_TAKE_PROFIT.md / Sol audit R5 R2.")
     ap.add_argument("--stop", type=float, default=0.0, help="stop %% (0 = global default -50%%)")
+    ap.add_argument("--no-model-thesis", action="store_true", dest="no_model_thesis",
+                    help="skip asking the model for its view of a --ticker name (keeps --thesis "
+                         "verbatim). Default is to ask and record the real reasoning.")
+    ap.add_argument("--hold-days", type=int, default=0, dest="hold_days",
+                    help="intended hold in calendar days (0 = derive as ceil(dte/8), which keeps "
+                         "the DTE inside the 5-8x doctrine window). Journalled for post-hoc audit.")
     ap.add_argument("--conviction", type=int, default=6, help="conviction 1-10 (display only)")
     ap.add_argument("--thesis", default="User-directed proposal.", help="thesis line shown in the proposal")
     ap.add_argument("--client-id", type=int, default=None, dest="client_id", help="override IBKR clientId (avoid clash with the cron's 93)")

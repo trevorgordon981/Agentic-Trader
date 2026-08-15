@@ -4,7 +4,7 @@ Raw-event-log-NOW, render-to-training-rows-LATER. Every Alfred trade decision/ac
 an immutable, receipt-bound event to a dedicated capture store, kept SEPARATE from the v2
 training dataset (exitmgr/trade_capture.py -> data/trade_dataset.jsonl). The raw event log is
 the durable asset; rendering it into M3-format training rows is cheap to redo. Implements the
-Alfred-side of the dataset-v6 capture spec (the operator's manual Fidelity trades are captured
+Alfred-side of the dataset-v6 capture spec (Trevor's manual Fidelity trades are captured
 separately and are NOT handled here).
 
 Store layout (default ~/trade-capture; override with env TRADE_CAPTURE_DIR -- the test suite
@@ -420,6 +420,14 @@ def on_position_mark(con_id, *, symbol=None, enrich=None, pnl_pct=None):
             dist_to_tp_pct=enrich.get("dist_to_tp_pct"),
             dist_to_sl_pct=enrich.get("dist_to_sl_pct"),
             mgmt_action=enrich.get("mgmt_action"), mgmt_reason=enrich.get("mgmt_reason"),
+            # 2026-08-13: the model's INPUTS and provenance were being dropped here. The reason
+            # text cites window_fraction / pct_from_peak / trend, so without the view the row
+            # cannot be verified or replayed -- it was an answer with no question. Attached only
+            # when an assessment exists, so plain path samples stay light.
+            mgmt_input=(enrich.get("mgmt_input") if enrich.get("mgmt_action") else None),
+            mgmt_model_identity=(enrich.get("mgmt_model_identity")
+                                 if enrich.get("mgmt_action") else None),
+            gamma=enrich.get("gamma"), theta=enrich.get("theta"), vega=enrich.get("vega"),
         )
     except Exception:
         return None

@@ -2,27 +2,27 @@
 """Liquidate ALL open positions at MARKET. SELL longs, BUY-to-close shorts, using each
 position's own contract for guaranteed fills. Spreads close leg-by-leg at market (sub-second
 fills). DRY-RUN by default; --confirm sends. Logs + Slacks a summary to #trading-alerts.
-Fired by the operator via the Slack 'liquidate everything' command (liquidate_listener.py), or run
-directly with --confirm. the operator authorizes; this just carries it out."""
+Run manually by Trevor. (The Slack 'liquidate everything' listener was DELETED 2026-08-12:
+his positions are defined-risk debit spreads with a hard stop, so there is no scenario needing
+seconds-not-minutes liquidation, and an always-listening trigger with no market-hours gate and no
+confirmation step was a bigger risk than the one it covered. To halt new risk: touch TRADING_DOWN.)
+Or run
+directly with --confirm. Trevor authorizes; this just carries it out."""
 import argparse, asyncio, json, os, sys
 sys.path.insert(0, os.path.expanduser("~/exitmgr-app"))
 from exitmgr.connection import IBConnection
+from exitmgr import alerting
 
-ALERTS = "C0XXXXXXXXX"  # #trading-alerts
+# Resolved from config.yaml at runtime (exitmgr/alerting.py), not hardcoded:
+# a placeholder scrub or a channel rename then has one place to go wrong.
+ALERTS = alerting.alerts_channel()  # #trading-alerts
 
-def slack(msg, channel=ALERTS):
-    try:
-        import urllib.request
-        tok = None
-        for l in open(os.path.expanduser("~/.hermes/.env")):
-            if l.startswith("SLACK_BOT_TOKEN="):
-                tok = l.split("=", 1)[1].strip().strip('"').strip("'"); break
-        if not tok: return
-        urllib.request.urlopen(urllib.request.Request("https://slack.com/api/chat.postMessage",
-            data=json.dumps({"channel": channel, "text": msg}).encode(),
-            headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"}), timeout=10)
-    except Exception as e:
-        print("slack fail:", e)
+def slack(msg, channel=None):
+    """Post to #trading-alerts and VERIFY delivery. Returns True only on
+    ok:true. These messages narrate real money leaving the book, so a
+    rejected post is logged loudly to stderr rather than swallowed."""
+    return alerting.post(msg, channel or ALERTS, label="liquidate",
+                         fallback_channel=alerting.error_channel())
 
 def desc(c):
     return f"{c.symbol} {getattr(c,'lastTradeDateOrContractMonth','')[:8]} {getattr(c,'strike','') or ''}{getattr(c,'right','') or ''}".strip()

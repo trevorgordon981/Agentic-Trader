@@ -72,13 +72,19 @@ def test_discovery_merge_dedupes_without_mutation():
 def test_main_proposal_and_training_capture_never_receive_attention_context():
     source = inspect.getsource(dr.run)
     assert "_ape_discovery_brief = apewisdom.discovery_context" in source
-    assert "_res = propose(tr.get(\"llm_endpoint\"), tr.get(\"llm_model\"), brief," in source
+    # 2026-08-13: the slate now calls propose_intents(...) across several lines. Match the
+    # callee AND that it is handed the CLEAN `brief`, rather than one exact formatting of the line
+    # -- the previous literal had drifted out of existence, which kept this whole test (including
+    # the leak assertions below) permanently red.
+    assert "_res = propose_intents(" in source
+    assert "tr.get(\"llm_endpoint\"), tr.get(\"llm_model\"), brief," in source
     assert "market_context=brief" in source
     assert "market_context=_ape_discovery_brief" not in source
     assert "technical_card=_ape_discovery_brief" not in source
     assert "propose(tr.get(\"llm_endpoint\"), tr.get(\"llm_model\"), _ape_discovery_brief" not in source
     assert "research.gather(ib, names" in source
-    assert "propose_one(tr.get(\"llm_endpoint\"), tr.get(\"llm_model\"), _one_brief" in source
+    assert "_one_brief, ticker=tk" in source or \
+           "propose_one(tr.get(\"llm_endpoint\"), tr.get(\"llm_model\"), _one_brief" in source
     assert "market_context=capture_context" in source
     assert "raw_strategist=capture_raw, cot=capture_cot" in source
     assert "technical_card=capture_technical_card" in source

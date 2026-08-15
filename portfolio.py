@@ -2,14 +2,35 @@
 """Portfolio review (2026-06-18): price the open book, ask the model HOLD/TRIM/SELL per position,
 and — when a new idea needs more cash than is available — recommend which position to sell to fund it.
 Advisory: posts a synopsis; execution stays human-approved. Run standalone or import review_positions()."""
-import asyncio, json, os, sys, urllib.request
+import asyncio, json, os, sys, time as _t, urllib.error, urllib.request
 from datetime import datetime, date
 
 from exitmgr.ibkr import IB, Contract
 from exitmgr.account import get_pot_snapshot
 
-ENDPOINT = os.environ.get("LLM_ENDPOINT", "http://127.0.0.1:8082/v1/chat/completions")
-MODEL = os.environ.get("LLM_MODEL", "/path/to/model")
+def _configured_llm():
+    """Read the serving endpoint/model from the ONE source of truth: the config trading block.
+
+    This module used to hardcode the custom M3 server on :8082. After the 2026-08-10 cutover to
+    deepseek-v4-flash that address serves nothing, so every book-review/funding-rotation call
+    raised and daily_recommend swallowed it in a broad except -- the rotation synopsis silently
+    stopped appearing, with only a review_error audit line to show for it. Reading the config
+    keeps this module correct across any future model move instead of drifting again.
+    Env still wins, for one-off overrides.
+    """
+    try:
+        from exitmgr.config import load_config
+        cfg_path = os.environ.get("EXITMGR_CONFIG") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+        cfg = load_config(cfg_path)
+        return getattr(cfg, "llm_endpoint", None), getattr(cfg, "llm_model", None)
+    except Exception:
+        return None, None
+
+
+_CFG_ENDPOINT, _CFG_MODEL = _configured_llm()
+ENDPOINT = os.environ.get("LLM_ENDPOINT") or _CFG_ENDPOINT or "http://127.0.0.1:8082/v1/chat/completions"
+MODEL = os.environ.get("LLM_MODEL") or _CFG_MODEL or "local-model"
 JOURNAL = os.environ.get("JOURNAL_PATH", os.path.expanduser("~/exitmgr-app/trades.log"))
 
 REVIEW_PROMPT = (
@@ -25,12 +46,19 @@ REVIEW_PROMPT = (
 )
 
 def _llm(system, user, timeout=300, thinking="enabled"):
+    # `thinking` alone is m3_serve_batched's private field; vLLM silently ignores unknown keys and
+    # is launched with default-chat-template-kwargs {"thinking": false}, so it must ALSO be told via
+    # chat_template_kwargs or it reasons not at all. Both are sent so either server works.
     body = {"model": MODEL, "temperature": 0,
             "max_tokens": 24000 if thinking == "enabled" else 900, "thinking": thinking,
+            "chat_template_kwargs": {"thinking": str(thinking).lower() in ("enabled", "adaptive")},
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     req = urllib.request.Request(ENDPOINT, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    import urllib.error, time as _t
+    # `import urllib.error` used to sit HERE. A function-level import binds `urllib` as a local
+    # for the entire function, so the urllib.request.Request(...) call above it raised
+    # UnboundLocalError on every invocation -- this helper could never have returned. Both imports
+    # are now module-level (2026-08-11).
     last = None
     for attempt in range(5):                       # M3 is single-gen -> retry 503 backpressure
         try:
@@ -149,7 +177,8 @@ def arm_sell_approvals(r, mins=30):
     import yaml
     from exitmgr import approval
     cfg = yaml.safe_load(open(os.path.expanduser("~/exitmgr-app/config.yaml"))).get("trading", {})
-    tok = os.environ.get("SLACK_BOT_TOKEN", ""); ch = cfg.get("slack_channel", "C0XXXXXXXXX")
+    from exitmgr import alerting
+    tok = os.environ.get("SLACK_BOT_TOKEN", ""); ch = alerting.approvals_channel()
     if not tok:
         return
     bym = {b["symbol"]: b for b in r.get("book", [])}
@@ -189,14 +218,14 @@ async def _main():
     if "--arm-sells" in sys.argv:
         arm_sell_approvals(r)
     if "--post" in sys.argv:
-        tok = os.environ.get("SLACK_BOT_TOKEN"); ch = os.environ.get("POSITIONS_CHANNEL", "C0XXXXXXXXX")
-        try:
-            urllib.request.urlopen(urllib.request.Request(
-                "https://slack.com/api/chat.postMessage",
-                data=json.dumps({"channel": ch, "text": format_synopsis(r)}).encode(),
-                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}), timeout=15)
-        except Exception as e:
-            print("slack post failed:", e)
+        from exitmgr import alerting
+        # POSITIONS_CHANNEL env override still wins; the default now comes from
+        # config.yaml (#trading-positions) instead of a hardcoded literal.
+        tok = os.environ.get("SLACK_BOT_TOKEN") or alerting.token()
+        ch = os.environ.get("POSITIONS_CHANNEL") or alerting.positions_channel()
+        if not alerting.post(format_synopsis(r), ch, tok=tok, label="portfolio",
+                             timeout=15):
+            sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(_main())

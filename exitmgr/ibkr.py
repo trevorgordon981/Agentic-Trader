@@ -4,6 +4,8 @@ Prefer the maintained `ib_async` (py3.10+); fall back to the older `ib_insync` (
 Hermes's py3.9.6). The public API is identical across both, so the rest of the app imports
 from here and runs unchanged in either environment.
 """
+
+import asyncio   # used by the bounded-read guards below (wait_for)
 try:
     import ib_async as _ib            # maintained fork, py3.10+
     BACKEND = "ib_async"
@@ -28,6 +30,12 @@ Ticker = getattr(_ib, "Ticker", None)
 # carry stale adjusted strikes (e.g. QQQ 174.78) far from spot that 404 on qualify. These
 # helpers pick the canonical SMART chain and window candidates to near-the-money strikes.
 import bisect as _bisect
+
+# BOUNDED BROKER READS (2026-08-13). An unbounded `await ib.*Async()` wedged the exit
+# loop for 6+ minutes tonight with every position unevaluated. Same guard applied here.
+# A timeout raises into the caller's existing error handling; a hang has no handler.
+_IB_CALL_TIMEOUT_S = 30
+
 
 
 def pick_chain(params, underlying):
@@ -57,7 +65,7 @@ async def underlying_price(ib, stk):
     """Best-effort spot for a qualified Stock: marketPrice, then last, then close. None if
     unavailable (caller falls back to the full chain)."""
     try:
-        tickers = await ib.reqTickersAsync(stk)
+        tickers = await asyncio.wait_for(ib.reqTickersAsync(stk), _IB_CALL_TIMEOUT_S)
     except Exception:
         return None
     if not tickers:

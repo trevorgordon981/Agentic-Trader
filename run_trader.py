@@ -84,6 +84,28 @@ def main(
     exit_mgr = ExitManager(cfg)
     exit_mgr.ib_conn = ib_conn  # share the one connection
 
+    # STATE OWNERSHIP (2026-08-12, stale-write clobber fix).
+    # -----------------------------------------------------
+    # In the split deployment the `--mode protective` process is the SOLE OWNER of
+    # exitmgr_state.json: it writes peak_prices (the trailing stop), in_flight (the double-close
+    # guard), mfe/mae and the trail confirmation every ~30s from live values.  The `--mode entry`
+    # process only READS that data, for its reconcile safety gate -- but it also called save() on
+    # the reconcile path, and that path fires on EVERY IBKR reconnect, not just at startup
+    # (trader.log shows ~390 reconciliations).  StateManager had no reload, so each of those saves
+    # flushed a snapshot as old as this process's FIRST state access back over the file, reverting
+    # trailing-stop peaks and deleting in-flight close records.
+    #
+    # Make the entry process's manager READ-ONLY.  Every mutation it makes during reconcile is
+    # already made independently by the protective loop's own per-cycle reconcile, from a fresh
+    # snapshot, so nothing is lost by not writing here -- the write was redundant, not
+    # load-bearing.  Pairs with the reload() in ExitManager._reconcile_on_startup, which keeps the
+    # entry gate's READS fresh.  Deliberately NOT applied to `combined`, where one process runs
+    # both loops and therefore legitimately owns the file.
+    if mode == "entry":
+        exit_mgr.state_manager.persist = False
+        print("[INFO] entry mode: shared exit state is READ-ONLY here "
+              "(the protective process owns exitmgr_state.json)")
+
     broker_order_lock = asyncio.Lock()
     trader = Trader(
         ib_conn=ib_conn, exit_manager=exit_mgr,
@@ -111,7 +133,8 @@ def main(
         max_orders_per_day=int(getattr(cfg.caps, "max_orders_per_day", 20)),
         max_notional_per_day=float(getattr(cfg.caps, "max_notional_per_day", 50000.0)),
         # TAKE-PROFIT-AND-RELOAD (2026-07-03). OFF BY DEFAULT (reload_enabled=False => no-op);
-        # the operator flips it on in config.yaml `trading:` after re-arm + validation. Knobs gate churn.
+        # Trevor flips it on in config.yaml `trading:` after re-arm + validation. Knobs gate churn.
+        auto_approve_within_gates=bool(getattr(cfg, "auto_approve_within_gates", False)),
         reload_enabled=bool(getattr(cfg, "reload_enabled", False)),
         reload_conviction_min=float(getattr(cfg, "reload_conviction_min", 6)),
         reload_friction_k=float(getattr(cfg, "reload_friction_k", 1.5)),
@@ -162,6 +185,47 @@ def main(
                     elapsed = asyncio.get_running_loop().time() - started
                     await asyncio.sleep(max(0.0, cadence - elapsed))
 
+            async def _model_assessment_loop():
+                """MODEL-DRIVEN EXIT MANAGEMENT (2026-08-12), deliberately OFF the stop path.
+
+                `assess_positions` is a blocking HTTP call with a 75s timeout, and run_cycle
+                awaits it BEFORE evaluating stops -- so calling the model from `_protective_loop`
+                would delay a protective stop by up to a full model timeout on every cycle.  A
+                delayed stop is worse than the bug we are fixing.
+
+                Instead: the protective cycle publishes the position views it already built, this
+                task turns them into model decisions beside the loop, and the next 30s cycle picks
+                them up with a dict lookup (age-bounded -- see _consume_model_decisions).  This
+                task takes NO lock, holds NO broker connection and places NO order, so it cannot
+                delay, block or deadlock exit management.  If it dies, stalls or the model is
+                down, the cache simply ages out and every cycle runs pure static rules.
+                """
+                # A bad config value must not take this task down: `asyncio.gather` below would
+                # propagate the exception and cancel the PROTECTIVE loop with it.  Fall back to the
+                # default cadence instead.
+                try:
+                    cadence = max(60.0, float(getattr(cfg, "manage_positions_interval_s",
+                                                      ExitManager.MGMT_DEFAULT_INTERVAL_S)))
+                except (TypeError, ValueError):
+                    cadence = float(ExitManager.MGMT_DEFAULT_INTERVAL_S)
+                    print("[WARN] manage_positions_interval_s is not a number; using "
+                          f"{cadence:.0f}s")
+                # Let at least one protective cycle publish its views before the first assessment.
+                await asyncio.sleep(min(45.0, cadence))
+                while True:
+                    started = asyncio.get_running_loop().time()
+                    try:
+                        await exit_mgr.assess_positions_offcycle()
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as e:   # noqa: BLE001 - see below
+                        # DELIBERATELY BROAD.  This task is gathered with `_protective_loop`, so
+                        # ANY escaping exception here cancels the loop that places stops.  Nothing
+                        # the model does is worth that: log it and take the next tick.
+                        print(f"[ERROR] off-cycle model assessment error: {e!r}")
+                    elapsed = asyncio.get_running_loop().time() - started
+                    await asyncio.sleep(max(0.0, cadence - elapsed))
+
             async def _entry_loop():
                 entry_cadence = max(60, int(interval))
                 while True:
@@ -177,6 +241,14 @@ def main(
             loops = []
             if mode in ("combined", "protective"):
                 loops.append(_protective_loop())
+                # The assessor lives in the SAME process as the protective loop -- the one process
+                # that owns the exit state and places closing orders -- so model-driven exits can
+                # never be issued by two processes for one position.
+                if getattr(cfg, "manage_positions", False):
+                    loops.append(_model_assessment_loop())
+                    print("[INFO] model-driven exit management ON (off-cycle assessor; "
+                          "static stops keep running every "
+                          f"{min(60, max(15, int(protective_interval)))}s regardless)")
             if mode in ("combined", "entry"):
                 loops.append(_entry_loop())
             await asyncio.gather(*loops)

@@ -290,7 +290,7 @@ def position_blurb(it):
 # thesis verdict: eroded/holds + reason + action) -- NO second LLM call. One
 # row per reviewed position, keyed by con_id (reliable join) + symbol + date.
 #
-# NOTE (needs the operator's eyes): morning_review runs on OPEN positions, so the
+# NOTE (needs Trevor's eyes): morning_review runs on OPEN positions, so the
 # real close date is unknown here. We stamp `date` = review date (today, ET).
 # load_review's con_id path ignores date, so the join is robust; its symbol
 # path only matches when the caller's date equals this review date. con_id is
@@ -467,7 +467,8 @@ async def run(args):
                 conn.ib, names,
                 single_names=[n for n in names if n not in CORE])
             brief = research.build_brief(today=today, quotes=quotes, universe=names,
-                                         allow_any_name=True, **data)
+                                         allow_any_name=True, net_liq=pot.net_liq,
+                                         available_funds=pot.available_funds, **data)
         except Exception as e:
             print("[WARN] brief build failed, judging on thesis alone:", repr(e))
             brief = "(today's market brief unavailable)"

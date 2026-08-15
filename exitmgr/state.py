@@ -18,9 +18,34 @@ def _normalize_trail_confirmation(raw) -> dict:
     """Coerce a persisted (or absent, or partial, or corrupt) confirmation blob into the exact
     four-field record.  Anything unreadable degrades to UNARMED -- never to armed."""
     rec = {"last_session": None, "consecutive_qualifying_closes": 0,
-           "armed_at": None, "peak_since_arm": None}
+           "armed_at": None, "peak_since_arm": None,
+           "pinned_activation_gain_pct": None, "pinned_giveback_fraction": None}
     if not isinstance(raw, dict):
         return rec
+    # PINNED TRAIL PARAMS (2026-08-12) travel WITH the confirmation record so they persist across
+    # a process bounce and are dropped by clear_trail_state along with the arm. They are carried
+    # here rather than bolted on by the caller because this function rebuilds the record from a
+    # fixed field list -- anything it does not know about is silently discarded on the next write.
+    try:
+        _pgb = raw.get("pinned_giveback_fraction")
+        _pgb = None if _pgb is None else float(_pgb)
+        if _pgb is not None and (_pgb != _pgb or not (0.0 < _pgb <= 1.0)):
+            _pgb = None                     # unreadable/out-of-band pin = NOT pinned
+        rec["pinned_giveback_fraction"] = _pgb
+    except (TypeError, ValueError):
+        rec["pinned_giveback_fraction"] = None
+    try:
+        _pact = raw.get("pinned_activation_gain_pct")
+        _pact = None if _pact is None else float(_pact)
+        if _pact is not None and _pact != _pact:
+            _pact = None
+        rec["pinned_activation_gain_pct"] = _pact
+    except (TypeError, ValueError):
+        rec["pinned_activation_gain_pct"] = None
+    # A pin with no giveback protects nothing -- drop the half-record rather than let a caller
+    # meet an activation with no floor to measure.
+    if rec["pinned_giveback_fraction"] is None:
+        rec["pinned_activation_gain_pct"] = None
     ls = raw.get("last_session")
     if isinstance(ls, str) and ls:
         rec["last_session"] = ls[:10]
@@ -274,6 +299,63 @@ class State:
         self.trail_confirmation[k] = rec
         return rec
 
+    def arm_on_peak_gain(self, con_id, peak_price, entry_debit, quantity,
+                         activation_gain_pct, ts: Optional[str] = None) -> bool:
+        """BIG-WINNER IMMEDIATE ARM (2026-08-12, Trevor's explicit call).
+
+        The two-consecutive-qualifying-closes contract in `record_session_close` is the RIGHT
+        default and is deliberately left intact: option marks carry a ~10-12% daily sigma, and a
+        tick-based trail fires on noise rather than on a thesis change.
+
+        But that contract has a hole, and it cost real gains on SMCI (2026-08-12).  Arming needs
+        two closes ABOVE the activation line -- and a winner that spikes and then FADES stops
+        producing qualifying closes, so it never arms at all.  Worse, `peak_since_arm` seeds from
+        the arming close, so the lifetime high is discarded even when arming does happen.  SMCI
+        peaked at +28.1%, closed at +16.0%, and the trail was still switched off with the streak
+        about to reset to zero.  The whole gain could round-trip unprotected.
+
+        This is a SECOND, deliberately narrow arming path for exactly that case: a gain so large
+        (>= `activation_gain_pct`, config `auto_trail.activation_gain_pct`, default 25%) that
+        protecting it outranks the noise concern.  It seeds `peak_since_arm` from the LIFETIME
+        peak -- which is the entire point, since the floor has to remember the high the position
+        actually reached.
+
+        This is a CONSIDERED OVERRIDE of Sol audit R5 R1, which stripped lifetime-peak arming out
+        of `_apply_auto_trail`.  That removal was correct for what it fixed: a 1-sigma intraday
+        blip flipping on a trail at +15-20%.  This path is gated more than 25% higher and pairs
+        with a WIDE 50% giveback, so it protects a runner without choking it -- a position must
+        give back HALF of a >=25% gain before it exits.  Do NOT "restore" the old strict no-op
+        without re-reading this note.
+
+        Never un-arms and never re-seeds: a position already armed by EITHER path is left alone,
+        so the ratchet in `record_trail_peak` keeps ownership of the floor from then on.
+        Returns True ONLY on the arming transition, so the caller can log it exactly once.
+        """
+        rec = self.trail_confirmation_for(con_id)
+        if rec["armed_at"] is not None:
+            return False
+        try:
+            q = int(quantity)
+            ed = float(entry_debit)
+            pk = float(peak_price)
+            act = float(activation_gain_pct)
+        except (TypeError, ValueError):
+            return False
+        # An unreadable peak is a MISSING peak, never a qualifying one -- same posture as
+        # record_session_close treats an unreadable close.
+        if q <= 0 or ed <= 0 or pk != pk or pk <= 0 or ed != ed or act != act:
+            return False
+        entry_per_share = ed / (100.0 * q)
+        if entry_per_share <= 0:
+            return False
+        if pk < entry_per_share * (1.0 + act / 100.0):
+            return False
+
+        rec["armed_at"] = ts or datetime.now().astimezone().isoformat()
+        rec["peak_since_arm"] = pk          # THE LIFETIME PEAK -- deliberately, see docstring
+        self.trail_confirmation[str(con_id)] = rec
+        return True
+
     def record_trail_peak(self, con_id, current_price) -> Optional[float]:
         """Ratchet `peak_since_arm` upward.  A NO-OP while unarmed -- that is what stops a pre-arm
         spike from ever setting the post-arm floor.  Returns the current peak_since_arm."""
@@ -290,6 +372,45 @@ class State:
             rec["peak_since_arm"] = px
             self.trail_confirmation[str(con_id)] = rec
         return rec["peak_since_arm"]
+
+    def pin_trail_params(self, con_id, activation_gain_pct, giveback_fraction) -> bool:
+        """Freeze the trail parameters in force at FIRST arming.  FIRST WRITE WINS.
+
+        Why (2026-08-12): the model is inconsistent about whether it emits
+        trail_activation_gain_pct / trail_giveback_fraction on an arm_trail.  When it omits them
+        the code falls back to the config trail, so the ACTUAL protected floor silently changed
+        every few minutes depending on the model's mood -- and each flip re-posted a Slack alert.
+        A floor that moves on its own is not a floor.  Once a position is armed, the parameters it
+        was armed WITH are the ones that govern it for the rest of its life.
+
+        Stored inside the trail_confirmation record so `clear_trail_state` drops the pin along with
+        the arm -- a re-entry of the same conId must never inherit an old floor.
+
+        Returns True only on the pinning transition, so the caller can log it exactly once.
+        """
+        rec = self.trail_confirmation_for(con_id)
+        if rec.get("pinned_giveback_fraction") is not None:
+            return False
+        try:
+            act = float(activation_gain_pct)
+            gb = float(giveback_fraction)
+        except (TypeError, ValueError):
+            return False
+        if act != act or gb != gb:          # NaN is not a parameter
+            return False
+        rec["pinned_activation_gain_pct"] = act
+        rec["pinned_giveback_fraction"] = max(0.1, min(0.9, gb))
+        self.trail_confirmation[str(con_id)] = rec
+        return True
+
+    def pinned_trail_params(self, con_id):
+        """The frozen (activation_gain_pct, giveback_fraction) for an armed position, or None."""
+        rec = self.trail_confirmation_for(con_id)
+        gb = rec.get("pinned_giveback_fraction")
+        if gb is None:
+            return None
+        return {"activation_gain_pct": rec.get("pinned_activation_gain_pct"),
+                "giveback_fraction": gb}
 
     def clear_trail_state(self, con_id) -> None:
         """Drop ALL trail state for a contract: the confirmation record (last_session,
@@ -342,14 +463,47 @@ class State:
 class StateManager:
     """Manages crash-safe state persistence using atomic writes."""
 
-    def __init__(self, state_path: str):
+    def __init__(self, state_path: str, persist: bool = True):
         self.state_path = Path(state_path)
         self._state: Optional[State] = None
+        # CROSS-PROCESS OWNERSHIP (2026-08-12, stale-write clobber fix)
+        # ------------------------------------------------------------
+        # `_state` is filled lazily on first access and (before this change) there was no way to
+        # re-read it, so a long-lived process's State is as old as its FIRST access -- while
+        # `save()` re-serialises that whole snapshot over the file.  Two processes share
+        # exitmgr_state.json:
+        #
+        #   * `--mode protective` (30s exit loop) OWNS peak_prices / in_flight / mfe / mae /
+        #     trail state and writes them every cycle;
+        #   * `--mode entry` only ever needs to READ that data (its reconcile safety gate).  Its
+        #     save on the reconcile path -- which fires on EVERY IBKR reconnect, not just startup
+        #     -- flushed an hours-old snapshot back over the protective loop's work, reverting
+        #     trailing-stop peaks and deleting in_flight records (the double-close guard).
+        #
+        # `persist=False` makes this manager READ-ONLY: every save() becomes a counted no-op, so a
+        # non-owner process can still run the full reconcile logic (and mutate its own throwaway
+        # in-memory copy) without ever touching the owner's file.  There is deliberately NO lock
+        # involved: the protective loop must never be blockable by the entry process, and a
+        # write that simply never happens cannot block anything.
+        self.persist = bool(persist)
+        #: Diagnostics only -- how many save() calls this manager swallowed because persist=False.
+        self.suppressed_saves = 0
 
     @property
     def state(self) -> State:
         if self._state is None:
             self._state = self._load()
+        return self._state
+
+    def reload(self) -> State:
+        """Discard the cached snapshot and re-read the state file from disk.
+
+        The counterpart to `persist`: a non-owner process calls this immediately before any
+        read-modify-write so it never reasons about (or writes from) a stale snapshot.  DROPS any
+        unflushed in-memory mutation, which is exactly why the OWNER of the file must not call it
+        -- see ExitManager._reconcile_on_startup, which reloads only when persist is False.
+        """
+        self._state = self._load()
         return self._state
 
     def _load(self) -> State:
@@ -402,7 +556,14 @@ class StateManager:
             return State()
 
     def save(self) -> None:
-        """Atomically write state to disk using temp file + rename."""
+        """Atomically write state to disk using temp file + rename.
+
+        A READ-ONLY manager (persist=False) swallows the write: see __init__ for why the entry
+        process must never flush its snapshot over the protective loop's live exit state.
+        """
+        if not self.persist:
+            self.suppressed_saves += 1
+            return
         # Ensure parent directory exists
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
 

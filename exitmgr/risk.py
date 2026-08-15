@@ -33,7 +33,7 @@ class RiskLimits:
                                            # pot per single trade, soft/regime-scalable)
     max_trade_pct_hard: float = 0.25       # ABSOLUTE ceiling: no single trade may EVER exceed this
                                            # % of NetLiq -- binds on every path incl. confident +
-                                           # regime size-up (the operator 2026-06-22 risk-gate hardening)
+                                           # regime size-up (Trevor 2026-06-22 risk-gate hardening)
     max_concurrent: int = 4                # dataclass default; LIVE config sets 8 open positions
     daily_halt_pct: float = 0.08           # dataclass default; LIVE config sets 0.20 -- halt NEW
                                            # entries when the pot is down >=20% on the day
@@ -47,7 +47,7 @@ class RiskLimits:
                                            # soft-sized correlated names coexist but blocks a third
                                            # concentrating the same macro bet. Tune in config.yaml.
     sector_map: Dict[str, str] = field(default_factory=dict)  # UPPERCASE symbol -> sector/cluster
-                                           # id. STATIC, the operator-editable map from config.yaml -- the
+                                           # id. STATIC, Trevor-editable map from config.yaml -- the
                                            # pragmatic no-network source (a live correlation/beta feed
                                            # is a future upgrade). Unmapped symbols key to their own
                                            # name => no clustering (behaves like today). EMPTY map =>
@@ -61,7 +61,7 @@ class RiskLimits:
     allow_any_name: bool = False           # model may propose names beyond approved_names
                                            # (all other caps + per-entry approval still bind)
     confident_full_size: bool = False      # if a high-conviction idea may use the WHOLE pot,
-                                           # bypassing the % size caps (the operator's call 2026-06-12)
+                                           # bypassing the % size caps (Trevor's call 2026-06-12)
     cap_bypass_min_conviction: int = 6     # conviction >= this may EXCEED the soft base cap (25% live) toward the
                                            # hard ceiling). Raised 2026-06-22 from 4 -> 6: low-conviction
                                            # ideas (3-5) can NOT exceed the base cap. Still bounded by
@@ -92,6 +92,18 @@ class OpenPosition:
     underlying: str
     notional: float        # current $ at risk
     is_index: bool
+    # CREDIT (SHORT) POSITIONS (2026-07-26). ADDITIVE and defaulted, so every existing
+    # construction -- production and tests, positional or keyword -- is unchanged.
+    #
+    # A cash-secured put is an open position for the purposes of check #4 (max_concurrent) and
+    # the aggregate concentration caps (#6/#6b), but its "$ at risk" is NOT a premium: it is the
+    # COLLATERAL pledged (strike * 100 * contracts). trader._open_positions supplies exactly that
+    # number and sets this flag, so a consumer that needs to distinguish the two books can --
+    # rather than having to infer it from a suspiciously large notional. Nothing in this module
+    # branches on it today: a dollar of collateral and a dollar of premium are both a dollar of
+    # capital to a solvency cap, which is why counting the CSP at collateral is the conservative
+    # direction. It exists so the distinction is CARRIED rather than lost.
+    is_credit: bool = False
 
 
 @dataclass
@@ -106,9 +118,15 @@ class ProposedTrade:
                            # ("medium"/"high") genuinely arrives and the bypass is reachable --
                            # it is NOT dead code. (Was mis-documented as "1-5" pre-2026-07-02.)
     is_long: bool = True   # bullish (long call / call debit) vs bearish; gates bull size-up
-    profit_target_pct: float = 0.0  # SELL-to-take-profit at +this% of premium (0 = use default)
+    profit_target_pct: Optional[float] = None
+                           # OPTIONAL and normally None (2026-07-26, Sol audit R5 R2). There is no
+                           # "0 = use default" any more: the take-profit default was one of the
+                           # three mechanical paths the ruling removed, so absent means ABSENT.
+                           # None/0 simply means this trade has no numeric profit target, which is
+                           # the normal case; the reward:risk gate below then has nothing to check.
     stop_pct: float = 0.0           # SELL-to-cut-loss at -this% of premium (0 = use default)
-                                    # reward:risk gate rejects if stop_pct > profit_target_pct
+                                    # UNCHANGED. reward:risk gate rejects if stop_pct > target,
+                                    # but only when a target was explicitly supplied.
 
 
 @dataclass
@@ -117,6 +135,24 @@ class GateDecision:
     reasons: List[str] = field(default_factory=list)  # why blocked (empty == approved)
     pot_value: float = 0.0
     per_trade_cap: float = 0.0
+
+
+def _explicit_pct(value) -> Optional[float]:
+    """Explicit-optional reader for a percent level (2026-07-26, Sol audit R5 R2).
+
+    Replaces the `x or fallback` idiom that let an absent take-profit collapse into 0.0 and then
+    into a default. Returns the float ONLY when one was genuinely supplied; None for absent, null,
+    0, "", False, garbage and NaN. Never raises.
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v != v:  # NaN
+        return None
+    return v
 
 
 def effective_pot(net_liq: float, pot_cap_usd: Optional[float]) -> float:
@@ -301,7 +337,10 @@ def evaluate_trade(
     if trade.notional > available_funds + EPS:
         reasons.append(f"notional ${trade.notional:,.0f} exceeds available funds ${available_funds:,.0f}")
 
-    # 4. concurrent position cap
+    # 4. concurrent position cap.  Counts EVERY open position the caller reports, long or short:
+    #    a filled cash-secured put occupies a slot in the book exactly as a debit spread does, and
+    #    until 2026-07-26 it occupied none because trader._open_positions read a long-only broker
+    #    view.  A short's notional here is its COLLATERAL (see OpenPosition.is_credit).
     if len(open_positions) >= limits.max_concurrent:
         reasons.append(f"at max concurrent positions ({len(open_positions)}/{limits.max_concurrent})")
 
@@ -314,7 +353,24 @@ def evaluate_trade(
     #    This is a HARD solvency gate. Conviction may relax only the soft per-trade size curve; it
     #    can never waive concentration. Human approval likewise cannot override it.
     if not trade.is_index:
-        name_exposure = sum(p.notional for p in open_positions if not p.is_index) + trade.notional
+        # PER-NAME (fixed 2026-08-13). This previously summed EVERY non-index position, which made
+        # a "single-name" cap behave as a portfolio-wide one: SMCI+SPCX+APO ($1,597) were charged
+        # against a $250 PLTR entry, reporting $1,847 vs the $1,716 cap on a name the book held
+        # none of. With $119 of headroom that rejected every proposal outright. Only positions in
+        # the SAME underlying belong in a single-name concentration cap -- #6b below is what
+        # catches correlated DIFFERENT names, and max_deployed_pct is what caps the whole book.
+        # A position whose underlying is missing/unreadable is counted IN, never silently dropped:
+        # on a solvency gate the conservative direction is to over-count, not to under-count.
+        def _same_name(p):
+            raw = getattr(p, "underlying", None)
+            if raw is None:
+                return True
+            try:
+                return str(raw).strip().upper() == u
+            except Exception:
+                return True
+        name_exposure = sum(p.notional for p in open_positions
+                            if not p.is_index and _same_name(p)) + trade.notional
         name_cap = limits.max_single_name_agg_pct * pot
         if name_exposure > name_cap + EPS:
             reasons.append(f"single-name exposure ${name_exposure:,.0f} would exceed {limits.max_single_name_agg_pct:.0%}-of-pot cap ${name_cap:,.0f}")
@@ -322,7 +378,7 @@ def evaluate_trade(
     # 6b. aggregate SECTOR / correlated-cluster exposure cap (max_sector_agg_pct, default 25% of
     #     pot). Mirrors the single-name-agg cap (#6) exactly, but groups CORRELATED names into one
     #     macro bet (e.g. NVDA + AMD + MU sail through #6 as three names while being one semis bet).
-    #     The grouping comes from a STATIC, the operator-editable sector_map (symbol -> cluster) in
+    #     The grouping comes from a STATIC, Trevor-editable sector_map (symbol -> cluster) in
     #     config.yaml -- the pragmatic no-network source; a live correlation/beta feed is a future
     #     upgrade. Unmapped symbols key to their own name (no clustering => same as today), and an
     #     EMPTY sector_map (or a non-positive cap) makes this whole check a no-op so old configs are
@@ -336,16 +392,18 @@ def evaluate_trade(
         if sec_exposure > sec_cap + EPS:
             reasons.append(f"sector '{sec}' exposure ${sec_exposure:,.0f} would exceed {limits.max_sector_agg_pct:.0%}-of-pot cap ${sec_cap:,.0f}")
 
-    # 7. reward:risk gate -- never take a trade risking more than it targets. Only enforced when
-    #    BOTH levels are present (>0); a 0 means "use the default rule" so we don't second-guess it.
-    #    ACCEPTED INVERTED R:R ON SMALL POTS (INTENTIONAL -- do NOT extend this gate): this checks
-    #    only the MODEL-PROVIDED tp/sl. It does NOT (and must not) re-check the pot-tier DEFAULT tp
-    #    applied later in construction.clamp_tp_sl, where a sub-$5k pot deliberately runs a 20-25% TP
-    #    below the 30% stop (bank fast out of down days; stop still holds at 30%). Leaving both levels
-    #    at 0 (use-the-default path) intentionally bypasses this gate -- that accepted case is by design.
-    tp = getattr(trade, "profit_target_pct", 0.0) or 0.0
-    sl = getattr(trade, "stop_pct", 0.0) or 0.0
-    if tp > 0 and sl > 0 and sl > tp + EPS:
+    # 7. reward:risk gate -- never take a trade risking more than it EXPLICITLY targets.
+    #    EXPLICIT-ONLY (2026-07-26, Sol audit R5 R2 / RULING_TAKE_PROFIT.md). `profit_target_pct` is
+    #    now genuinely optional and is None on essentially every trade, because the three mechanical
+    #    take-profit paths (pot tiers, the global 30% fallback, the +20% scale-out) were removed. An
+    #    ABSENT target is not a 0% target and must never be read as one: with nothing to compare
+    #    against, this gate simply does not apply and the -30% maximum-loss stop governs alone.
+    #    The old note here claimed the small-pot inverted R:R was deliberate and that this gate must
+    #    not be extended to the pot-tier default TP. That note is SUPERSEDED: there is no longer a
+    #    manufactured small-pot take-profit for it to describe.
+    tp = _explicit_pct(getattr(trade, "profit_target_pct", None))
+    sl = _explicit_pct(getattr(trade, "stop_pct", None))
+    if tp is not None and sl is not None and tp > 0 and sl > 0 and sl > tp + EPS:
         reasons.append(f"reward:risk inverted: stop {sl:.0f}% exceeds profit target {tp:.0f}% (need target >= stop)")
 
     return GateDecision(approved=not reasons, reasons=reasons, pot_value=pot, per_trade_cap=per_trade_cap)

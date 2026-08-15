@@ -1,10 +1,10 @@
-"""IBKR Flex Web Service history ingest (2026-07-03): backfill the operator's FULL trade history --
+"""IBKR Flex Web Service history ingest (2026-07-03): backfill Trevor's FULL trade history --
 including MANUAL trades that never touched Alfred AND app trades older than the ~7-day
 reqExecutions window -- into the trade_dataset.v2 training corpus.
 
 WHY THIS EXISTS
 ---------------
-exec_capture.py pulls executions via reqExecutions, which only reaches ~7 days. the operator's real
+exec_capture.py pulls executions via reqExecutions, which only reaches ~7 days. Trevor's real
 edge is trades he punches straight into TWS / the mobile app; anything older than a week is
 invisible to reqExecutions. The IBKR **Flex Web Service** serves a 365-day Activity Flex Query
 (real execIDs, real commissions, real fifoPnlRealized) -- the authoritative history. This module
@@ -112,7 +112,7 @@ _PNL_TOLERANCE_USD = 0.05
 # --- cash-transaction ledger (feeds ~/pnl-tracker/pnl_net.py) ------------------------------
 # pnl_net.py defaults to Path.home()/"contributions.jsonl"; keep them identical or the tracker
 # reads nothing.  The env var exists so tests (and any dry inspection) can never write into
-# the operator's real ledger.
+# Trevor's real ledger.
 CASH_LEDGER_ENV = "EXITMGR_CASH_LEDGER"
 DEFAULT_CASH_LEDGER = os.path.join(os.path.expanduser("~"), "contributions.jsonl")
 # Amounts at/below this are treated as no cash movement at all.  Emitting a $0.00 row would be
@@ -356,7 +356,7 @@ CASH_INCOME_TYPES = ("dividend", "interest", "fee", "commission", "tax", "adjust
 
 # IBKR's own CashTransaction `type` strings, normalised (lowercased, punctuation -> spaces).
 # "deposit_or_withdrawal" is resolved by the SIGN of the amount, which is the only honest way
-# to tell the operator's $500 in from a $500 out -- IBKR reports both under one type string.
+# to tell Trevor's $500 in from a $500 out -- IBKR reports both under one type string.
 _CASH_TYPE_MAP: Dict[str, str] = {
     "deposits withdrawals": "deposit_or_withdrawal",
     "deposits and withdrawals": "deposit_or_withdrawal",

@@ -241,17 +241,21 @@ def _api(method: str, token: str, params: dict, http_post: bool = True) -> dict:
 
 
 def post_proposal(token: str, channel: str, text: str,
-                  client_msg_id: Optional[str] = None) -> Optional[str]:
+                  client_msg_id: Optional[str] = None,
+                  seed_reactions: bool = True) -> Optional[str]:
+    """seed_reactions=False for messages that are RECEIPTS, not requests (auto-approved
+    submissions). Seeding taps on a message nothing polls invites a click that silently does
+    nothing, which reads as the system ignoring you."""
     payload = {"channel": channel, "text": text}
     if client_msg_id:
         payload["client_msg_id"] = str(client_msg_id)
     resp = _api("chat.postMessage", token, payload)
     ts = resp.get("ts") if resp.get("ok") else None
-    if ts:
+    if ts and seed_reactions:
         # Pre-seed the approve/deny taps so the user just clicks one — no typing, no hunting for
         # the emoji picker. The bot adding these does NOT count as a decision: decision_from_
         # reactions only counts a reaction whose users include an approver_id, so it sits inert
-        # until the operator taps it (adding his user to that reaction).
+        # until Trevor taps it (adding his user to that reaction).
         for emoji in ("white_check_mark", "x"):
             try:
                 _api("reactions.add", token, {"channel": channel, "timestamp": ts, "name": emoji})

@@ -320,13 +320,17 @@ def test_backstop_refuses_a_short_that_reaches_managed_positions(tmp_path, capsy
     assert mgr.order_manager.place_close_order.await_count == 0
 
 
-def test_trader_open_positions_is_untouched_by_the_default(tmp_path):
+def test_trader_open_positions_counts_a_csp_at_collateral(tmp_path):
     """AUDITED CONSUMER: trader._open_positions() -> risk.evaluate_trade caps + max_concurrent.
-    It calls get_positions() with NO keywords, so it is unchanged. That is the documented,
-    accepted boundary of this change: the CSP still does not count toward max_concurrent on
-    cycles after the fill (its capital is separately capped by _deployed_collateral / invariant
-    3). Flipping the default instead would poison construction.open_book_items -- see the next
-    test for the measured consequence."""
+
+    SUPERSEDED 2026-07-26 (credit exit wiring). This test previously asserted the OPPOSITE -- that
+    a CSP never reaches this list -- and called it "the documented, accepted boundary of this
+    change". That boundary was the max_concurrent gap: the put counted as ZERO open positions on
+    every cycle after the fill. It is now folded in DELIBERATELY, valued at COLLATERAL
+    ($500 strike x 100 = $50,000), by a path that reads get_positions(include_short=True)
+    directly. What must still never happen is the thing the next test measures: the credit row
+    reaching construction.open_book_items via the long-only get_positions() default. That default
+    is untouched, which is why both properties can hold at once."""
     from exitmgr.trader import Trader
     (tmp_path / "trades.log").write_text(json.dumps(CSP_JOURNAL) + "\n")
     t = Trader.__new__(Trader)
@@ -335,8 +339,13 @@ def test_trader_open_positions_is_untouched_by_the_default(tmp_path):
     t.journal_path = str(tmp_path / "trades.log")
     t.audit_path = str(tmp_path / "audit.jsonl")
     out = asyncio.run(Trader._open_positions(t))
-    assert all(p.underlying != "SPY" for p in out), \
-        "a short put leaked into the long-exposure book"
+    spy = [p for p in out if p.underlying == "SPY"]
+    assert len(spy) == 1, "the CSP must occupy exactly one slot in the concurrent book"
+    assert spy[0].is_credit is True
+    assert spy[0].notional == 50_000.0, "a CSP is valued at collateral, not premium/max-loss"
+    # the SHORT CALL (con 104, a spread's short leg) is still excluded -- it is counted through
+    # its long leg's journaled net debit, and a naked call must not exist in this account.
+    assert all(not (p.underlying == "RKLB" and p.notional == 2_500.0) for p in out)
 
 
 def test_construction_open_book_would_be_poisoned_by_a_short(tmp_path):
@@ -482,9 +491,16 @@ def test_expired_long_is_unchanged(tmp_path):
 # ============================================== 5. visible on EVERY cycle, not just the fill one
 def test_csp_is_reported_on_every_cycle_not_only_the_fill_cycle(tmp_path):
     """The specific gap that made a CSP unmanaged: it was counted once, on the cycle it filled,
-    then vanished. Run three cycles and assert it is present, priced and flagged UNMANAGED every
+    then vanished. Run three cycles and assert it is present, priced and correctly flagged every
     single time -- including on a book that holds NOTHING else, which used to print
-    'No positions to evaluate' and go silent."""
+    'No positions to evaluate' and go silent.
+
+    UPDATED 2026-07-26 (credit exit wiring): the flag was `managed is False` with reason
+    "short_exit_path_not_implemented", because there was no short exit path. There is one now, so
+    a journaled CSP with a usable credit basis and a live mark reports MANAGED -- the unconditional
+    UNMANAGED would now be the more dangerous of the two lies. The unmanaged branch is still
+    asserted, by the tests that remove the basis (test_an_unjournaled_short_is_still_reported here,
+    and the refusal tests in tests/test_credit_wiring.py)."""
     rows = [_raw(105, "P", -1, symbol="SPY", strike=500.0, avg_cost=1.75)]
     mgr, _ = _mgr(tmp_path, [CSP_JOURNAL], rows=rows)
     mgr.ib_conn.get_open_orders = AsyncMock(return_value={})
@@ -501,7 +517,7 @@ def test_csp_is_reported_on_every_cycle_not_only_the_fill_cycle(tmp_path):
         assert row["contracts"] == 1
         assert row["collateral_usd"] == 50000.0
         assert row["unrealized_pnl_usd"] == 125.0     # 175 credit - 50 to close -> a GAIN
-        assert row["managed"] is False and row["unmanaged_reason"]
+        assert row["managed"] is True and row["unmanaged_reason"] is None
 
 
 def test_short_report_counts_a_csp_toward_the_concurrent_book(tmp_path):

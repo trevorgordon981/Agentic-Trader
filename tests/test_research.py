@@ -2,7 +2,8 @@
 from datetime import date
 
 from exitmgr.research import (
-    momentum_stats, next_events, parse_rss_titles, build_brief, FOMC_DECISIONS_2026,
+    account_sizing_snapshot, build_brief, FOMC_DECISIONS_2026, momentum_stats,
+    next_events, parse_rss_titles, with_account_sizing_snapshot,
 )
 from exitmgr.risk import OpenPosition
 
@@ -93,6 +94,8 @@ def _full_brief(**over):
         quotes={"SPY": {"last": 737.76, "change_pct": 0.4}},
         universe=["SPY", "QQQ", "IWM"],
         allow_any_name=True,
+        net_liq=1893.01,
+        available_funds=1175.42,
         price_stats={"SPY": momentum_stats([100.0] * 16 + [101, 102, 103, 104, 105.0])},
         vix=14.2,
         events=["FOMC rate decision 2026-06-17 (in 5d)"],
@@ -106,6 +109,8 @@ def _full_brief(**over):
 
 def test_brief_renders_all_sections():
     s = _full_brief()
+    assert "Net liquidation value: $1,893.01" in s
+    assert "Available funds: $1,175.42" in s
     assert "SPY: 737.76 (+0.40%)" in s
     assert "20d vol" in s
     assert "VIX: 14.2" in s
@@ -118,9 +123,26 @@ def test_brief_renders_all_sections():
 
 
 def test_brief_degrades_explicitly_when_sections_missing():
-    s = build_brief(today="2026-06-12", quotes={}, universe=["SPY"], allow_any_name=False)
+    s = build_brief(today="2026-06-12", quotes={}, universe=["SPY"],
+                    allow_any_name=False, net_liq=1893.01, available_funds=0.0)
     assert "(quotes unavailable this cycle)" in s
     assert "(unavailable this cycle)" in s          # price structure
     assert "VIX: unavailable" in s
     assert "no open positions" in s
     assert "single name you have real conviction on" not in s
+
+
+def test_account_snapshot_invalid_is_explicit_and_forbids_entry():
+    s = account_sizing_snapshot(net_liq=float("nan"), available_funds=100.0)
+    assert "UNAVAILABLE OR INVALID" in s
+    assert "do not propose a new trade" in s
+    assert "Net liquidation value:" not in s
+
+
+def test_account_snapshot_refresh_replaces_instead_of_duplicates():
+    old = _full_brief()
+    new = with_account_sizing_snapshot(old, net_liq=2001.25, available_funds=999.50)
+    assert new.count("Account sizing snapshot") == 1
+    assert "Net liquidation value: $2,001.25" in new
+    assert "Available funds: $999.50" in new
+    assert "$1,893.01" not in new

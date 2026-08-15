@@ -77,11 +77,22 @@ def test_insufficient_buying_power():
 
 
 def test_aggregate_single_name_cap():
-    # already $300 of single names on a $1010 pot (agg cap = 36% = ~$364); +$100 -> $400 > cap
-    pos = [OpenPosition("NVDA", 150, False), OpenPosition("AAPL", 150, False)]
+    # SAME NAME aggregates: $300 of NVDA on a $1010 pot (agg cap = 36% = ~$364); +$100 -> $400 > cap
+    # (2026-08-13: this previously used NVDA + AAPL and asserted they aggregate. They must not --
+    # that made a "single-name" cap behave as a portfolio cap. Correlated DIFFERENT names are #6b's
+    # job; the whole book is max_deployed_pct's job.)
+    pos = [OpenPosition("NVDA", 150, False), OpenPosition("NVDA", 150, False)]
     d = gate(ProposedTrade("NVDA", 100.0, False), open_pos=pos)
     assert not d.approved
     assert any("single-name exposure" in r for r in d.reasons)
+
+
+def test_positions_in_OTHER_names_do_not_aggregate_into_this_one():
+    """The 2026-08-13 regression: SMCI+SPCX+APO ($1,597) were charged against a $250 PLTR entry,
+    blocking every proposal on a name the book held none of."""
+    pos = [OpenPosition("NVDA", 150, False), OpenPosition("AAPL", 150, False)]
+    d = gate(ProposedTrade("PLTR", 100.0, False), open_pos=pos)
+    assert not any("single-name exposure" in r for r in d.reasons), d.reasons
 
 
 def test_index_exposure_not_capped_by_single_name_rule():
@@ -110,7 +121,9 @@ def test_allow_any_name_keeps_size_cap():
 
 
 def test_allow_any_name_keeps_aggregate_name_cap():
-    pos = [OpenPosition("NVDA", 150, False), OpenPosition("AAPL", 150, False)]
+    # Opening the universe must never waive the concentration cap -- but the cap is PER NAME,
+    # so the existing exposure has to be in the SAME name to count (2026-08-13).
+    pos = [OpenPosition("PLTR", 150, False), OpenPosition("PLTR", 150, False)]
     d = gate(ProposedTrade("PLTR", 100.0, False), open_pos=pos,
              limits=RiskLimits(allow_any_name=True))
     assert not d.approved
@@ -183,7 +196,7 @@ def test_blocked_name_case_insensitive():
 
 def test_non_blocked_name_still_allowed():
     lim = RiskLimits(allow_any_name=True, blocked_names={"TSLA"})
-    d = gate(ProposedTrade("RKLB", 50.0, False), limits=lim)  # space name the operator kept
+    d = gate(ProposedTrade("RKLB", 50.0, False), limits=lim)  # space name Trevor kept
     assert d.approved, d.reasons
 
 

@@ -1,6 +1,6 @@
 """Take-profit-and-reload queue + friction gate (2026-07-03).
 
-Encodes the operator's serial-reload exit style WITHOUT any autonomous action. The flow is a strict
+Encodes Trevor's serial-reload exit style WITHOUT any autonomous action. The flow is a strict
 hand-off between two already-existing, already-gated stages:
 
   1. EXIT side (manager.py): when the MODEL banks a winner (`take_profit`) AND still sees room
@@ -11,7 +11,7 @@ hand-off between two already-existing, already-gated stages:
   2. ENTRY side (trader.py): each cycle, AFTER the existing kill-switch / reconcile-halt /
      exit-fail-streak entry gates, the trader DRAINS ready tickets into synthetic high-priority
      ideas that flow through the SAME gate -> construct -> Slack-approve -> submit path as strategist
-     ideas. the operator approves EVERY trade, so a reload is just another suggested entry -- not an
+     ideas. Trevor approves EVERY trade, so a reload is just another suggested entry -- not an
      auto-fire. Each fresh entry journals its OWN debit + 30% stop, so the basis/stop re-anchor is
      automatic and banked gain can't be given back.
 

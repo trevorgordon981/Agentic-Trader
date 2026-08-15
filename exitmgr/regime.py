@@ -23,14 +23,36 @@ def _vix_risk(vix):
     return "stressed"        # high/extreme -> risk-off
 
 
+def _finite(value):
+    """A momentum stat, or None if it cannot be used.
+
+    CLAUDE FIX 2026-07-26. Non-finite values MUST be rejected here rather than reaching the
+    clamp below: `min(1.0, float("nan"))` returns 1.0 (the comparison is False, so min keeps
+    its first argument), so `max(-1.0, min(1.0, nan/6.0))` == 1.0 and a NaN scored +100
+    "strong_up" -- byte-identical to a genuine maximal uptrend. Verified empirically before
+    this fix. Returning None routes a non-finite stat down the SAME path as an absent one,
+    so an all-non-finite input yields the existing {"score": 0, "label": "unknown"} rather
+    than maximum bullish conviction. Infinities are rejected for the same reason.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):   # NaN != NaN
+        return None
+    return f
+
+
 def trend_strength(stats):
     """Per-underlying trend score in [-100, 100] from momentum_stats. Higher = stronger
     uptrend. Returns {"score": int, "label": str}. label in
     strong_up / up / flat / down / strong_down / unknown."""
     if not stats:
         return {"score": 0, "label": "unknown"}
-    r20 = stats.get("ret_20d")
-    r5 = stats.get("ret_5d")
+    r20 = _finite(stats.get("ret_20d"))
+    r5 = _finite(stats.get("ret_5d"))
     parts = []
     # 20d return is the trend backbone (~+6%/20d on an index = a strong leg -> full weight)
     if r20 is not None:
