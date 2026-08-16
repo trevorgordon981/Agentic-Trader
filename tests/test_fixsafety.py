@@ -29,6 +29,7 @@ from exitmgr.state import State, StateManager, InFlightClose, reconcile_state
 from exitmgr.config import Config, RulesConfig, TrailingConfig, ScaleOutConfig
 from exitmgr.order import OrderResult
 from exitmgr.manager import ExitManager
+from tests._stage_stub import stub_stage_a
 
 LIM = RiskLimits()
 IDEA = TradeIdea("SPY", True, "bullish", "long call", 7, 0.35, 90.0, 4, "trend")
@@ -151,7 +152,7 @@ def _wire_trader_env(monkeypatch):
     monkeypatch.setattr(trader.research, "gather", AsyncMock(return_value={}))
     monkeypatch.setattr(trader, "_market_open", lambda: True)
     monkeypatch.setattr(trader, "get_pot_snapshot", AsyncMock(return_value=PotSnapshot(1010.0, 9000.0, 1010.0)))
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [IDEA])
     monkeypatch.setattr(trader.approval, "post_proposal", lambda *a, **k: "ts1")
     monkeypatch.setattr(trader.approval, "await_approval", lambda *a, **k: "approve")
     monkeypatch.setattr(trader.research, "days_to_earnings", lambda *a, **k: None)

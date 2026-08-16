@@ -82,6 +82,14 @@ async def test_strategist_receives_exact_live_account_snapshot(tmp_path, monkeyp
         return []
 
     monkeypatch.setattr(trader, "propose", fake_propose)
+    # Entry loop is two-stage: propose_intents (A) -> _materialize_stage_b (B).
+    # Patching only `propose` let Stage A hit a live endpoint (URLError, 4 retries,
+    # no ideas), so these asserted against an empty run.
+    monkeypatch.setattr(trader, "propose_intents",
+                        lambda *a, **k: ((fake_propose)(*a, **k), "", None, None))
+    async def _stage_b_passthrough(self, intents, pot):
+        return list(intents or [])
+    monkeypatch.setattr(trader.Trader, "_materialize_stage_b", _stage_b_passthrough)
     t = _trader(tmp_path)
     await t.run_once(dry_run=True)
     assert "Net liquidation value: $1,893.01" in seen["context"]
@@ -97,6 +105,14 @@ async def test_invalid_account_skips_entry_model_but_preserves_exit_cycle(tmp_pa
         AsyncMock(return_value=PotSnapshot(float("nan"), 9000.0, 1010.0)))
     proposed = MagicMock(return_value=[IDEA])
     monkeypatch.setattr(trader, "propose", proposed)
+    # Entry loop is two-stage: propose_intents (A) -> _materialize_stage_b (B).
+    # Patching only `propose` let Stage A hit a live endpoint (URLError, 4 retries,
+    # no ideas), so these asserted against an empty run.
+    monkeypatch.setattr(trader, "propose_intents",
+                        lambda *a, **k: ((proposed)(*a, **k), "", None, None))
+    async def _stage_b_passthrough(self, intents, pot):
+        return list(intents or [])
+    monkeypatch.setattr(trader.Trader, "_materialize_stage_b", _stage_b_passthrough)
     t = _trader(tmp_path)
     await t.run_once(dry_run=True)
     t.exit_manager.run_cycle.assert_awaited_once()
@@ -123,6 +139,14 @@ async def test_dry_run_never_executes(tmp_path, monkeypatch):
     # guard skips propose() outside RTH, which made this test time-of-day dependent (pre-existing)
     monkeypatch.setattr(trader, "get_pot_snapshot", AsyncMock(return_value=PotSnapshot(1010.0, 9000.0, 1010.0)))
     monkeypatch.setattr(trader, "propose", lambda *a, **k: [IDEA])
+    # Entry loop is two-stage: propose_intents (A) -> _materialize_stage_b (B).
+    # Patching only `propose` let Stage A hit a live endpoint (URLError, 4 retries,
+    # no ideas), so these asserted against an empty run.
+    monkeypatch.setattr(trader, "propose_intents",
+                        lambda *a, **k: ((lambda *a, **k: [IDEA])(*a, **k), "", None, None))
+    async def _stage_b_passthrough(self, intents, pot):
+        return list(intents or [])
+    monkeypatch.setattr(trader.Trader, "_materialize_stage_b", _stage_b_passthrough)
     posts = []
     monkeypatch.setattr(trader.approval, "post_proposal", lambda tok, ch, txt: posts.append(txt) or "ts1")
     monkeypatch.setattr(trader.approval, "await_approval", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not await approval in dry run")))
@@ -138,6 +162,14 @@ async def test_executes_only_on_approval(tmp_path, monkeypatch):
     monkeypatch.setattr(trader, "_market_open", lambda: True)  # deterministic (see note above)
     monkeypatch.setattr(trader, "get_pot_snapshot", AsyncMock(return_value=PotSnapshot(1010.0, 9000.0, 1010.0)))
     monkeypatch.setattr(trader, "propose", lambda *a, **k: [IDEA])
+    # Entry loop is two-stage: propose_intents (A) -> _materialize_stage_b (B).
+    # Patching only `propose` let Stage A hit a live endpoint (URLError, 4 retries,
+    # no ideas), so these asserted against an empty run.
+    monkeypatch.setattr(trader, "propose_intents",
+                        lambda *a, **k: ((lambda *a, **k: [IDEA])(*a, **k), "", None, None))
+    async def _stage_b_passthrough(self, intents, pot):
+        return list(intents or [])
+    monkeypatch.setattr(trader.Trader, "_materialize_stage_b", _stage_b_passthrough)
     monkeypatch.setattr(trader.approval, "post_proposal", lambda *a, **k: "ts1")
     # case 1: approved -> executes
     monkeypatch.setattr(trader.approval, "await_approval", lambda *a, **k: "approve")
@@ -159,6 +191,14 @@ async def test_circuit_breaker_blocks_after_8pct_drop(tmp_path, monkeypatch):
     monkeypatch.setattr(trader.research, "gather", AsyncMock(return_value={}))  # no network in tests
     monkeypatch.setattr(trader, "get_pot_snapshot", AsyncMock(return_value=PotSnapshot(920.0, 9000.0, 920.0)))
     monkeypatch.setattr(trader, "propose", lambda *a, **k: [IDEA])
+    # Entry loop is two-stage: propose_intents (A) -> _materialize_stage_b (B).
+    # Patching only `propose` let Stage A hit a live endpoint (URLError, 4 retries,
+    # no ideas), so these asserted against an empty run.
+    monkeypatch.setattr(trader, "propose_intents",
+                        lambda *a, **k: ((lambda *a, **k: [IDEA])(*a, **k), "", None, None))
+    async def _stage_b_passthrough(self, intents, pot):
+        return list(intents or [])
+    monkeypatch.setattr(trader.Trader, "_materialize_stage_b", _stage_b_passthrough)
     monkeypatch.setattr(trader.approval, "await_approval", lambda *a, **k: (_ for _ in ()).throw(AssertionError("breaker should stop us first")))
     monkeypatch.setattr(trader.approval, "post_proposal", lambda *a, **k: "ts1")
     t = _trader(tmp_path)

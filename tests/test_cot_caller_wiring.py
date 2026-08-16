@@ -21,6 +21,7 @@ from exitmgr.account import PotSnapshot
 from exitmgr import trade_capture
 
 import daily_recommend as dr
+from tests._stage_stub import stub_stage_a
 
 
 LIM = RiskLimits()
@@ -80,7 +81,7 @@ def _wire_trader(monkeypatch, propose_ret):
     monkeypatch.setattr(trader, "_market_open", lambda: True)
     monkeypatch.setattr(trader, "get_pot_snapshot",
                         AsyncMock(return_value=PotSnapshot(1010.0, 9000.0, 1010.0)))
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: propose_ret)
+    stub_stage_a(monkeypatch, lambda *a, **k: propose_ret)
     monkeypatch.setattr(trader.approval, "post_proposal", lambda *a, **k: "ts1")
     monkeypatch.setattr(trader.approval, "await_approval", lambda *a, **k: "approve")
 

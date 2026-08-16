@@ -271,6 +271,18 @@ def _as_dict(obj):
                 d = {k: v for k, v in vars(obj).items() if not k.startswith("_")}
             else:
                 return {"repr": _cap(repr(obj), 2000)}
+        # PROVENANCE. apply_deterministic_construction() overwrites target_dte/target_delta
+        # IN PLACE and keeps the model's own numbers as ad-hoc attributes -- which asdict() does
+        # not emit, because they are not declared fields. Without this the rule's expiry and delta
+        # are captured as the model's choice and any corpus built from these rows is poisoned.
+        if not isinstance(obj, dict):
+            _model_dte = getattr(obj, "model_target_dte", None)
+            if _model_dte is not None:
+                d = dict(d)
+                d["model_target_dte"] = _model_dte
+                d["model_target_delta"] = getattr(obj, "model_target_delta", None)
+                d["construction_overridden"] = True
+
         # strip un-serializable values (e.g. qualified IB contracts)
         out = {}
         for k, v in d.items():

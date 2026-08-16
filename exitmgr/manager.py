@@ -2190,7 +2190,10 @@ class ExitManager:
         token = os.environ.get("SLACK_BOT_TOKEN", "")
         if not (channel and token):
             return
-        tsf = os.path.expanduser("~/exitmgr-app/.reconcile_alert_ts")
+        # Same no-override live-path pattern as _MGMT_ALERTED_PATH above: a test that reaches
+        # this branch would write (and rate-limit against) the real file.
+        tsf = (os.environ.get("EXITMGR_RECONCILE_TS_PATH")
+               or os.path.expanduser("~/exitmgr-app/.reconcile_alert_ts"))
         try:
             if os.path.exists(tsf) and (time.time() - os.path.getmtime(tsf)) < 1800:
                 return
@@ -3096,7 +3099,18 @@ class ExitManager:
     #: Holds remain in the audit log and in the per-mark dataset capture.
     MGMT_ALERT_ACTIONS = ("arm_trail", "tighten_stop", "take_profit", "cut")
 
-    _MGMT_ALERTED_PATH = os.path.expanduser("~/.local/var/exitmgr/mgmt-alerted.json")
+    #: Alert-dedup cache location. Resolved at CALL time from EXITMGR_MGMT_ALERTED_PATH so a
+    #: test can point it at tmp_path. It used to be a fixed real path with no override, and
+    #: because conftest's Slack guard returns True (to exercise the dedupe/retry logic), every
+    #: alerting test PERSISTED its fingerprints into live state. A fingerprint written for a
+    #: con_id that is still open at the next restart makes the manager think that position was
+    #: already paged and silently swallow its first real management alert.
+    _MGMT_ALERTED_ENV = "EXITMGR_MGMT_ALERTED_PATH"
+    _MGMT_ALERTED_DEFAULT = os.path.expanduser("~/.local/var/exitmgr/mgmt-alerted.json")
+
+    @property
+    def _MGMT_ALERTED_PATH(self) -> str:
+        return os.environ.get(self._MGMT_ALERTED_ENV) or self._MGMT_ALERTED_DEFAULT
 
     def _load_mgmt_alerted(self) -> dict:
         """Alert-dedup cache, persisted so a restart does not re-page decisions already sent.

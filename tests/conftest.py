@@ -27,6 +27,13 @@ def isolate_dataset_dir(tmp_path, monkeypatch):
     v6dir = tmp_path / "trade_capture_isolated"
     v6dir.mkdir(exist_ok=True)
     monkeypatch.setenv("TRADE_CAPTURE_DIR", str(v6dir))
+    # LIVE ALERT STATE isolation (2026-08-16). ExitManager's alert-dedup cache and the reconcile
+    # alert rate-limit stamp were fixed real paths, so alerting tests wrote their fingerprints into
+    # ~/.local/var/exitmgr/mgmt-alerted.json -- and the Slack guard below returns True, which makes
+    # the persist path fire every time rather than occasionally. A fingerprint left there for a
+    # still-open con_id suppresses that position's next REAL management alert.
+    monkeypatch.setenv("EXITMGR_MGMT_ALERTED_PATH", str(tmp_path / "mgmt-alerted.json"))
+    monkeypatch.setenv("EXITMGR_RECONCILE_TS_PATH", str(tmp_path / "reconcile_alert_ts"))
     yield str(ddir)
 
 

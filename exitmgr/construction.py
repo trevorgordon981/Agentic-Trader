@@ -624,7 +624,7 @@ def _as_date(x):
         return None
 
 
-def earnings_ok(entry_date, expiry, earnings_date, cons):
+def earnings_ok(entry_date, expiry, earnings_date, cons, hold_days=None):
     """Earnings-blackout gate for DEBIT structures (long options / debit verticals).
 
     A debit trade held THROUGH an earnings print is an IV-crush loser by construction: once
@@ -665,9 +665,33 @@ def earnings_ok(entry_date, expiry, earnings_date, cons):
     except (TypeError, ValueError):
         buf = 0
     cutoff = xp + timedelta(days=max(0, buf))
+    window = f"on/before expiry {xp.isoformat()}" if buf == 0 else \
+             f"on/before expiry {xp.isoformat()} +{buf}d cushion ({cutoff.isoformat()})"
+
+    # HOLD-WINDOW MODE (2026-08-16). Under the long-dated doctrine expiry is ~8x the hold, so
+    # comparing earnings to EXPIRY rejects almost every name. What the gate protects against is
+    # being OPEN through the crush, so judge the window the position is actually open for.
+    # hold * slip_mult, because the trade that is not working is the one that gets held. Falls
+    # back to the strict expiry cutoff whenever the hold is missing or unusable.
+    if bool(getattr(cons, "earnings_use_hold_window", False)) and en is not None:
+        try:
+            _hold = int(hold_days) if hold_days is not None else None
+        except (TypeError, ValueError):
+            _hold = None
+        if _hold and _hold > 0:
+            try:
+                _mult = float(getattr(cons, "earnings_hold_slip_mult", 2.0) or 2.0)
+            except (TypeError, ValueError):
+                _mult = 2.0
+            _mult = max(1.0, _mult)
+            _hold_cut = en + timedelta(days=int(round(_hold * _mult)) + max(0, buf))
+            if _hold_cut < cutoff:          # shrink the window: earnings after the HOLD ends
+                                            # are irrelevant, so a nearer cutoff = more permissive
+                cutoff = _hold_cut
+                window = (f"within {_hold}d intended hold x{_mult:g} slip "
+                          f"(through {cutoff.isoformat()}; expiry {xp.isoformat()})")
+
     if ea <= cutoff:
-        window = f"on/before expiry {xp.isoformat()}" if buf == 0 else \
-                 f"on/before expiry {xp.isoformat()} +{buf}d cushion ({cutoff.isoformat()})"
         return False, (f"earnings {ea.isoformat()} falls within the holding horizon "
                        f"({window}) -- debit held through earnings = IV-crush loser")
     return True, ""
@@ -744,3 +768,59 @@ def assignment_risk_ok(short_strike, spot, right, expiry, ex_div_date, dte, cons
     if bool(getattr(cons, "assignment_block_hard", False)):
         return False, reason
     return True, reason  # WARN (default): pass but SURFACE the risk (caller flags :warning:)
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic construction (2026-08-16). See DETERMINISTIC_CONSTRUCTION note.
+# --------------------------------------------------------------------------- #
+DOCTRINE_HOLD_MULTIPLE = 8       # measured winner: ~8x the intended hold
+DOCTRINE_LONG_DELTA = 0.60       # doctrine_real's long-leg delta
+DOCTRINE_MAX_DTE = 800           # the schema's ceiling; nothing caps below this
+DOCTRINE_MIN_HOLD = 5            # a hold under this is almost always a typo or a scalp
+
+
+def deterministic_expiry(intended_hold_days, min_dte, max_dte=DOCTRINE_MAX_DTE):
+    """target_dte from the hold, not from the model.
+
+    Returns None when the hold is unusable, so the caller can leave the model's own number
+    alone rather than inventing one from a bad input.
+    """
+    try:
+        hold = int(intended_hold_days)
+    except (TypeError, ValueError):
+        return None
+    if hold < DOCTRINE_MIN_HOLD:
+        return None
+    dte = hold * DOCTRINE_HOLD_MULTIPLE
+    return int(max(int(min_dte), min(int(max_dte), dte)))
+
+
+def apply_deterministic_construction(idea, min_dte, enabled=True):
+    """Overwrite expiry/delta on a parsed idea, preserving what the model chose.
+
+    Mutates and returns the idea. A credit-side idea is returned untouched: the CSP path has
+    its own 3-45 DTE write window where theta works FOR the writer, and the debit doctrine
+    must never be plumbed into it.
+    """
+    if not enabled or idea is None:
+        return idea
+    if str(getattr(idea, "side", "debit") or "debit").lower() == "credit":
+        return idea
+
+    dte = deterministic_expiry(getattr(idea, "intended_hold_days", None), min_dte)
+    if dte is None:
+        return idea
+
+    # keep the model's numbers for the audit trail and future A/Bs
+    if not hasattr(idea, "model_target_dte") or idea.model_target_dte is None:
+        try:
+            object.__setattr__(idea, "model_target_dte", getattr(idea, "target_dte", None))
+            object.__setattr__(idea, "model_target_delta", getattr(idea, "target_delta", None))
+        except Exception:
+            pass
+    try:
+        object.__setattr__(idea, "target_dte", dte)
+        object.__setattr__(idea, "target_delta", DOCTRINE_LONG_DELTA)
+    except Exception:
+        return idea
+    return idea

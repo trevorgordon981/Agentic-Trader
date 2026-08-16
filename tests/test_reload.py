@@ -30,6 +30,7 @@ from exitmgr.account import PotSnapshot
 from exitmgr.config import Config, RulesConfig, TrailingConfig, StateConfig, JournalConfig, LoopConfig
 from exitmgr.manager import ExitManager
 from exitmgr import position_manager, reload_queue
+from tests._stage_stub import stub_stage_a
 
 
 # ============================ 1. reload verb parse (position_manager) ============================
@@ -218,7 +219,7 @@ def test_drain_depth_cap(tmp_path):
 
 def test_friction_rejects_low_conviction():
     ok, why, _ = reload_queue.reload_friction_ok(
-        reload_conviction=4, conviction_min=6, tp_pct=30.0, new_debit=800.0, qty=1,
+        reload_conviction=4, conviction_min=6, expected_continuation_pct=30.0, new_debit=800.0, qty=1,
         is_spread=False, theta_per_share=-0.1, entry_spread_pct=2.0, k=1.5)
     assert not ok and "conviction" in why
 
@@ -226,14 +227,14 @@ def test_friction_rejects_low_conviction():
 def test_friction_rejects_bad_economics():
     # tiny expected continuation vs. heavy theta -> churn, rejected
     ok, why, _ = reload_queue.reload_friction_ok(
-        reload_conviction=9, conviction_min=6, tp_pct=1.0, new_debit=100.0, qty=1,
+        reload_conviction=9, conviction_min=6, expected_continuation_pct=1.0, new_debit=100.0, qty=1,
         is_spread=False, theta_per_share=-5.0, entry_spread_pct=1.0, k=1.5)
     assert not ok and "continuation" in why
 
 
 def test_friction_passes_good_reload():
     ok, why, detail = reload_queue.reload_friction_ok(
-        reload_conviction=8, conviction_min=6, tp_pct=30.0, new_debit=800.0, qty=1,
+        reload_conviction=8, conviction_min=6, expected_continuation_pct=30.0, new_debit=800.0, qty=1,
         is_spread=False, theta_per_share=-0.05, entry_spread_pct=1.0, k=1.5)
     assert ok and detail["expected_continuation"] == pytest.approx(240.0)
 
@@ -286,7 +287,7 @@ def _seed_reload(tmp_path, sym="NVDA", conv=8):
 
 @pytest.mark.asyncio
 async def test_reload_routed_through_normal_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [])   # no strategist ideas
+    stub_stage_a(monkeypatch, lambda *a, **k: [])                # no strategist ideas
     _seed_reload(tmp_path)
     t, ibc, em = _trader(tmp_path, reload_enabled=True)
     ibc.get_positions = AsyncMock(return_value={})              # just-vacated slot: book empty
@@ -299,7 +300,7 @@ async def test_reload_routed_through_normal_path(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_reload_deferred_while_close_in_flight(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [])
+    stub_stage_a(monkeypatch, lambda *a, **k: [])
     _seed_reload(tmp_path)
     t, ibc, em = _trader(tmp_path, reload_enabled=True)
     ibc.get_positions = AsyncMock(return_value={})
@@ -314,7 +315,7 @@ async def test_reload_deferred_while_close_in_flight(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_reload_friction_rejects_churn(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [])
+    stub_stage_a(monkeypatch, lambda *a, **k: [])
     _seed_reload(tmp_path, conv=3)                              # below reload_conviction_min (6)
     t, ibc, em = _trader(tmp_path, reload_enabled=True)
     ibc.get_positions = AsyncMock(return_value={})
@@ -328,7 +329,7 @@ async def test_reload_inherits_entry_throttle(tmp_path, monkeypatch):
     # one reload + one strategist idea, per-cycle cap = 1. The reload runs FIRST and consumes the
     # single allowed order; the strategist idea is then throttled -> proves the reload counts
     # against max_orders_per_cycle (no cap bypass).
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [NVDA_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [NVDA_IDEA])
     _seed_reload(tmp_path)
     t, ibc, em = _trader(tmp_path, reload_enabled=True, max_orders_per_cycle=1)
     ibc.get_positions = AsyncMock(return_value={})
@@ -339,7 +340,7 @@ async def test_reload_inherits_entry_throttle(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_feature_off_is_exact_noop(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [])
+    stub_stage_a(monkeypatch, lambda *a, **k: [])
     _seed_reload(tmp_path)
     t, ibc, em = _trader(tmp_path)                              # reload_enabled defaults False
     ibc.get_positions = AsyncMock(return_value={})

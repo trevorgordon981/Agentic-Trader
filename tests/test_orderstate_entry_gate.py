@@ -22,6 +22,7 @@ from exitmgr.strategist import TradeIdea
 from exitmgr.account import PotSnapshot
 from exitmgr.state import StateManager, InFlightClose
 from exitmgr.connection import PositionData
+from tests._stage_stub import stub_stage_a
 
 # max_concurrent = 8 (live value). Small per-trade sizes so only the count/name caps bind.
 LIM = RiskLimits(max_concurrent=8)
@@ -80,7 +81,7 @@ def _hermetic(monkeypatch):
 # --------------------------------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_name_closed_in_exit_cycle_not_counted_by_entry_gate(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [SPY_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [SPY_IDEA])
     t, ibc, em = _trader(tmp_path)
 
     # PRE-exit book = 8 open positions (== max_concurrent -> a new entry would be blocked).
@@ -107,7 +108,7 @@ async def test_name_closed_in_exit_cycle_not_counted_by_entry_gate(tmp_path, mon
 async def test_stale_book_would_have_blocked_regression_guard(tmp_path, monkeypatch):
     """Control: if the book DID NOT change (8 both before and after), the concurrent cap still
     binds and the entry is blocked -- proves the pass above is due to the close, not a loosened gate."""
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [SPY_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [SPY_IDEA])
     t, ibc, em = _trader(tmp_path)
     full = {i: _pos(1000 + i, f"SYM{i}") for i in range(8)}
     ibc.get_positions = AsyncMock(return_value=full)
@@ -123,7 +124,7 @@ async def test_stale_book_would_have_blocked_regression_guard(tmp_path, monkeypa
 async def test_intracycle_sequential_gating_still_blocks_second_idea(tmp_path, monkeypatch):
     # Two SPY ideas in one cycle, book starts at 7/8 open. First fills -> book effectively 8/8 ->
     # the SECOND idea must be blocked by max_concurrent WITHIN the same cycle (append is honored).
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [SPY_IDEA, SPY_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [SPY_IDEA, SPY_IDEA])
     t, ibc, em = _trader(tmp_path)
     seven = {i: _pos(1000 + i, f"SYM{i}") for i in range(7)}
     ibc.get_positions = AsyncMock(return_value=seven)
@@ -140,7 +141,7 @@ async def test_fresh_and_stale_book_use_same_path(tmp_path, monkeypatch):
     # With an unchanged book, the pre-exit `positions` and the post-exit `entry_positions` are byte-
     # identical (same method, same inputs). Verified indirectly: a 5-position book leaves room, the
     # single SPY idea is submitted, and _open_positions() was called at least twice (pre + post-exit).
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [SPY_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [SPY_IDEA])
     t, ibc, em = _trader(tmp_path)
     five = {i: _pos(1000 + i, f"SYM{i}") for i in range(5)}
     ibc.get_positions = AsyncMock(return_value=five)
@@ -167,7 +168,7 @@ def _sell_trade(symbol, status="Submitted"):
 
 @pytest.mark.asyncio
 async def test_entry_deferred_when_resting_close_on_same_underlying(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [NVDA_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [NVDA_IDEA])
     t, ibc, em = _trader(tmp_path, resolve_sym="NVDA")
     ibc.get_positions = AsyncMock(return_value={})
     # a resting SELL-to-close on NVDA is working right now
@@ -179,7 +180,7 @@ async def test_entry_deferred_when_resting_close_on_same_underlying(tmp_path, mo
 
 @pytest.mark.asyncio
 async def test_entry_deferred_when_state_inflight_close_on_same_underlying(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [NVDA_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [NVDA_IDEA])
     sm = StateManager(str(tmp_path / "state.json"))
     sm.state.add_in_flight(InFlightClose(con_id=555, order_id=7, remaining_qty=1, entry_debit=90.0))
     t, ibc, em = _trader(tmp_path, resolve_sym="NVDA", state_manager=sm)
@@ -192,7 +193,7 @@ async def test_entry_deferred_when_state_inflight_close_on_same_underlying(tmp_p
 
 @pytest.mark.asyncio
 async def test_entry_proceeds_once_close_is_gone(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [NVDA_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [NVDA_IDEA])
     t, ibc, em = _trader(tmp_path, resolve_sym="NVDA")
     ibc.get_positions = AsyncMock(return_value={})
     ibc.ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])   # no close in flight anymore
@@ -202,7 +203,7 @@ async def test_entry_proceeds_once_close_is_gone(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unrelated_underlying_close_does_not_defer(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [NVDA_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [NVDA_IDEA])
     t, ibc, em = _trader(tmp_path, resolve_sym="NVDA")
     ibc.get_positions = AsyncMock(return_value={})
     # a resting close on AMD must NOT block an NVDA entry
@@ -214,7 +215,7 @@ async def test_unrelated_underlying_close_does_not_defer(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_terminal_status_close_does_not_defer(tmp_path, monkeypatch):
     # a SELL order already Filled/Cancelled is NOT in-flight -> must not defer.
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: [NVDA_IDEA])
+    stub_stage_a(monkeypatch, lambda *a, **k: [NVDA_IDEA])
     t, ibc, em = _trader(tmp_path, resolve_sym="NVDA")
     ibc.get_positions = AsyncMock(return_value={})
     ibc.ib.reqAllOpenOrdersAsync = AsyncMock(

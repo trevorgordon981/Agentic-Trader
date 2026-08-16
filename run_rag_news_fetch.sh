@@ -7,7 +7,7 @@
 set -euo pipefail
 
 STAGE="$HOME/rag-news-stage"
-NODE4_NEWS="/path/to/rag-data/news/"
+NODE4_NEWS="/home/node4/alfred-rag-active/data/news/"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] rag-news: fetching headlines"
 python3 "$HOME/exitmgr-app/rag_news_fetch.py"

@@ -138,6 +138,8 @@ def main(
         reload_enabled=bool(getattr(cfg, "reload_enabled", False)),
         reload_conviction_min=float(getattr(cfg, "reload_conviction_min", 6)),
         reload_friction_k=float(getattr(cfg, "reload_friction_k", 1.5)),
+        reload_expected_continuation_pct=float(
+            getattr(cfg, "reload_expected_continuation_pct", 3.0)),
         reload_max_per_name_per_day=int(getattr(cfg, "reload_max_per_name_per_day", 2)),
         reload_ttl_cycles=int(getattr(cfg, "reload_ttl_cycles", 3)),
     )

@@ -63,6 +63,14 @@ def _wire(monkeypatch, posts, days_to_earnings):
     monkeypatch.setattr(trader, "get_pot_snapshot",
                         AsyncMock(return_value=PotSnapshot(1010.0, 9000.0, 1010.0)))
     monkeypatch.setattr(trader, "propose", lambda *a, **k: [IDEA])
+    # The entry loop is two-stage now: propose_intents (A) -> _materialize_stage_b (B).
+    # Patching only `propose` left Stage A hitting a live endpoint (URLError -> no ideas
+    # -> every assertion below fails), which is what made these tests red.
+    monkeypatch.setattr(trader, "propose_intents",
+                        lambda *a, **k: ([IDEA], "", None, None))
+    async def _stage_b(self, intents, pot):
+        return list(intents or [])
+    monkeypatch.setattr(trader.Trader, "_materialize_stage_b", _stage_b)
     monkeypatch.setattr(trader.approval, "post_proposal",
                         lambda tok, ch, txt: posts.append(txt) or "ts1")
     monkeypatch.setattr(trader.approval, "await_approval", lambda *a, **k: "approve")

@@ -17,6 +17,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 import exitmgr.trader as trader
+from exitmgr.entry_reservation import EntryReservationLedger, ReservationDecision
 from exitmgr.trader import (
     CREDIT_MAX_COLLATERAL_PCT, CSP_STRUCTURE, ResolvedOrder, Trader, capital_at_risk,
     capital_committed, collateral_capacity, contract_snapshot, credit_structure_ok,
@@ -25,6 +26,7 @@ from exitmgr.trader import (
 from exitmgr.account import PotSnapshot
 from exitmgr.risk import RiskLimits
 from exitmgr.strategist import TradeIdea
+from tests._stage_stub import stub_stage_a
 
 
 # --------------------------------------------------------------------------- builders / fixtures
@@ -150,7 +152,14 @@ def _trader(tmp_path, monkeypatch, *, net_liq=100_000.0, available=60_000.0,
                journal_path=str(tmp_path / "trades.log"),
                config_path=str(tmp_path / "config.yaml"),
                trading_down_path=str(tmp_path / "TRADING_DOWN"),
-               kill_switch_path=str(tmp_path / "KILL_SWITCH"))
+               kill_switch_path=str(tmp_path / "KILL_SWITCH"),
+               # Per-test ledger. Without this the Trader falls back to the LIVE
+               # /tmp/alfred-entry-reservations.json that the armed entry loop reads, so the
+               # suite injected phantom collateral into a real-money admission path -- and
+               # reservations retained between tests poisoned three cases downstream.
+               entry_reservation_ledger=EntryReservationLedger(
+                   ledger_path=tmp_path / "reservations.json",
+                   lock_path=tmp_path / "reservations.lock"))
     return t
 
 
@@ -303,7 +312,10 @@ async def test_invariant2_valid_csp_builds_the_right_sell_put_order(tmp_path, mo
 async def test_invariant2_insufficient_cash_REFUSES(tmp_path, monkeypatch):
     """$4,000 of buying power cannot secure a $5,000 put. Refusal is the correct outcome."""
     t = _trader(tmp_path, monkeypatch, net_liq=100_000.0, available=4_000.0)
-    with pytest.raises(RuntimeError, match="insufficient cash to secure the put"):
+    # The cash limb moved from the inline collateral check into reserve_credit_entry ->
+    # EntryReservationLedger.reserve, which subtracts OUTSTANDING PENDING reservations too
+    # (entry_reservation.py:346-358) -- a strictly tighter gate. Only the wording changed.
+    with pytest.raises(RuntimeError, match="insufficient unreserved funds"):
         await t._submit_order(_csp_order(strike=50.0, qty=1))
     t.ib_conn.ib.placeOrder.assert_not_called()
     assert _journal_rows(tmp_path) == []               # and nothing is orphaned in the journal
@@ -338,7 +350,12 @@ async def test_NEGATIVE_CONTROL_invariant2_submit_recheck_is_what_stops_it(tmp_p
     assert frozen.allowed
 
     trader.get_pot_snapshot.return_value = PotSnapshot(100_000.0, 1_000.0, 1_000.0)
-    t._credit_capacity = AsyncMock(return_value=(frozen, frozen_detail))   # <-- the bug
+    # Freeze the LIVE seam. _submit_order_unlocked calls module-level reserve_credit_entry
+    # (trader.py:2806), not t._credit_capacity -- patching the instance attribute injected
+    # nothing and this control silently proved nothing.
+    _allow = ReservationDecision(True, True, "reserved", (), order_ref=r.decision_id)
+    monkeypatch.setattr(trader, "reserve_credit_entry",
+                        AsyncMock(return_value=(_allow, None, None)))   # <-- the bug
     await t._submit_order(r)
     t.ib_conn.ib.placeOrder.assert_called_once()
     assert t.ib_conn.ib.placeOrder.call_args[0][1].action == "SELL"
@@ -432,7 +449,11 @@ async def test_NEGATIVE_CONTROL_invariant3_ignoring_the_book_would_let_it_throug
     the exact 'this trade fits, so it's fine' bug invariant 3 names."""
     t = _trader(tmp_path, monkeypatch, net_liq=100_000.0, available=90_000.0,
                 positions=[_short_put_position(strike=300.0, qty=-2)])
-    t._deployed_collateral = AsyncMock(return_value=0.0)                 # <-- the bug
+    # The reservation reads the book via module-level broker_csp_collateral_snapshot
+    # (trader.py:337); an instance patch on _deployed_collateral cannot shadow it.
+    monkeypatch.setattr(trader, "broker_csp_collateral_snapshot",
+                        AsyncMock(return_value=trader.BrokerCollateralSnapshot(
+                            0.0, frozenset(), frozenset())))             # <-- the bug
     await t._submit_order(_csp_order(strike=250.0, qty=1))
     t.ib_conn.ib.placeOrder.assert_called_once()
 
@@ -440,11 +461,15 @@ async def test_NEGATIVE_CONTROL_invariant3_ignoring_the_book_would_let_it_throug
 def test_invariant3_risk_gate_measures_the_full_collateral_not_the_credit():
     """plan_idea must hand the SOLVENCY layer the cash the trade ties up. Measuring the $120
     credit instead would wave a $50,000 commitment through every cap in risk.py."""
-    idea = _csp_idea(strike=500.0, contracts=1, credit=120.0)            # $50,000 collateral
+    # Sized to $85,000 because _credit_limits (trader.py:540-573, the 2026-07-27 "80% of the
+    # pot for CSPs" ruling) raises per-trade/name/sector caps to 0.80 for CREDIT ideas. Measured
+    # boundary: $80,000 -> needs_approval, $85,000 -> gate_rejected. At $50,000 this asserted a
+    # 12% cap that no longer applies to credit, and could not fail.
+    idea = _csp_idea(strike=850.0, contracts=1, credit=120.0)            # $85,000 collateral
     plan = plan_idea(idea, net_liq=100_000.0, available_funds=90_000.0, positions=[],
                      baseline=100_000.0, approved_names={"SPY"}, limits=RiskLimits())
-    assert plan.trade.notional == 50_000.0
-    assert plan.action == "gate_rejected"                                # 12% per-trade cap binds
+    assert plan.trade.notional == 85_000.0        # collateral, NOT the $120 credit -- the invariant
+    assert plan.action == "gate_rejected"                                # 80%-of-pot CSP cap binds
     small = _csp_idea(strike=50.0, contracts=1, credit=120.0)            # $5,000 collateral
     assert plan_idea(small, net_liq=100_000.0, available_funds=90_000.0, positions=[],
                      baseline=100_000.0, approved_names={"SPY"},
@@ -462,7 +487,9 @@ def test_invariant3_credit_idea_with_unusable_collateral_can_only_be_rejected():
 def test_NEGATIVE_CONTROL_gate_on_credit_received_would_pass_the_oversized_put():
     """If plan_idea had used net_credit_usd, the $50,000 CSP above would read as a $120 trade
     and clear the gate. Shown explicitly so the choice of notional is provably load-bearing."""
-    idea = _csp_idea(strike=500.0, contracts=1, credit=120.0)
+    # 850 to match the test above: at strike 500 the honest $50,000 case ALSO returned
+    # needs_approval, so this control distinguished nothing and passed vacuously.
+    idea = _csp_idea(strike=850.0, contracts=1, credit=120.0)
     idea.collateral_usd = idea.net_credit_usd                            # <-- the bug
     plan = plan_idea(idea, net_liq=100_000.0, available_funds=90_000.0, positions=[],
                      baseline=100_000.0, approved_names={"SPY"}, limits=RiskLimits())
@@ -501,7 +528,7 @@ async def test_invariant4_trading_down_stops_a_credit_idea_before_it_is_ever_pro
     monkeypatch.setattr(trader.approval, "await_approval",
                         lambda *a, **k: pytest.fail("must never seek approval under TRADING_DOWN"))
     called = []
-    monkeypatch.setattr(trader, "propose", lambda *a, **k: called.append(1) or [_csp_idea()])
+    stub_stage_a(monkeypatch, lambda *a, **k: called.append(1) or [_csp_idea()])
     t = _trader(tmp_path, monkeypatch, trading_down=True)
     t.exit_manager.run_cycle = AsyncMock()
     t._submit_order = AsyncMock()

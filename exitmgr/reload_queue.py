@@ -168,7 +168,8 @@ class ReloadQueue:
         return ready, {"expired": expired, "capped": capped, "ready": len(ready)}
 
 
-def reload_friction_ok(*, reload_conviction, conviction_min, tp_pct, new_debit, qty, is_spread,
+def reload_friction_ok(*, reload_conviction, conviction_min, expected_continuation_pct,
+                       new_debit, qty, is_spread,
                        theta_per_share, entry_spread_pct, k,
                        commission_per_contract: float = 0.65,
                        min_slippage_frac: float = 0.005) -> Tuple[bool, str, dict]:
@@ -177,8 +178,13 @@ def reload_friction_ok(*, reload_conviction, conviction_min, tp_pct, new_debit, 
       (2) expected continuation (clamped tp% x new debit) exceeds k x total friction, where friction
           = fresh-entry commission + one-cycle theta + entry slippage.
 
-    Pure function (no I/O) so it is trivially unit-testable. tp_pct is in PERCENT units (30.0 == 30%),
-    matching construction.clamp_tp_sl output. theta_per_share is the long-leg per-share/day theta
+    Pure function (no I/O) so it is trivially unit-testable. expected_continuation_pct is in
+    PERCENT units (30.0 == 30%). It USED to be construction.clamp_tp_sl's take-profit output, but
+    the R5/R2 ruling made that limb optional and it is None on every real order -- which made the
+    numerator a structural zero and rejected 100% of reloads from 2026-07-26 until this fix. The
+    caller now supplies the ticket's own realized gain (100 * realized_pnl / original_debit), a
+    measured number rather than a retired mechanism's output. None/0 means "no estimate", and the
+    gate refuses with that reason stated rather than reporting a computed-looking $0.00. theta_per_share is the long-leg per-share/day theta
     (usually negative); entry_spread_pct is the bid/ask spread as a percent of mid. Returns
     (ok, reason, detail) -- detail carries the component numbers for the audit trail.
     """
@@ -191,6 +197,17 @@ def reload_friction_ok(*, reload_conviction, conviction_min, tp_pct, new_debit, 
     if conv is None or conv < cmin:
         return False, f"reload_conviction {conv} < min {cmin:g}", {"reload_conviction": conv,
                                                                     "conviction_min": cmin}
+    # No estimate is NOT the same as an estimate of zero. Say which one it is: a structural
+    # zero masquerading as a computed continuation is exactly what hid this gate's failure.
+    try:
+        _ecp = None if expected_continuation_pct is None else float(expected_continuation_pct)
+    except (TypeError, ValueError):
+        _ecp = None
+    if _ecp is None or _ecp <= 0.0:
+        return False, ("no continuation estimate on ticket (realized_pnl / original_debit missing "
+                       "or non-positive) -- cannot judge friction"), {
+            "expected_continuation_pct": _ecp, "reload_conviction": conv}
+
     debit = max(0.0, float(new_debit or 0.0))
     q = max(1, int(qty or 1))
     legs = 2 if is_spread else 1
@@ -199,8 +216,10 @@ def reload_friction_ok(*, reload_conviction, conviction_min, tp_pct, new_debit, 
     slip_frac = max(float(entry_spread_pct or 0.0) / 100.0, float(min_slippage_frac))
     slippage = slip_frac * debit
     friction = commission + theta_cost + slippage
-    expected = (float(tp_pct or 0.0) / 100.0) * debit
-    detail = {"expected_continuation": round(expected, 2), "commission": round(commission, 2),
+    expected = (_ecp / 100.0) * debit
+    detail = {"expected_continuation": round(expected, 2),
+              "expected_continuation_pct": round(_ecp, 2),
+              "commission": round(commission, 2),
               "theta_cost": round(theta_cost, 2), "slippage": round(slippage, 2),
               "friction": round(friction, 2), "k": float(k), "reload_conviction": conv}
     if expected > float(k) * friction:

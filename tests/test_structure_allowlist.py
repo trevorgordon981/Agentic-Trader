@@ -194,6 +194,23 @@ def test_bypass1_naked_call_used_to_construct_and_now_refuses():
     assert "long call" in str(exc.value)             # the permitted set is named
 
 
+def _cmp_ignoring_hold(new_idea, legacy_idea):
+    """Compare a post-fix idea to the frozen pre-fix reference.
+
+    `intended_hold_days` is excluded on purpose: it was ADDED to user_directed_idea on
+    2026-08-12 because the user-directed route journalled a null there, and that field is the
+    denominator of the 5-8x DTE doctrine check -- a null makes a filled position un-auditable.
+    The legacy helper is a snapshot of pre-fix behaviour and must not learn new fields, so the
+    field is checked separately instead of being folded into the equality.
+    """
+    a, b = asdict(new_idea), asdict(legacy_idea)
+    a.pop("intended_hold_days", None)
+    b.pop("intended_hold_days", None)
+    assert a == b
+    assert new_idea.intended_hold_days is not None, "post-fix builder must set a hold"
+    assert new_idea.intended_hold_days > 0
+
+
 def test_bypass1_differential_permitted_identical_banned_refused():
     """THE DIFFERENTIAL. Over the full cross-product of structures x --right x every other flag
     that reaches the constructor: an accepted idea must be FIELD-FOR-FIELD identical to the
@@ -220,7 +237,8 @@ def test_bypass1_differential_permitted_identical_banned_refused():
                                     continue
                                 accepted += 1
                                 assert should, f"{structure!r}/{right} wrongly accepted"
-                                assert asdict(got) == asdict(legacy)   # byte-identical idea
+                                _cmp_ignoring_hold(got, legacy)   # identical but for the
+                                # 2026-08-12 intended_hold_days addition (see helper)
     # 38 structures x 4 --right spellings x 5 dte x 3 delta x 3 conviction x 2 tp/stop x 2 ticker
     # = 27,360 cases. Accepted = 180 flag combinations x 32 (structure, --right) pairs:
     #   10 right-naming permitted structures  -> consistent with 2 of the 4 --right spellings = 20
@@ -231,7 +249,8 @@ def test_bypass1_differential_permitted_identical_banned_refused():
 
 def test_bypass1_default_structure_path_is_untouched():
     """No --structure at all: the historical default, unchanged."""
-    assert asdict(user_directed_idea(_args("", "C"))) == asdict(_legacy_user_directed_idea(_args("", "C")))
+    _cmp_ignoring_hold(user_directed_idea(_args("", "C")),
+                       _legacy_user_directed_idea(_args("", "C")))
     assert user_directed_idea(_args("", "C")).structure == "long call"
     assert user_directed_idea(_args("", "P")).structure == "long put"
 
@@ -665,6 +684,14 @@ def _spy_idea(structure, direction="bullish"):
 
 async def _run_entry_loop(t, monkeypatch, idea):
     monkeypatch.setattr(trader_mod, "propose", lambda *a, **k: [idea])
+    # Entry loop is two-stage: propose_intents (A) -> _materialize_stage_b (B).
+    # Patching only `propose` let Stage A hit a live endpoint (URLError, 4 retries,
+    # no ideas), so these asserted against an empty run.
+    monkeypatch.setattr(trader_mod, "propose_intents",
+                        lambda *a, **k: ((lambda *a, **k: [idea])(*a, **k), "", None, None))
+    async def _stage_b_passthrough(self, intents, pot):
+        return list(intents or [])
+    monkeypatch.setattr(trader_mod.Trader, "_materialize_stage_b", _stage_b_passthrough)
     t.exit_manager.run_cycle = AsyncMock()
     t._entry_markers_clear = lambda: trader_mod.entry_safety.SafetyResult(True, ())
     t._resolve_order = AsyncMock(return_value=None)

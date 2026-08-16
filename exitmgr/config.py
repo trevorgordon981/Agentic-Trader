@@ -116,6 +116,14 @@ class ConstructionConfig:
     tp_min_pct: float = 0.25                   # model TP clamped into [tp_min, tp_max]
     tp_max_pct: float = 0.35
     sl_pct: float = -0.30                      # default stop = -30% of debit (was -50%)
+    # 2026-08-16: when true, target_dte/target_delta come from the doctrine rule rather
+    # than the model. duel n=759: deterministic +12.4 GNA vs +5.9 best-scaffolded model
+    # vs -5.0 unguided; direction skill identical (p=0.77).
+    # DEFAULT FALSE and it must stay that way: this flag OVERWRITES the model's target_dte and
+    # target_delta, so a Config built without config.yaml (any script, tool, or test that does not
+    # load it) would silently rewrite the model's construction and, worse, capture the rule's
+    # numbers as the model's own. Opt in explicitly via config.yaml, never by omission.
+    deterministic_construction: bool = False
     max_premium_pct: float = 0.25              # premium per trade <= 25% of net-liq
     max_deployed_pct: float = 0.40             # total deployed premium <= 40% of net-liq
     max_decay_pct_per_day: float = 0.01        # (debit/DTE)/net-liq <= 1%/day per trade
@@ -145,6 +153,12 @@ class ConstructionConfig:
     earnings_blackout_enabled: bool = True     # block DEBIT trades that hold THROUGH an earnings
                                                # print (IV-crush loser by construction). Fail-open
                                                # when the earnings date is unknown (caller flags it).
+    # 2026-08-16: judge the gate against the INTENDED HOLD rather than expiry. Needed
+    # because the long-dated doctrine puts expiry ~8x the hold, and earnings every ~90d
+    # means "earnings <= expiry" rejects the whole universe at 168 DTE. Default FALSE:
+    # turning it on is a deliberate act, and a missing hold always falls back to strict.
+    earnings_use_hold_window: bool = False
+    earnings_hold_slip_mult: float = 2.0       # holds slip; check hold x this, not hold
     earnings_blackout_days: int = 0            # cushion days BEYOND expiry also treated as blackout
                                                # (0 => block iff earnings <= expiry).
     assignment_check_enabled: bool = True      # gate A6: SURFACE early-assignment / ex-dividend risk
@@ -176,6 +190,17 @@ def construction_from_dict(d: Optional[dict]) -> ConstructionConfig:
 
     d = dict(d)
     d[key] = value
+
+    # INTERLOCK: deterministic_construction pushes the expiry out to ~8x the intended hold, which
+    # lands past the plain earnings cutoff -- so with the hold-window earnings gate OFF, every
+    # entry is rejected and the trader goes quiet with no error. The two flags are one decision;
+    # enforce that in code rather than in a config comment nobody reads at 4am.
+    if d.get("deterministic_construction") and not d.get("earnings_use_hold_window", False):
+        print("[WARN] construction.deterministic_construction=true requires "
+              "earnings_use_hold_window=true (the doctrine expiry lands past the plain earnings "
+              "cutoff and would halt ALL entries). Enabling the hold-window gate.")
+        d["earnings_use_hold_window"] = True
+
     known = {f.name for f in ConstructionConfig.__dataclass_fields__.values()}
     return ConstructionConfig(**{k: v for k, v in d.items() if k in known})
 
@@ -363,6 +388,19 @@ def load_config(
                                                        # model's reload_conviction >= this
                    ('reload_friction_k', 1.5),         # friction gate: expected continuation must
                                                        # exceed k x (commission + 1-cycle theta + slippage)
+                   ('reload_expected_continuation_pct', 3.0),
+                                                       # friction gate NUMERATOR, in PERCENT. MEASURED
+                                                       # on byron (2026-08-16): re-entering a name the
+                                                       # day a harvest filled returned +1.9/+4.0/+2.7%
+                                                       # mean across +20/+30/+50% harvests, n=2138/1485/
+                                                       # 748, vs a +0.6/+1.2/+2.2% drift baseline.
+                                                       # It is a CONSTANT because the prior leg's gain
+                                                       # does NOT predict the next leg's:
+                                                       # corr = -0.052 / -0.005 / +0.092, and the
+                                                       # SMALLER first leg was often followed by the
+                                                       # better second one. Using the ticket's own
+                                                       # 28-61% gain here made the gate unable to
+                                                       # reject anything.
                    ('reload_max_per_name_per_day', 2), # anti-churn: <= this many reloads per name/day
                    ('reload_ttl_cycles', 3),           # a reload ticket expires after N exit cycles
                                                        # (stale continuation signal is dropped, never fired)

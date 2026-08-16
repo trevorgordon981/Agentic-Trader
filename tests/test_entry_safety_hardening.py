@@ -2,6 +2,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import time
+
 import pytest
 
 from exitmgr import entry_safety, risk
@@ -111,7 +113,14 @@ def test_confidence_never_waives_hard_concentration():
     decision = risk.evaluate_trade(
         risk.ProposedTrade("NVDA", 2_000, False, conviction=10),
         net_liq=10_000, available_funds=10_000,
-        open_positions=[risk.OpenPosition("AMD", 2_000, False)],
+        # SAME underlying as the proposed trade. Before 2026-08-13 `name_exposure` summed EVERY
+        # non-index position, so an AMD holding blocked an NVDA entry -- a "single-name" cap
+        # behaving portfolio-wide, which rejected every proposal outright and was fixed at
+        # risk.py:372. Correlated DIFFERENT names are #6b's job; the whole book is max_deployed_pct's.
+        # $2,000 existing + $2,000 proposed = $4,000 against the 36%-of-$10,000 = $3,600 cap, while
+        # the per-trade cap ($2,500) leaves the trade alone -- so concentration is the ONLY gate
+        # that can reject here, which is exactly the invariant under test.
+        open_positions=[risk.OpenPosition("NVDA", 2_000, False)],
         pot_day_start=10_000, approved_names={"NVDA", "AMD"}, limits=limits)
     assert not decision.approved
     assert any("single-name exposure" in x for x in decision.reasons)
@@ -127,7 +136,14 @@ async def test_trader_submit_refuses_stale_nbbo_before_place_order(tmp_path):
         slack_channel="", approver_ids=set(), baseline_path=str(tmp_path / "base"),
         audit_path=str(tmp_path / "audit"), config_path=str(tmp_path / "config.yaml"),
         kill_switch_path="./KILL_SWITCH", trading_down_path=tmp_path / "TRADING_DOWN")
-    stale = _resolved(observed=1.0)
+    # Stale RELATIVE TO NOW, not a magic constant. time.monotonic() starts near 0.0 per
+    # process here, so observed=1.0 was only 'stale' depending on WHEN in the process this
+    # ran: at ~0.8s in, age was -0.2 and it refused as 'clock moved backwards' (passing for
+    # the wrong reason); anywhere from ~1s to ~11s in, age landed INSIDE the 10s window and
+    # the order was ALLOWED THROUGH, placed, and then sat 22s waiting for a fill. One extra
+    # upstream test file was enough to move it into that band. The gate itself is correct.
+    stale = _resolved(
+        observed=time.monotonic() - (entry_safety.DEFAULT_NBBO_MAX_AGE_SECONDS + 60.0))
     with pytest.raises(RuntimeError, match="NBBO"):
         await trader._submit_order(stale)
     ib.placeOrder.assert_not_called()

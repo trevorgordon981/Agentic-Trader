@@ -53,6 +53,10 @@ def _report_from_rows(tmp_path, rows, min_fills=5):
 
 
 # --------------------------------------------------------------------------- recommend() logic
+# Config.from_yaml requires construction.max_entry_spread_pct -- a fail-closed entry-liquidity
+# limit, deliberately NOT defaultable. Fixture YAML has to carry it like a real config does.
+_CONSTRUCTION = "construction:\n  max_entry_spread_pct: 25.0\n"
+
 def test_too_loose_recommends_raise(tmp_path):
     # 6 filled well BELOW the mark (mark 2.00, fill 1.60 => 20% give-up), 0 unfilled -> fill_rate
     # 100% but median give-up 20% > 10% => TOO_LOOSE. Fix = RAISE the floor price (tighten).
@@ -133,7 +137,7 @@ def test_config_value_reaches_floor_logic():
 def test_config_round_trip_present_and_absent(tmp_path):
     # present in YAML -> loads onto RulesConfig -> threads into OrderManager -> floor uses it.
     cfg_present = tmp_path / "present.yaml"
-    cfg_present.write_text("rules:\n  exit_slippage_floor: 0.30\n")
+    cfg_present.write_text(_CONSTRUCTION + "rules:\n  exit_slippage_floor: 0.30\n")
     cfg = Config.from_yaml(str(cfg_present))
     assert cfg.rules.exit_slippage_floor == 0.30
     om, px = _floor_px(cfg.rules.exit_slippage_floor)
@@ -141,7 +145,7 @@ def test_config_round_trip_present_and_absent(tmp_path):
 
     # absent from YAML -> default 0.50 -> byte-identical 1.00 floor price.
     cfg_absent = tmp_path / "absent.yaml"
-    cfg_absent.write_text("rules:\n  stop_pct: 30.0\n")
+    cfg_absent.write_text(_CONSTRUCTION + "rules:\n  stop_pct: 30.0\n")
     cfg2 = Config.from_yaml(str(cfg_absent))
     assert cfg2.rules.exit_slippage_floor == 0.50
     _om2, px2 = _floor_px(cfg2.rules.exit_slippage_floor)
@@ -154,7 +158,9 @@ def test_config_round_trip_present_and_absent(tmp_path):
 # --------------------------------------------------------------------------- --write staging
 def test_write_stages_into_config_yaml(tmp_path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text("rules:\n  stop_pct: 30.0\n  exit_slippage_floor: 0.50\n  time_stop_days: 10\n")
+    cfg.write_text(_CONSTRUCTION +
+                   "rules:\n  stop_pct: 30.0\n  exit_slippage_floor: 0.50\n"
+                   "  time_stop_days: 10\n")
     ok, bak = tef.stage_into_config(str(cfg), 0.30)
     assert ok
     reloaded = Config.from_yaml(str(cfg))

@@ -11,6 +11,7 @@ from exitmgr.risk import RiskLimits
 from exitmgr.strategist import TradeIdea
 from exitmgr.account import PotSnapshot
 from exitmgr.state import StateManager
+from tests._stage_stub import stub_stage_a
 
 LIM = RiskLimits(max_concurrent=8)
 # SPY index idea (index bypasses the single-name aggregate cap so multiple copies pass the gate).
@@ -61,7 +62,7 @@ def _propose_n(n):
 
 @pytest.mark.asyncio
 async def test_per_cycle_order_cap_blocks_extra_entries(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", _propose_n(3))
+    stub_stage_a(monkeypatch, _propose_n(3))
     t = _trader(tmp_path, n_ideas=3, max_orders_per_cycle=2,
                 max_orders_per_day=99, max_notional_per_day=1e9)
     await t.run_once(dry_run=False)
@@ -70,7 +71,7 @@ async def test_per_cycle_order_cap_blocks_extra_entries(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_per_day_order_cap_blocks_extra_entries(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", _propose_n(3))
+    stub_stage_a(monkeypatch, _propose_n(3))
     sm = StateManager(str(tmp_path / "state.json"))
     t = _trader(tmp_path, n_ideas=3, state_manager=sm, max_orders_per_cycle=99,
                 max_orders_per_day=2, max_notional_per_day=1e9)
@@ -80,7 +81,7 @@ async def test_per_day_order_cap_blocks_extra_entries(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_per_day_notional_cap_blocks_extra_entries(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", _propose_n(3))
+    stub_stage_a(monkeypatch, _propose_n(3))
     sm = StateManager(str(tmp_path / "state.json"))
     # each entry costs $120; cap $250 -> only 2 fit ($240), the 3rd ($360) is refused.
     t = _trader(tmp_path, n_ideas=3, state_manager=sm, max_orders_per_cycle=99,
@@ -92,7 +93,7 @@ async def test_per_day_notional_cap_blocks_extra_entries(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_caps_none_means_no_throttle(tmp_path, monkeypatch):
     # Bare Trader (no caps passed) must keep prior behavior: all approved ideas submit.
-    monkeypatch.setattr(trader, "propose", _propose_n(3))
+    stub_stage_a(monkeypatch, _propose_n(3))
     t = _trader(tmp_path, n_ideas=3)   # no caps kwargs -> all None -> disabled
     await t.run_once(dry_run=False)
     assert t._submit_order.await_count == 3
@@ -102,7 +103,7 @@ async def test_caps_none_means_no_throttle(tmp_path, monkeypatch):
 async def test_same_cycle_submitted_buys_count_against_deployed_budget(tmp_path, monkeypatch):
     # $1,010 net-liq => 40% deployed cap $404. Four $120 entries would be $480, so the
     # fourth must be rejected even if IBKR has not reflected the prior same-cycle submits yet.
-    monkeypatch.setattr(trader, "propose", _propose_n(4))
+    stub_stage_a(monkeypatch, _propose_n(4))
     t = _trader(tmp_path, n_ideas=4)
     await t.run_once(dry_run=False)
     assert t._submit_order.await_count == 3
@@ -110,7 +111,7 @@ async def test_same_cycle_submitted_buys_count_against_deployed_budget(tmp_path,
 
 @pytest.mark.asyncio
 async def test_working_order_snapshot_failure_blocks_entries(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", _propose_n(1))
+    stub_stage_a(monkeypatch, _propose_n(1))
     t = _trader(tmp_path, n_ideas=1)
     t.ib_conn.ib.reqAllOpenOrdersAsync = AsyncMock(side_effect=RuntimeError("broker snapshot down"))
     await t.run_once(dry_run=False)
@@ -119,7 +120,7 @@ async def test_working_order_snapshot_failure_blocks_entries(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_per_day_opened_notional_persisted_to_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(trader, "propose", _propose_n(2))
+    stub_stage_a(monkeypatch, _propose_n(2))
     sm = StateManager(str(tmp_path / "state.json"))
     t = _trader(tmp_path, n_ideas=2, state_manager=sm, max_orders_per_cycle=99,
                 max_orders_per_day=99, max_notional_per_day=1e9)

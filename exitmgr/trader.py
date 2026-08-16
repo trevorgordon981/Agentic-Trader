@@ -769,6 +769,7 @@ class Trader:
                  reload_enabled: bool = False,
                  reload_conviction_min: float = 6,
                  reload_friction_k: float = 1.5,
+                 reload_expected_continuation_pct: float = 3.0,
                  reload_max_per_name_per_day: int = 2,
                  reload_ttl_cycles: int = 3):
         self.ib_conn = ib_conn
@@ -820,6 +821,8 @@ class Trader:
         self.reload_enabled = bool(reload_enabled)
         self.reload_conviction_min = float(reload_conviction_min)
         self.reload_friction_k = float(reload_friction_k)
+        # MEASURED constant, not a per-ticket forecast -- see config.py for the byron evidence.
+        self.reload_expected_continuation_pct = float(reload_expected_continuation_pct)
         self.reload_max_per_name_per_day = int(reload_max_per_name_per_day)
         self.reload_ttl_cycles = int(reload_ttl_cycles)
         # market regime + per-underlying momentum, refreshed each cycle in _market_context;
@@ -1556,6 +1559,29 @@ class Trader:
                     intents, _raw_strategist = _res
                 else:
                     intents = _res
+                # DETERMINISTIC CONSTRUCTION (2026-08-16). Expiry/delta come from the rule,
+                # not the model. Measured on duel at n=759: the deterministic arm scored
+                # +12.4 GNA vs +5.9 for the best-scaffolded model and -5.0 unguided, while
+                # direction skill was statistically identical (p=0.77) -- so the model's
+                # name/side call is kept and its expiry choice is discarded. Never raises
+                # into the trading path; on any failure the model's own numbers survive.
+                try:
+                    if getattr(self.construction, "deterministic_construction", True):
+                        from exitmgr.construction import apply_deterministic_construction
+                        _mind = int(getattr(self.construction, "min_dte", 25) or 25)
+                        for _i in (intents or []):
+                            _before = getattr(_i, "target_dte", None)
+                            apply_deterministic_construction(_i, _mind, enabled=True)
+                            _after = getattr(_i, "target_dte", None)
+                            if _before != _after:
+                                audit(self.audit_path, "deterministic_construction",
+                                      underlying=getattr(_i, "underlying", None),
+                                      intended_hold_days=getattr(_i, "intended_hold_days", None),
+                                      model_target_dte=_before, rule_target_dte=_after,
+                                      model_target_delta=getattr(_i, "model_target_delta", None),
+                                      rule_target_delta=getattr(_i, "target_delta", None))
+                except Exception as _dce:
+                    audit(self.audit_path, "deterministic_construction_error", error=str(_dce))
                 ideas = await self._materialize_stage_b(intents, pot)
             except Exception as e:
                 audit(self.audit_path, "strategist_error", error=str(e))
@@ -1782,7 +1808,8 @@ class Trader:
                 _rf_ok, _rf_reason, _rf_detail = reload_queue.reload_friction_ok(
                     reload_conviction=getattr(idea, "reload_conviction", None),
                     conviction_min=self.reload_conviction_min,
-                    tp_pct=resolved.tp_pct,
+                    expected_continuation_pct=getattr(
+                        idea, "reload_expected_continuation_pct", None),
                     new_debit=resolved.limit * 100 * resolved.qty,
                     qty=resolved.qty,
                     is_spread=(resolved.short_contract is not None),
@@ -1864,8 +1891,12 @@ class Trader:
                 _edays = None
             _earn_date = (_entry + timedelta(days=_edays)) if _edays is not None else None
             resolved.earnings_unchecked = _earn_date is None
+            # hold_days lets the gate judge the window the position is actually OPEN rather
+            # than the expiry -- required once expiry runs ~8x the hold. No-op while
+            # construction.earnings_use_hold_window is false.
             ok_earn, why_earn = construction.earnings_ok(_entry, resolved.expiry, _earn_date,
-                                                         self.construction)
+                                                         self.construction,
+                                                         hold_days=getattr(idea, "intended_hold_days", None))
             if not ok_earn:
                 audit(self.audit_path, "earnings_blackout_rejected", underlying=idea.underlying,
                       order=order_summary(resolved), reason=why_earn)
@@ -2306,7 +2337,8 @@ class Trader:
                     entry_date = datetime.now(timezone.utc).date()
                     earnings_date = entry_date + timedelta(days=days)
                     earn_ok, earn_reason = construction.earnings_ok(
-                        entry_date, fresh.expiry, earnings_date, self.construction)
+                        entry_date, fresh.expiry, earnings_date, self.construction,
+                        hold_days=getattr(idea, "intended_hold_days", None))
                     if not earn_ok:
                         reasons.append(earn_reason)
         except Exception as exc:
@@ -2349,6 +2381,17 @@ class Trader:
             # dynamic tags read by the friction gate + Slack banner (dataclass has no slots).
             idea.is_reload = True
             idea.reload_conviction = conv
+            # EXPECTED CONTINUATION for the friction gate -- a MEASURED CONSTANT.
+            # This replaced resolved.tp_pct, which has been None on every order since the R5/R2
+            # take-profit ruling and made the gate's numerator a structural zero (every reload
+            # silently rejected since 2026-07-26). My first replacement used the ticket's own
+            # banked gain; byron refuted it (corr(leg1,leg2) = -0.05/-0.00/+0.09 over 5,712 setups
+            # per arm -- the prior leg's size says nothing about the next). What IS measurable is
+            # the LEVEL: ~+3% mean on a same-name re-entry the day a harvest filled. The ticket's
+            # realized_pnl stays on the record below as evidence; it just no longer forecasts.
+            idea.reload_expected_continuation_pct = self.reload_expected_continuation_pct
+            idea.reload_realized_pnl = t.get("realized_pnl")          # audit only
+            idea.reload_original_debit = t.get("original_debit")      # audit only
             # BYPASS 2 CLOSED (2026-07-26): this constructs a TradeIdea directly, so the
             # strategist's allow-list never saw it. The mapping above only ever emits
             # "debit spread" or "long option" -- both permitted, and neither names an option

@@ -16,6 +16,8 @@ id_rsa*
 KILL_SWITCH
 .reconcile_alert_ts
 exitmgr_state.json
+entry_throttle.json
+entry_throttle.lock
 day_baseline.json
 .gateway_health_state.json
 audit.jsonl
