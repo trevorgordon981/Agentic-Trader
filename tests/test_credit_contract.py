@@ -473,21 +473,50 @@ def test_negative_control_golden_snapshot_catches_a_parser_change(monkeypatch):
 # --------------------------------------------------------------------------------------------
 
 def _load_pre_change_strategist():
-    """Materialise the committed (pre-credit) strategist.py as a throwaway module."""
+    """Materialise the last PRE-CREDIT strategist.py as a throwaway module.
+
+    This used to read `HEAD:exitmgr/strategist.py`, which was only ever a differential by
+    accident: the credit-limb work was uncommitted, so HEAD happened to hold the old parser. The
+    moment the live tree was committed (2026-08-16, 79bd75c) HEAD became the NEW parser and these
+    tests started comparing it against itself -- two hard failures, and four siblings quietly
+    skipping themselves with "HEAD already contains the credit limb". A differential anchored to a
+    moving reference is not an anchor.
+
+    Walk the file's history instead and take the newest commit whose TradeIdea has no `side`
+    field. That is the real pre-credit parser and it stays correct however far HEAD advances.
+    """
+    root = str(pathlib.Path(__file__).resolve().parent.parent)
     try:
-        src = subprocess.run(
-            ["git", "show", "HEAD:exitmgr/strategist.py"],
-            cwd=str(pathlib.Path(__file__).resolve().parent.parent),
-            capture_output=True, text=True, timeout=30,
+        log = subprocess.run(
+            ["git", "log", "--format=%H", "--", "exitmgr/strategist.py"],
+            cwd=root, capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as exc:      # pragma: no cover
         pytest.skip("git unavailable: %s" % exc)
-    if src.returncode != 0 or not src.stdout.strip():         # pragma: no cover
-        pytest.skip("could not read HEAD:exitmgr/strategist.py")
-    mod = types.ModuleType("_strategist_pre_credit")
-    mod.__file__ = "<git HEAD:exitmgr/strategist.py>"
-    exec(compile(src.stdout, mod.__file__, "exec"), mod.__dict__)
-    return mod
+    if log.returncode != 0 or not log.stdout.strip():         # pragma: no cover
+        pytest.skip("could not list exitmgr/strategist.py history")
+
+    for sha in log.stdout.split():
+        blob = subprocess.run(
+            ["git", "show", "%s:exitmgr/strategist.py" % sha],
+            cwd=root, capture_output=True, text=True, timeout=30,
+        )
+        if blob.returncode != 0 or not blob.stdout.strip():
+            continue
+        mod = types.ModuleType("_strategist_pre_credit")
+        mod.__file__ = "<git %s:exitmgr/strategist.py>" % sha[:9]
+        try:
+            exec(compile(blob.stdout, mod.__file__, "exec"), mod.__dict__)
+        except Exception:                                     # pragma: no cover
+            continue                                          # unimportable old revision; keep walking
+        try:
+            fields = dataclasses.fields(mod.TradeIdea)
+        except Exception:                                     # pragma: no cover
+            continue
+        if not any(f.name == "side" for f in fields):
+            return mod                                        # the genuine pre-credit parser
+
+    pytest.skip("no pre-credit exitmgr/strategist.py found in history")   # pragma: no cover
 
 
 def test_debit_payloads_parse_identically_to_the_pre_change_parser():

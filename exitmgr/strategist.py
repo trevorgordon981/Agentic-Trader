@@ -116,19 +116,26 @@ _CONTRACT = (
 # buy falling knives" reads as "do not act on a downtrend" rather than its actual meaning, "do not
 # buy CALLS into a downtrend." Both directions now carry the same evidentiary bar.
 _REGIME = (
-    "ENTRY DISCIPLINE: before any directional idea, confirm the underlying's trend and the broad "
-    "tape (SPY/QQQ) agree with it. Trade WITH the trend, in EITHER DIRECTION -- the trend is what "
-    "must be confirmed, not the direction bullish.\n"
-    "  * A confirmed UPTREND (underlying making higher highs, tape agreeing) supports a BULLISH "
-    "idea: a call debit spread or long call.\n"
-    "  * A confirmed DOWNTREND (underlying making lower lows, tape agreeing) supports a BEARISH "
-    "idea with exactly the same standing: a PUT DEBIT SPREAD or long put. A sustained downtrend is "
-    "a tradeable setup, not a reason to sit out. Do not skip it merely because it is short-side.\n"
-    "FADING is the error, not direction. Do not buy calls into a falling tape hoping for a bounce "
-    "('oversold', 'due to bounce'), and do not buy puts into a rising tape hoping for a top. "
-    "'Buying a falling knife' means buying CALLS as something drops -- it does NOT mean declining "
-    "to trade a downtrend. If the tape is genuinely choppy or directionless, prefer an empty slate; "
-    "and prefer a defined-risk debit spread over a naked long in either direction."
+    "ENTRY DISCIPLINE: before any directional idea, confirm the UNDERLYING'S OWN trend -- that is "
+    "the trend you are trading. The broad tape (SPY/QQQ) is CONTEXT, not a veto: it must not "
+    "flatly contradict the idea, but it does NOT have to point the same way. Trade WITH the "
+    "name's trend, in EITHER DIRECTION -- the trend is what must be confirmed, not the direction "
+    "bullish.\n"
+    "  * A confirmed UPTREND (underlying making higher highs) supports a BULLISH idea: a call "
+    "debit spread or long call.\n"
+    "  * A confirmed DOWNTREND IN THE NAME (lower lows, negative 5d and 20d) supports a BEARISH "
+    "idea with exactly the same standing: a PUT DEBIT SPREAD or long put -- EVEN IF THE INDEX IS "
+    "RISING. A name making lower lows while SPY/QQQ grind higher is RELATIVE WEAKNESS, which is "
+    "one of the cleanest short setups there is, not a contradiction to be resolved in favour of "
+    "the index. Requiring the index to fall too is what made the short side unreachable. A "
+    "sustained downtrend is a tradeable setup, not a reason to sit out. Do not skip it merely "
+    "because it is short-side, and do not downgrade it because the index disagrees.\n"
+    "FADING is the error, not direction, and the test is THE NAME'S direction. Do not buy calls "
+    "into a name that is falling hoping for a bounce ('oversold', 'due to bounce'), and do not "
+    "buy puts into a name that is RISING hoping for a top. 'Buying a falling knife' means buying "
+    "CALLS as something drops -- it does NOT mean declining to trade a downtrend. If the NAME is "
+    "genuinely choppy or directionless, prefer an empty slate; and prefer a defined-risk debit "
+    "spread over a naked long in either direction."
 )
 
 # TREVOR'S DOCTRINE, STATED IN-PROMPT (2026-08-10).
@@ -1004,15 +1011,28 @@ def propose_intents(endpoint: str, model: str, market_context: str, timeout: int
     """
     symbol = str(ticker).strip().upper() if ticker is not None else None
     prompt = _stage_a_prompt(recommend=recommend, ticker=symbol)
-    think = thinking if thinking is not None else (
-        "enabled" if (recommend or symbol is not None) else "disabled")
+    # 2026-08-16: thinking ON for EVERY path, not just recommend/ticker. The continuous
+    # entry loop fell through to "disabled" here, so any caller that did not pass the flag
+    # explicitly got a flat model. Measured think-on gain on this model, paired on identical
+    # BFCL case ids: +12 pts on multi_turn_base (p=0.0004), +12 on miss_func (p=0.0025), +32
+    # on irrelevance -- larger than the gap between this model and a 397B competitor on the
+    # base category. Callers may still pass "disabled" deliberately, and SLATE_THINKING in
+    # _resolve_thinking() remains the operational override for slate/trader contention.
+    think = thinking if thinking is not None else "enabled"
     think = _resolve_thinking(think)
     # The continuous entry loop historically got 1400 tokens because it never reasoned. With
     # thinking ON the trace is emitted BEFORE the answer, so a 1400 budget would truncate the JSON
     # behind its own reasoning and fail the contract. 6000 covers an entry-sized trace plus the
     # answer with room to spare, and the loop runs every 1200s so the extra decode time is free.
+    # 2026-08-17: the continuous entry loop was 6000 and that is NOT enough with thinking
+    # ON. Measured on the live 17.5k-char brief: the reasoning trace alone runs ~3,900
+    # tokens and can exceed the whole budget, which returns finish_reason=length with NO
+    # content -- surfaced as 'EMPTY reply' / 'Unterminated string' and turned into
+    # ideas=[]. Five EMPTY replies and a truncated-JSON error in the first hour of the
+    # 08-17 session, each one a cycle that proposed nothing. 16000, not 24000: the trace
+    # precedes the answer, so an oversized ceiling buys longer traces, not more safety.
     max_tokens = ((24000 if think == "enabled" else 2000) if (recommend or symbol)
-                  else (6000 if think == "enabled" else 1400))
+                  else (16000 if think == "enabled" else 1400))
     body = {
         "model": model,
         "messages": [
@@ -1088,7 +1108,8 @@ def _stage_b_payload(intent: StageAIntent, candidates: List[RuntimeCandidate],
 
 def select_candidate(endpoint: str, model: str, intent: StageAIntent,
                      candidates: List[RuntimeCandidate], timeout: int = 300,
-                     thinking: str = "disabled", return_raw: bool = False,
+                     thinking: str = "enabled",   # 2026-08-16: ON by default (+12 pts measured)
+                     return_raw: bool = False,
                      return_cot: bool = False, return_identity: bool = False,
                      intent_id: Optional[str] = None):
     """Stage B: select one supplied runtime candidate, or return None for terminal decline.

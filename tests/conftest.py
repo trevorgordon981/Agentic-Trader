@@ -1,6 +1,21 @@
 """Pytest fixtures and mocks for IB connection."""
 
+import os
+import sys
+
 import pytest
+
+# INTERPRETER GUARD (2026-08-16). `python3` on this box is /usr/bin/python3 = 3.9.6, while both
+# live traders run ib-grader-venv 3.12.13. The suite executes under both, so nothing warned -- and
+# a full night was spent chasing a failure that turned out to be a 3.9-only artifact
+# (asyncio.Lock() binds a loop at construction in 3.9; it is loop-agnostic from 3.10). Test
+# results from the wrong interpreter are not evidence about production. Set
+# EXITMGR_ALLOW_ANY_PYTHON=1 to bypass deliberately.
+if sys.version_info < (3, 12) and not os.environ.get("EXITMGR_ALLOW_ANY_PYTHON"):
+    raise RuntimeError(
+        "This suite must run on the interpreter production uses (>=3.12). Detected %d.%d.%d at %s.\n"
+        "Use: $HOME/ib-grader-venv/bin/python -m pytest tests/ -q -p no:cacheprovider"
+        % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 from typing import Dict, Optional
@@ -34,6 +49,15 @@ def isolate_dataset_dir(tmp_path, monkeypatch):
     # still-open con_id suppresses that position's next REAL management alert.
     monkeypatch.setenv("EXITMGR_MGMT_ALERTED_PATH", str(tmp_path / "mgmt-alerted.json"))
     monkeypatch.setenv("EXITMGR_RECONCILE_TS_PATH", str(tmp_path / "reconcile_alert_ts"))
+    # The rest of the no-override live-path class (2026-08-16). Each of these resolved to real
+    # user state with nothing pointing it elsewhere under test: clientId rotation counters, the
+    # research cache, the shadow decision corpus (training data), the exit log, and -- sharpest --
+    # the path the live IBKR Flex token is read from.
+    monkeypatch.setenv("EXITMGR_LINK_ROTATIONS_PATH", str(tmp_path / "link-rotations.json"))
+    monkeypatch.setenv("EXITMGR_ENRICH_CACHE_DIR", str(tmp_path / "enrich-cache"))
+    monkeypatch.setenv("EXITMGR_SHADOW_LOG", str(tmp_path / "shadow-decisions.jsonl"))
+    monkeypatch.setenv("EXITMGR_EXITS_LOG", str(tmp_path / "exits.log"))
+    monkeypatch.setenv("EXITMGR_FLEX_ENV", str(tmp_path / "flex.env"))
     yield str(ddir)
 
 

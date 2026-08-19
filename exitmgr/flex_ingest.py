@@ -102,7 +102,10 @@ from exitmgr import dataset_integrity as _di
 
 FLEX_BASE = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
 SEND_URL = FLEX_BASE + "/SendRequest"
-DEFAULT_ENV = os.path.expanduser("~/.hermes/.env")
+# CREDENTIAL PATH. This is where the live IBKR Flex token is read from, so it must be
+# overridable or a test exercising the ingest path reads real broker credentials off disk.
+DEFAULT_ENV = (os.environ.get("EXITMGR_FLEX_ENV")
+               or os.path.expanduser("~/.hermes/.env"))
 SOURCE_TAG = "flex_history"
 _INPROGRESS_CODE = "1019"  # "Statement generation in progress. Please try again shortly."
 _BAK_SUFFIX = "bak-flexingest-20260703"
@@ -728,6 +731,14 @@ def _retag(row: Dict[str, Any], manual: Optional[bool], meta: Dict[str, Any],
     prov["capture_source"] = "ibkr_flex_web_service"
     prov["flex_period"] = meta.get("period")
     prov["flex_when_generated"] = meta.get("whenGenerated")
+    # Coverage window, NOT freshness. IBKR ends every Flex period at the last COMPLETED business
+    # day, so toDate is normally yesterday even on a report generated minutes ago. Without this,
+    # a consumer comparing the ledger to today's journal sees a phantom discrepancy and cannot
+    # distinguish "settled through toDate" from "sync stalled on toDate".
+    prov["flex_from_date"] = meta.get("fromDate")
+    prov["flex_to_date"] = meta.get("toDate")
+    prov["flex_settled_through"] = meta.get("toDate")
+    prov["flex_excludes_same_day"] = True
     prov["trade_ids"] = sorted({f["trade_id"] for f in fills if f.get("trade_id")})
     prov["api_order_flags"] = [f.get("api_order") for f in fills]
     row["provenance"] = prov

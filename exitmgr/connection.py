@@ -188,7 +188,14 @@ class IBConnection:
             pass
 
     _ROTATION_POOL_SIZE = 4
-    _ROTATION_COUNT_PATH = os.path.expanduser("~/.local/var/exitmgr/link-rotations.json")
+    #: Resolved at CALL time from EXITMGR_LINK_ROTATIONS_PATH so tests cannot write the live
+    #: rotation counters. Same no-override class as _MGMT_ALERTED_PATH (fixed 2026-08-16).
+    _ROTATION_COUNT_ENV = "EXITMGR_LINK_ROTATIONS_PATH"
+    _ROTATION_COUNT_DEFAULT = os.path.expanduser("~/.local/var/exitmgr/link-rotations.json")
+
+    @property
+    def _ROTATION_COUNT_PATH(self) -> str:
+        return os.environ.get(self._ROTATION_COUNT_ENV) or self._ROTATION_COUNT_DEFAULT
 
     def _rotation_pool(self):
         """Four ids reserved to THIS connection, disjoint from every other job's.

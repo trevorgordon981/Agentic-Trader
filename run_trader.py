@@ -14,6 +14,7 @@ from exitmgr.connection import IBConnection
 from exitmgr.manager import ExitManager
 from exitmgr import entry_safety
 from exitmgr.trader import Trader
+from exitmgr.trader import entry_window_wait_seconds as _entry_window_wait
 
 app = typer.Typer(help="LLM trading orchestrator (propose -> gate -> approve -> execute -> manage)")
 
@@ -76,6 +77,11 @@ def main(
     _refuse_if_trading_down(arm, mode)
 
     cfg = load_config(config_path=config, arm=arm, loop=loop, interval=interval)
+
+    # CREDIT MASTER SWITCH -> env, because plan_idea (trader.py) reads it from the environment so
+    # that a caller constructing RiskLimits by hand cannot route around it. Explicit "1"/"0" only.
+    os.environ["EXITMGR_CREDIT_ENTRIES"] = (
+        "1" if bool(getattr(cfg, "credit_entries_enabled", False)) else "0")
     dry_run = not arm
 
     selected_client_id = _selected_client_id(cfg, mode, client_id)
@@ -231,6 +237,14 @@ def main(
             async def _entry_loop():
                 entry_cadence = max(60, int(interval))
                 while True:
+                    # Sleep to the session boundary rather than free-running on a fixed cadence:
+                    # a fixed interval has arbitrary phase and can leave an interval-sized hole
+                    # across the open (2026-08-18: last cycle 13:25:57Z, bell 13:30Z).
+                    _wait = _entry_window_wait()
+                    if _wait > 0:
+                        # Capped so a long overnight wait stays interruptible and re-reads config.
+                        await asyncio.sleep(min(_wait, 900.0))
+                        continue
                     started = asyncio.get_running_loop().time()
                     try:
                         if await _ensure_live_connection():

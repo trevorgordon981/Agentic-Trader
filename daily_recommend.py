@@ -72,6 +72,11 @@ CONS = ConstructionConfig()
 # takes part in the exit decision at all, so there is nothing left to cache.)
 
 
+# Floor-cost proxy for the cheapest realistic 0.60-delta debit spread, as a fraction
+# of notional. Tunable via AFFORD_NOTIONAL_FRAC env var; see the screen below for why
+# 0.02 was too aggressive at a ~$4.6k account size.
+AFFORD_NOTIONAL_FRAC = float(os.environ.get("AFFORD_NOTIONAL_FRAC", "0.01"))
+
 def _tp_level_text(tp_pct, tp_price):
     """Render the take-profit half of a Slack sell-levels line. `tp_pct` is OPTIONAL and is None
     on essentially every trade now (Sol audit R5 R2): there is no mechanical profit target, so say
@@ -1173,14 +1178,21 @@ async def run(args):
                     except (TypeError, ValueError):
                         _kept.append(_n)          # unknown price -> let construction decide
                         continue
-                    # 2% of notional ~= the cheap end of a real 0.60-delta spread
-                    if _spot > 0 and (_spot * 100.0 * 0.02) > _screen_cap:
+                    # Fraction of notional used as a floor-cost proxy for a 0.60-delta
+                    # spread. 0.02 assumed width scales with share price and deleted the whole
+                    # universe above ~$230 (slate went 1/3,1/1,1/1 -> 0/0,0/0,0/0). Width is
+                    # chosen, not implied by spot, so 0.01 now rejects only names whose spot
+                    # exceeds the cap outright. Construction enforces the REAL limit downstream
+                    # against actual quoted debits via max_premium_pct.
+                    if _spot > 0 and (_spot * 100.0 * AFFORD_NOTIONAL_FRAC) > _screen_cap:
                         _afford_dropped.append((_n, round(_spot, 2)))
                     else:
                         _kept.append(_n)
                 if _afford_dropped:
-                    print("[SCREEN] affordability dropped %d name(s) over the $%.0f per-trade "
-                          "cap: %s" % (len(_afford_dropped), _screen_cap,
+                    print("[SCREEN] affordability dropped %d of %d name(s) over the $%.0f "
+                          "per-trade cap (kept %d): %s"
+                          % (len(_afford_dropped), len(_afford_dropped) + len(_kept),
+                             _screen_cap, len(_kept),
                                        ", ".join("%s@$%.0f" % (t, p)
                                                  for t, p in _afford_dropped)))
                     audit(audit_path, "affordability_screen",
@@ -1740,8 +1752,12 @@ async def run(args):
                             _block_reasons.extend(whyf)
                         _edays_final = await asyncio.to_thread(
                             research.days_to_earnings, fresh_r.underlying)
-                        if _edays_final is None:
+                        if _edays_final is None and not entry_safety.is_no_earnings_etf(
+                                fresh_r.underlying):
                             _block_reasons.append("earnings date unavailable at approval time")
+                        # An ETF has no earnings date: missing is EXPECTED, not a failure.
+                        # NOT risk.INDEX_UNDERLYINGS -- that set also skips the blocklist and
+                        # the approved-names universe check.
                         else:
                             _entry_final = datetime.now(timezone.utc).date()
                             _earn_final = _entry_final + timedelta(days=_edays_final)

@@ -71,7 +71,9 @@ _CARD_RE = re.compile(
     r"RSI14 \d+\. vs SMA20 [+-]\d+\.\d% SMA50 [+-]\d+\.\d% SMA200 [+-]\d+\.\d%\. "
     r"SMA20[<>]SMA50\. MACD-h [+-]\d+\.\d{2}\. BB%B [+-]?\d+\.\d{2}\. ATR \d+\.\d%\. "
     r"Vol \d+\.\d+x\. [+-]\d+% from 52wk high, [+-]\d+% above 52wk low\. "
-    r"IVR \d+\. VIX \d+ (calm|normal|elevated|high|extreme)\. "
+    # v4 layout (2026-08): technical_card.earn_field() inserts an earnings segment between
+    # IVR and VIX -- either "{N}d to earnings" or "earn n/a". The v3 regex could never match.
+    r"IVR \d+\. (?:\d+d to earnings|earn n/a)\. VIX \d+ (calm|normal|elevated|high|extreme)\. "
     r"Stance next (~1 week|~2 weeks|~1 month|~2 months|~3 months)\?$"
 )
 

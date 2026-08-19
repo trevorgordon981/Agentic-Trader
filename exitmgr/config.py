@@ -89,6 +89,30 @@ class AutoTrailConfig:
 
 
 @dataclass
+class AtrLevelsConfig:
+    """ATR-NORMALISED EXIT LEVELS (2026-08-19, Trevor's call: "dynamic based on ATR,
+    not blindly assign 25").
+
+    A flat `stop_pct` and a flat `giveback_fraction` are expressed in PREMIUM space, which
+    is not comparable across positions. Measured on the live book the same -30% rule sat
+    1.76 ATR away on BKR and 3.61 ATR on BSX -- a 2.1x spread in real risk that nobody
+    chose. These knobs make the ATR distance the controlled variable instead.
+
+    All three are UPPER-bounded by the existing static rules: the stop is capped by
+    rules.stop_pct (stops only tighten) and the trail pin only ever ratchets tighter. When
+    the ATR cache has no fresh entry, every consumer falls back to the static value, so
+    disabling this (or an empty cache) is an exact no-op.
+    """
+    enabled: bool = True
+    k_arm: float = 1.5      # arm the trail once PEAK gain clears this many ATRs
+    k_trail: float = 1.0    # trail floor sits this many ATRs below peak_since_arm
+    k_stop: float = 2.0     # protective stop sits this many ATRs below entry
+    min_stop_pct: float = 8.0   # never produce a hair-trigger stop on a very low delta
+    gb_min: float = 0.25    # never give back less than this share of the gain (anti-choke)
+    gb_max: float = 0.75    # never give back more than this share of the gain
+
+
+@dataclass
 class ScaleOutConfig:
     """Partial-trim / scale-out at a FIRST target below the full profit target. Consumed by
     rules.evaluate_scale_out; the manager acts on ExitTrigger.quantity_fraction. Priors below
@@ -212,6 +236,7 @@ class RulesConfig:
     time_stop_days: Optional[int] = None
     trailing: TrailingConfig = field(default_factory=TrailingConfig)
     auto_trail: AutoTrailConfig = field(default_factory=AutoTrailConfig)
+    atr_levels: AtrLevelsConfig = field(default_factory=AtrLevelsConfig)
     scale_out: ScaleOutConfig = field(default_factory=ScaleOutConfig)
     exit_market_orders: bool = False  # True = close with MARKET orders so a triggered stop/target
                                       # always fills (option bid/ask don't stream cleanly here)
@@ -267,12 +292,17 @@ class Config:
         _at_raw = rules_data.get("auto_trail", {}) or {}
         _at_known = {f.name for f in AutoTrailConfig.__dataclass_fields__.values()}
         auto_trail_cfg = AutoTrailConfig(**{k: v for k, v in _at_raw.items() if k in _at_known})
+        # atr_levels: same posture -- a typo must not crash the trader, it must fall back.
+        _al_raw = rules_data.get("atr_levels", {}) or {}
+        _al_known = {f.name for f in AtrLevelsConfig.__dataclass_fields__.values()}
+        atr_levels_cfg = AtrLevelsConfig(**{k: v for k, v in _al_raw.items() if k in _al_known})
         rules_cfg = RulesConfig(
             profit_target_pct=rules_data.get("profit_target_pct"),
             stop_pct=rules_data.get("stop_pct"),
             time_stop_days=rules_data.get("time_stop_days"),
             trailing=trailing_cfg,
             auto_trail=auto_trail_cfg,
+            atr_levels=atr_levels_cfg,
             scale_out=scale_out_cfg,
             exit_market_orders=bool(rules_data.get("exit_market_orders", False)),
             exit_slippage_floor=float(rules_data.get("exit_slippage_floor", 0.50)),
@@ -383,6 +413,15 @@ def load_config(
                    # path (each reload re-anchors its own 30% stop to the new basis). OFF by default
                    # -- reload_enabled=False is a pure no-op (today's behavior); Trevor flips it on
                    # deliberately after re-arm + validation. The other knobs only bind when enabled.
+                   # CREDIT / CASH-SECURED PUTS (2026-08-16). OFF by default. The credit limb is
+                   # fully built and gated (INVARIANT 1/2/3, the 80%-of-pot ruling, submit-time cash
+                   # recheck), but it had no on/off switch at all: strategist.py:502 can emit
+                   # side="credit" and nothing downstream asked whether that was wanted. ZERO credit
+                   # entries have ever been taken, and at this account size a single CSP would tie up
+                   # most of the pot -- Trevor's own read. Flip to true when the account is large
+                   # enough for a write to be a sensible fraction of it; the 80% ruling then applies
+                   # exactly as written, untouched.
+                   ('credit_entries_enabled', False),
                    ('reload_enabled', False),          # master flag; False => feature is a full no-op
                    ('reload_conviction_min', 6),       # friction gate: reload clears only if the
                                                        # model's reload_conviction >= this

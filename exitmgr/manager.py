@@ -81,6 +81,54 @@ def _enforce_airtight_stop(rules):
                                     if stop > 0 else _STOP_BACKSTOP_PCT))
 
 
+
+def _resolve_entry_basis(journal_entry, pos):
+    """Resolve (entry_debit, quantity) for a position. SINGLE SOURCE OF TRUTH.
+
+    Both the protective eval loop and the model-facing position views MUST value a position
+    against the same basis. When they drifted apart (2026-08-17) the model was shown the ORDER's
+    limit debit while the rules used the actual FILL, and it cut BSX citing a 30% stop breach that
+    the rule engine measured at -14.24%. Returns the fill-derived basis, pro-rated to the contracts
+    actually held after any scale-out.
+
+    Returns (entry_debit: float, quantity: int, basis_source: str).
+    """
+    je = journal_entry or {}
+    if not je:
+        return (pos.avg_cost * 100 * pos.quantity, pos.quantity, "avg_cost")
+
+    journal_debit = je.get("debit")
+    basis_source = "debit"
+    # Prefer what actually FILLED over what was asked for -- see module docstring.
+    _jefd = je.get("entry_fill_debit")
+    if _jefd is not None:
+        try:
+            _f = float(_jefd)
+            if _f == _f and _f > 0:
+                journal_debit, basis_source = _f, "entry_fill_debit"
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        journal_debit = float(journal_debit)
+    except (TypeError, ValueError):
+        journal_debit = 0.0
+    if not (journal_debit > 0):
+        # No usable journalled basis: fall back exactly as the eval loop does.
+        return (pos.avg_cost * 100 * pos.quantity, pos.quantity, "avg_cost")
+
+    quantity_in_journal = je.get("quantity", pos.quantity)
+    quantity = min(pos.quantity, quantity_in_journal)
+    # Scale-out pro-rating: the journalled debit is the FULL entry cost for quantity_in_journal
+    # contracts; a trimmed runner must be valued against a basis scaled to what is still held.
+    if quantity_in_journal and quantity_in_journal > 0 and quantity != quantity_in_journal:
+        entry_debit = journal_debit * quantity / quantity_in_journal
+        basis_source += "+prorated"
+    else:
+        entry_debit = journal_debit
+    return (entry_debit, quantity, basis_source)
+
+
 class ExitManager:
     """Main orchestrator for exit management."""
 
@@ -1665,6 +1713,14 @@ class ExitManager:
                     row["expiry"], px, row["credit_usd"], _p_s, _pc_s,
                     ("MANAGED -- a protective buy-to-close stop is armed on this position"
                      if _managed else
+                     # A spread's short leg is INTENTIONALLY not managed on its own: an
+                     # independent stop could close it alone and turn a defined-risk spread
+                     # into a NAKED SHORT CALL. It exits with its long. That is a different
+                     # fact from "this short is unprotected", so it gets a different word.
+                     # Every other reason keeps the loud wording on purpose.
+                     "PAIRED ({}) -- exits with its long leg; no separate stop by design"
+                     .format(_why)
+                     if _why == "spread_short_leg_closes_with_its_long" else
                      "UNMANAGED ({}) -- no stop/target is armed on this position".format(_why))))
                 if int(cid) not in self._short_alerted:
                     self._short_alerted.add(int(cid))
@@ -3238,12 +3294,40 @@ class ExitManager:
                     # Once the params are PINNED they govern regardless of what the model sends,
                     # so a flip-flop between "emits params" and "omits params" changes NOTHING
                     # about the position and must not manufacture a fresh alert every few minutes.
+                    #
+                    # 2026-08-19: THE SAME COLLAPSE APPLIES BEFORE THE TRAIL IS PINNED. The model
+                    # echoes the position's CURRENT gain back into trail_activation_gain_pct, so an
+                    # unarmed winner drifting +19.7 -> +20.0 -> +21.4 -> +23.1 -> +24.8 minted a
+                    # brand-new fingerprint on EVERY assessment and paged ~20 times in two hours
+                    # (PFE 714652653, 2026-08-19 06:59-08:43). The no-op guard above cannot catch
+                    # it: that guard requires armed_at AND pinned params, and an UNARMED position
+                    # has neither -- so a position pages hardest during exactly the window in which
+                    # it is NOT yet protected. The judgment "arm a trail here" is the news; the
+                    # re-echoed live gain is not. Once a PRIOR arm_trail has durably marked the
+                    # position trail_configured, only a CHANGE OF ACTION is worth paging again.
                     try:
                         if self.state_manager.state.pinned_trail_params(con_id) is not None:
                             fingerprint = (fingerprint[0], fingerprint[1], None, None,
                                            fingerprint[4])
                     except Exception:
                         pass
+                    # ACTIVATION IS NOISE, GIVEBACK IS POLICY (2026-08-19, PFE 714652653).
+                    # The position manager echoes the position's CURRENT gain back as
+                    # trail_activation_gain_pct, so a winner grinding up emits a different
+                    # activation on every assessment while the DECISION -- "arm a trail here" --
+                    # never changes. That drift minted a fresh fingerprint each cycle and paged
+                    # ~20 times between 06:59 and 08:43 on a single position. The no-op guard
+                    # above cannot catch it: that guard needs armed_at AND pinned params, and an
+                    # UNARMED position has neither -- so a position pages hardest during exactly
+                    # the window in which its trail is not yet protecting anything.
+                    #
+                    # So the activation never participates in the fingerprint for an arm_trail.
+                    # trail_giveback_fraction DOES stay in it: that is the width of the actual
+                    # protection and a model that widens 0.4 -> 0.5 has changed what happens to
+                    # the position, which is worth one page. The activation remains in the audit
+                    # log and in the alert TEXT either way -- this only governs re-paging.
+                    fingerprint = (fingerprint[0], fingerprint[1], None, fingerprint[3],
+                                   fingerprint[4])
                 if self._mgmt_alerted.get(con_id) == fingerprint:
                     continue      # same decision as last time -- already announced
                 text = self._format_exit_decision(con_id, decision,
@@ -3314,27 +3398,58 @@ class ExitManager:
                   f"(assessed {age:.0f}s ago)")
         return out, (cache.get("raw") if covered else None), cache.get("model_identity")
 
+    def _portfolio_marks(self):
+        """conId -> IBKR's own marketPrice, for every contract the broker will mark.
+
+        SINGLE SOURCE OF TRUTH for marking. The protective eval loop and the model-facing views
+        must value a position off the SAME price; when they drifted (2026-08-17) the model read
+        streaming quotes ~9% below the broker's mark and cut BSX on a stop it had not breached.
+
+        NaN GUARD: a NaN marketPrice passes `is not None`, then every comparison (>= target,
+        <= stop) evaluates False and the stop silently never fires -- a -47% spread once read
+        +25% and never stopped (2026-06-26). `px == px` rejects NaN; a bad mark is simply omitted
+        so the caller falls back to the streaming quote for that contract.
+        """
+        try:
+            return {p.contract.conId: p.marketPrice for p in self.ib_conn.ib.portfolio()
+                    if p.position != 0 and p.marketPrice is not None
+                    and p.marketPrice == p.marketPrice and p.marketPrice > 0}
+        except Exception as _e:
+            print(f"[WARN] portfolio marking unavailable ({_e}); using streaming quotes")
+            return {}
+
     def _build_position_views(self, managed_positions, quotes, price_stats=None):
         """Compact, read-only per-position state for the model to assess.
         Mirrors the eval loop's net-price logic (spreads valued long-minus-short).
         price_stats: optional {symbol: momentum_stats} so each view carries the underlying's
         trend strength (lets the model let strong winners run in a bull)."""
         views = []
+        # One broker read per build; the per-position loop below only looks up.
+        _pmarks = self._portfolio_marks()
         for p in managed_positions:
             cid = p.con_id
             q = quotes.get(cid)
             if q is None:
                 continue
-            cur = q["price"]
+            # MARK PARITY (2026-08-17): prefer the broker's mark exactly as the eval loop
+            # does. Reading the streaming quote here while the rules read IBKR's marketPrice
+            # is half of why the model cut BSX/NFLX on losses that had not happened.
+            cur = _pmarks.get(cid, q["price"])
             je = self._journal_entries.get(cid) or {}
             sp = je.get("spread")
             if sp and sp.get("short_con_id"):
-                sq = quotes.get(int(sp["short_con_id"]))
-                if sq is None:
-                    continue
-                cur = cur - sq["price"]
-            qty = min(p.quantity, je.get("quantity", p.quantity))
-            entry_debit = je.get("debit") or (p.avg_cost * 100 * p.quantity)
+                _scid = int(sp["short_con_id"])
+                short_px = _pmarks.get(_scid)
+                if short_px is None:
+                    sq = quotes.get(_scid)
+                    if sq is None:
+                        continue
+                    short_px = sq["price"]
+                cur = cur - short_px
+            # BASIS PARITY (2026-08-17): resolve the basis the SAME way the eval loop
+            # does. These drifted -- the view used the order's limit debit while the
+            # rules used the actual fill -- and the model cut BSX/NFLX on a phantom loss.
+            entry_debit, qty, basis_source = _resolve_entry_basis(je, p)
             current_value = cur * 100 * qty
             pnl_pct = round((current_value - entry_debit) / entry_debit * 100, 1) if entry_debit else 0.0
             peak = self.state_manager.state.peak_prices.get(str(cid), cur)
@@ -3362,6 +3477,12 @@ class ExitManager:
                 "symbol": sym,
                 "structure": "spread" if sp else "single",
                 "pnl_pct": pnl_pct,
+                # Not shown to the model -- carried so the eval loop can verify that the
+                # number the model reasoned over matches the number the rules enforce.
+                "_basis": round(float(entry_debit), 4),
+                "_basis_source": basis_source,
+                "_mark": round(float(cur), 4),
+                "_qty": qty,
                 "pct_from_peak": from_peak,
                 "trend": trend,  # {"score":-100..100, "label":...} per-underlying, or None
                 "dte": days_to_expiry(getattr(p, "expiry", "")),
@@ -3405,6 +3526,55 @@ class ExitManager:
                 "mfe_pct": self.state_manager.state.mfe_pct.get(str(cid)),
             })
         return views
+
+    def _atr_levels_for(self, con_id, symbol, entry_debit, quantity, iv, dte, spread=None):
+        """ATR-normalised levels for ONE position, or None when no honest answer exists.
+
+        Returns {atr, spot, net_delta, entry_per_share, per_atr_pct, activation_gain_pct,
+        stop_pct}. `per_atr_pct` is how many PERCENT of the debit one underlying ATR is
+        worth for this structure -- the conversion that makes premium-space rules
+        comparable across positions.
+
+        FAIL-SOFT BY CONSTRUCTION. A missing/stale ATR cache entry, an unpriceable
+        structure, or any exception returns None, and every caller then keeps its
+        configured static value. Nothing here can throw into the stop path, and nothing
+        here does I/O beyond one local cache read -- the network refresh is a separate
+        scheduled job precisely so a yfinance hang can never sit in front of an exit.
+        """
+        cfg = getattr(self.config.rules, "atr_levels", None)
+        if cfg is None or not getattr(cfg, "enabled", False):
+            return None
+        try:
+            from exitmgr import atr_cache, atr_levels
+            rec = atr_cache.read(symbol)
+            if not rec:
+                return None
+            je = self._journal_entries.get(con_id) or {}
+            long_strike = je.get("strike")
+            if long_strike is None:
+                return None
+            sp = spread if spread else (je.get("spread") or {})
+            net = atr_levels.net_structure_delta(
+                rec["spot"], long_strike, (sp or {}).get("short_strike"), dte, iv,
+                right=je.get("right", "C"))
+            if net is None:
+                return None
+            q, ed = abs(int(quantity)), float(entry_debit)
+            if q <= 0 or ed <= 0:
+                return None
+            eps = ed / (100.0 * q)
+            per_atr_pct = rec["atr"] * net / eps * 100.0
+            return {
+                "atr": rec["atr"], "spot": rec["spot"], "net_delta": net,
+                "entry_per_share": eps, "per_atr_pct": per_atr_pct,
+                "activation_gain_pct": float(cfg.k_arm) * per_atr_pct,
+                "stop_pct": atr_levels.atr_stop_pct(
+                    eps, rec["atr"], net, float(cfg.k_stop),
+                    float(self.config.rules.stop_pct), float(cfg.min_stop_pct)),
+            }
+        except Exception as e:      # noqa: BLE001 -- ATR sizing must never break exits
+            print(f"[ATR] con_id={con_id} ({symbol}): levels unavailable ({e}); static rules")
+            return None
 
     def _apply_decision(self, rules, decision, current_price, entry_debit, quantity, con_id, symbol, regime=None):
         """Apply a model decision to a RulesConfig with regime-aware guardrails.
@@ -4077,9 +4247,7 @@ class ExitManager:
             # <= stop) is False -> the stop silently never fires (a -47% spread that read +25% never
             # stopped, 2026-06-26). Require a real, positive mark (px == px rejects NaN); a bad mark
             # is simply omitted so the code falls back to the streaming quote for that contract.
-            _mark = {p.contract.conId: p.marketPrice for p in self.ib_conn.ib.portfolio()
-                     if p.position != 0 and p.marketPrice is not None
-                     and p.marketPrice == p.marketPrice and p.marketPrice > 0}
+            _mark = self._portfolio_marks()
         except Exception as _e:
             print(f"[WARN] portfolio marking unavailable ({_e}); using streaming quotes")
             _mark = {}
@@ -4158,6 +4326,39 @@ class ExitManager:
                 symbol = pos_data.symbol
                 quantity = pos_data.quantity
                 quantity_in_journal = pos_data.quantity
+
+            # BASIS-DIVERGENCE DETECTOR (2026-08-17). The model decides from self._mgmt_views;
+            # the rules enforce from `entry_debit` right here. These silently disagreed -- the
+            # view carried the order's limit debit, the rules the actual fill -- and the model
+            # cut BSX citing "Loss -33.7% exceeds 30% stop" while the rules measured -14.24% on
+            # the same tick. Purely observational: logs the disagreement, never acts on it.
+            try:
+                _v = next((v for v in (getattr(self, "_mgmt_views", None) or [])
+                           if v.get("con_id") == con_id), None)
+                if _v and _v.get("_basis") and entry_debit > 0:
+                    _vb = float(_v["_basis"])
+                    _skew = _vb / entry_debit - 1.0
+                    if abs(_skew) > 0.005:
+                        print(f"[BASIS-DIVERGENCE] con_id={con_id} ({symbol}): model reasoned over "
+                              f"basis={_vb:.2f} (src={_v.get('_basis_source')}, mark={_v.get('_mark')}, "
+                              f"qty={_v.get('_qty')}, pnl={_v.get('pnl_pct')}%) but the rules enforce "
+                              f"basis={entry_debit:.2f} (qty={quantity}) -- model P&L skewed "
+                              f"{_skew * 100:+.1f}%")
+                        try:
+                            from exitmgr.trader import audit as _audit_event
+                            import os as _os
+                            _ap = _os.path.join(
+                                _os.path.dirname(self.config.journal.path) or ".", "audit.jsonl")
+                            _audit_event(_ap, "basis_divergence", con_id=con_id, symbol=symbol,
+                                         view_basis=_vb, rule_basis=round(entry_debit, 4),
+                                         view_basis_source=_v.get("_basis_source"),
+                                         view_mark=_v.get("_mark"), view_pnl_pct=_v.get("pnl_pct"),
+                                         view_qty=_v.get("_qty"), rule_qty=quantity,
+                                         skew_pct=round(_skew * 100, 3))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
             # Record this mark-to-market: peak price + MFE (max favorable %) AND MAE (max
             # ADVERSE %) excursions + the mark-path time series, all PERSISTED with the state
@@ -4249,18 +4450,54 @@ class ExitManager:
             #     Runs BEFORE the ratchet so peak_since_arm is seeded before record_trail_peak
             #     sees it -- the same ordering rule the arming close obeys.
             _auto_cfg_arm = getattr(self.config.rules, "auto_trail", None)
+            # ATR-NORMALISED ARMING (2026-08-19). A flat 25% activation is a different
+            # amount of real risk on every name, and PFE proved the failure mode: it
+            # peaked at +24.13% against a flat 25.0 threshold, missed automatic arming by
+            # 0.87pt, and had to be armed BY HAND. Express the bar in ATRs instead, and
+            # take the EARLIER of {static, ATR} so this can only ever arm sooner than
+            # today -- never later. Arming only enables a trail; the giveback below is
+            # what decides how far the exit sits.
+            _atr_lv = self._atr_levels_for(con_id, symbol, entry_debit, quantity,
+                                           (_enrich or {}).get("iv"), dte,
+                                           locals().get("spread"))
+            _arm_bar = getattr(_auto_cfg_arm, "activation_gain_pct", None)
+            if _atr_lv and _arm_bar is not None:
+                _arm_bar = min(float(_arm_bar), float(_atr_lv["activation_gain_pct"]))
             if _auto_cfg_arm is not None and getattr(_auto_cfg_arm, "enabled", False):
                 if self.state_manager.state.arm_on_peak_gain(
                         con_id, peaks.get(k), entry_debit, quantity,
-                        _auto_cfg_arm.activation_gain_pct):
+                        _arm_bar):
                     _keep = 1 - max(float(self.config.rules.trailing.giveback_fraction),
                                     float(_auto_cfg_arm.giveback_fraction))
                     print(f"[EVAL] con_id={con_id} ({symbol}): BIG-GAIN TRAIL ARMED off peak "
-                          f"{peaks.get(k)} (>= {_auto_cfg_arm.activation_gain_pct:.0f}% gain); "
+                          f"{peaks.get(k)} (>= {float(_arm_bar):.1f}% gain"
+                          f"{' [ATR]' if _atr_lv else ''}); "
                           f"floor keeps {_keep:.0%} of the peak gain")
             self.state_manager.state.record_trail_peak(con_id, current_price)
             _trail_armed = self.state_manager.state.is_trail_armed(con_id)
             _peak_since_arm = self.state_manager.state.trail_peak_since_arm(con_id)
+            # 2b. RATCHET THE TRAIL UP AS THE WINNER GAINS (2026-08-19, Trevor's ask:
+            #     "the trailing stop should be adjusted up in the event that the position
+            #     is gaining more"). With an ATR-sized trail the floor is
+            #     `peak_since_arm - k_trail*ATR*delta`, so the giveback FRACTION shrinks
+            #     on its own as the gain grows. ratchet_trail_params persists that shrink
+            #     and REFUSES any value that would lower the floor, so a volatility
+            #     expansion can never loosen a trail that is already protecting a gain.
+            if _trail_armed and _atr_lv and _peak_since_arm:
+                try:
+                    from exitmgr import atr_levels as _al
+                    _cfgl = self.config.rules.atr_levels
+                    _gb_new = _al.atr_giveback(
+                        _atr_lv["entry_per_share"], _peak_since_arm, _atr_lv["atr"],
+                        _atr_lv["net_delta"], float(_cfgl.k_trail),
+                        float(_cfgl.gb_min), float(_cfgl.gb_max))
+                    if _gb_new is not None and self.state_manager.state.ratchet_trail_params(
+                            con_id, _atr_lv["activation_gain_pct"], _gb_new):
+                        print(f"[EVAL] con_id={con_id} ({symbol}): TRAIL RATCHETED UP -> "
+                              f"giveback {_gb_new:.0%} "
+                              f"({_cfgl.k_trail:.1f} ATR below peak {_peak_since_arm:.4f})")
+                except Exception as _re:    # noqa: BLE001
+                    print(f"[ATR] con_id={con_id}: trail ratchet skipped ({_re})")
             # Per-position sell levels the model recommended (journaled); fall back to the global
             # config rule when a level wasn't specified for this trade.
             rules = self.config.rules

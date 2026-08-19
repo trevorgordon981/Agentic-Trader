@@ -29,6 +29,18 @@ from exitmgr.strategist import TradeIdea
 from tests._stage_stub import stub_stage_a
 
 
+@pytest.fixture(autouse=True)
+def _enable_credit_entries(monkeypatch):
+    """Every test in this file exercises the CREDIT path, so the master switch has to be on.
+
+    Added 2026-08-16 with credit_entries_enabled (default FALSE): plan_idea now refuses credit
+    ideas outright unless EXITMGR_CREDIT_ENTRIES is explicitly truthy, so without this the
+    collateral-vs-credit invariants below would "pass" by being rejected one gate too early --
+    green for the wrong reason, which is the failure mode this whole file exists to prevent.
+    """
+    monkeypatch.setenv("EXITMGR_CREDIT_ENTRIES", "1")
+
+
 # --------------------------------------------------------------------------- builders / fixtures
 
 def _dte_str(days: int) -> str:

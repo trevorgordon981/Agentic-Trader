@@ -33,6 +33,21 @@ class SafetyResult:
     reasons: Tuple[str, ...] = ()
 
 
+# ETFs have no earnings date, so the earnings hard gate can only ever block them (see
+# NO_EARNINGS_ETFS rationale). Explicit allow-list, NOT the model-set is_index flag: a safety gate
+# must not be disarmed by a field the model controls. Anything absent here keeps the gate, so a
+# forgotten ETF costs a blocked trade rather than a skipped check.
+NO_EARNINGS_ETFS = frozenset({"SPY", "QQQ", "IWM", "DIA", "SMH", "SOXL", "TQQQ", "SCHD", "XLF", "XLK", "DRAM"})
+
+
+def is_no_earnings_etf(symbol) -> bool:
+    """True for index/sector ETFs that structurally cannot have an earnings date."""
+    try:
+        return str(symbol or "").strip().upper() in NO_EARNINGS_ETFS
+    except Exception:
+        return False
+
+
 def _configured_path(raw: object, *, config_path: str, label: str) -> Tuple[Optional[Path], Optional[str]]:
     """Resolve a marker path relative to the config directory, refusing empty/invalid paths."""
     if raw is None:

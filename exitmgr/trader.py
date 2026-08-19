@@ -13,6 +13,7 @@ Hard invariants:
 import dataclasses
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
@@ -113,6 +114,47 @@ def _market_open() -> bool:
         return False
     mins = t.hour * 60 + t.minute
     return 13 * 60 + 30 <= mins <= 20 * 60
+
+
+# Minutes after the opening bell before the entry strategist may run. The opening auction and
+# the first minutes of price discovery are the worst moment to ask for a directional read --
+# quotes are often crossed or stale -- so the model is held back briefly. Override with
+# EXITMGR_OPEN_DELAY_MIN.
+OPEN_DELAY_MIN = int(os.environ.get("EXITMGR_OPEN_DELAY_MIN", "5"))
+
+_SESSION_OPEN_MIN = 13 * 60 + 30      # 13:30 UTC
+_SESSION_CLOSE_MIN = 20 * 60          # 20:00 UTC
+
+
+def entry_window_wait_seconds(now: Optional[datetime] = None,
+                              delay_min: Optional[int] = None) -> float:
+    """Seconds until the entry strategist may next run; 0.0 when already inside the window.
+
+    Exists so the entry loop can sleep to the exact session boundary instead of free-running on
+    a fixed interval whose phase depends on when the process happened to start. Without it a
+    cycle can land minutes before the bell and leave a full interval-sized hole across the open
+    (observed 2026-08-18: last pre-market cycle 13:25:57Z, next would have been 13:45Z).
+
+    Holidays are not modelled, matching _market_open(); on a holiday this simply returns 0 during
+    what would have been the session and the strategist's own checks apply.
+    """
+    t = now or datetime.now(timezone.utc)
+    delay = OPEN_DELAY_MIN if delay_min is None else int(delay_min)
+    open_min = _SESSION_OPEN_MIN + max(0, delay)
+
+    mins_now = t.hour * 60 + t.minute + t.second / 60.0
+    if t.weekday() < 5 and open_min <= mins_now <= _SESSION_CLOSE_MIN:
+        return 0.0
+
+    # Walk forward to the next weekday session open (today if it has not happened yet).
+    day = t
+    if not (t.weekday() < 5 and mins_now < open_min):
+        day = t + timedelta(days=1)
+    while day.weekday() >= 5:
+        day = day + timedelta(days=1)
+
+    target = day.replace(hour=open_min // 60, minute=open_min % 60, second=0, microsecond=0)
+    return max(0.0, (target - t).total_seconds())
 
 
 # ----------------------------------------------------------- CREDIT LIMB (CREDIT_PATH_SPEC.md S2)
@@ -583,6 +625,18 @@ def plan_idea(idea: TradeIdea, *, net_liq: float, available_funds: float,
     # would make every CSP look like a ~$100 trade and wave a $50,000 cash commitment straight
     # through the solvency layer.
     if is_credit(idea):
+        # MASTER SWITCH (2026-08-16). Refuse credit entries outright unless explicitly enabled.
+        # Everything below is correct and stays correct -- this is about whether the pathway should
+        # be open at all. Read from the env so it cannot be bypassed by a caller that builds
+        # RiskLimits by hand, and fail CLOSED: anything other than an explicit truthy value is off.
+        if str(os.environ.get("EXITMGR_CREDIT_ENTRIES", "")).strip().lower() not in (
+                "1", "true", "yes", "on"):
+            trade = ProposedTrade(idea.underlying, float("inf"), idea.is_index, idea.conviction,
+                                  is_long=False)
+            return Plan(idea, trade,
+                        GateDecision(False, ("credit entries are disabled "
+                                             "(credit_entries_enabled=false)",)),
+                        "gate_rejected")
         notional = _fnum(getattr(idea, "collateral_usd", 0.0), None)
         if notional is None or notional <= 0:
             # unusable collateral -> a notional the gate can only REJECT (never a free pass)
@@ -1641,6 +1695,55 @@ class Trader:
 
         _ddir = trade_capture.dataset_dir(self.journal_path)
 
+        def _notify_gate_hold(idea_obj, gate_obj):
+            """Post ONE Slack line when the risk gate holds an idea, deduped.
+
+            Silence is ambiguous: a full book and a dead process both produce no message. This
+            makes the difference visible without becoming noise -- it fires when the reason or
+            the set of held names changes, and otherwise at most once every 4 hours.
+            """
+            try:
+                import hashlib as _hl, json as _js, os as _os, time as _t
+                reasons = list(getattr(gate_obj, "reasons", []) or [])
+                if not reasons:
+                    return
+                sym = getattr(idea_obj, "underlying", "?")
+                fp = _hl.sha256(_js.dumps({"r": sorted(reasons), "s": sym},
+                                          sort_keys=True).encode()).hexdigest()
+                path = _os.path.join(
+                    _os.path.dirname(_os.path.abspath(self.audit_path)) or ".",
+                    ".gate_hold_notify.json")
+                prev = {}
+                try:
+                    with open(path) as _fh:
+                        prev = _js.load(_fh)
+                except Exception:
+                    prev = {}
+                now = _t.time()
+                same = prev.get("fp") == fp
+                recent = (now - float(prev.get("ts", 0) or 0)) < 4 * 3600
+                if same and recent:
+                    return          # unchanged and reported recently -- stay quiet
+                try:
+                    tmp = path + ".tmp"
+                    with open(tmp, "w") as _fh:
+                        _js.dump({"fp": fp, "ts": now}, _fh)
+                    _os.replace(tmp, path)
+                except Exception:
+                    pass            # never let bookkeeping block the notice
+                why = "; ".join(str(r) for r in reasons)[:180]
+                conv = getattr(idea_obj, "conviction", None)
+                approval.post_proposal(
+                    self.slack_token, self.slack_channel,
+                    f":pause_button: *Holding {sym}* "
+                    f"({getattr(idea_obj, 'direction', '?')} "
+                    f"{getattr(idea_obj, 'structure', '?')}"
+                    + (f", conviction {conv}/10" if conv is not None else "") + ")"
+                    f"\n_The trader is running and finding ideas — the gate is declining them._"
+                    f"\nReason: {why}")
+            except Exception as _ne:
+                print(f"[WARN] gate-hold notify failed (continuing): {_ne}")
+
         def _cap_rej(stage, reason, *, resolved=None, gate=None, construction=None):
             """Record-only: append a REJECTED row for a killed idea. Never raises."""
             try:
@@ -1757,6 +1860,9 @@ class Trader:
                   per_trade_cap=plan.gate.per_trade_cap)
             if not plan.gate.approved:
                 _cap_rej("risk_gate", plan.gate.reasons, gate=plan.gate)
+                # Make "working but idle" visible; deduped inside so a persistent condition
+                # (e.g. a full book) is announced once, not every cycle.
+                _notify_gate_hold(idea, plan.gate)
                 continue
 
             # Resolve the CONCRETE order BEFORE asking -- so the human approves the real order.
@@ -2275,7 +2381,9 @@ class Trader:
             # NBBO timestamp remains tight at the money boundary.
             days = await asyncio.to_thread(research.days_to_earnings, idea.underlying)
             if days is None:
-                reasons.append("earnings date unavailable at approval time")
+                if not entry_safety.is_no_earnings_etf(idea.underlying):
+                    reasons.append("earnings date unavailable at approval time")
+                # else: an ETF has no earnings date; missing is EXPECTED, not a failure.
             fresh = await self._resolve_order(
                 idea, gate.per_trade_cap,
                 net_liq=pot.net_liq, available_funds=pot.available_funds)
@@ -3032,5 +3140,42 @@ class Trader:
                 "short_strike": r.short_strike,
                 "width": abs(r.short_strike - r.strike),
             }
+        # ATR-NORMALISED ENTRY STOP (2026-08-19, Trevor: "make sure positions are open
+        # with an ATR stop"). A flat -30% of debit is a different amount of REAL risk on
+        # every structure: measured across the live book the identical rule sat 1.76 ATR
+        # away on BKR and 3.61 ATR on BSX -- a 2.1x spread in risk that nobody chose.
+        # Size the stop so it sits k_stop ATRs below entry, using the net structure delta
+        # already computed above (the broker-derived figure, not an approximation).
+        #
+        # TIGHTEN-ONLY: atr_stop_pct is capped by the stop the constructor already set, so
+        # this can never widen a stop. FAIL-SOFT: any missing input leaves rec["stop_pct"]
+        # exactly as it was, and the manager's _enforce_airtight_stop remains an
+        # independent backstop. CREDIT positions are excluded -- their stop_pct is a
+        # percent OF CREDIT with different semantics (see _SHORT_STOP_BACKSTOP_PCT).
+        try:
+            from exitmgr import atr_cache as _ac, atr_levels as _alv
+            from exitmgr.config import load_config as _lc
+            _rules = _lc(self.config_path).rules
+            _acfg = getattr(_rules, "atr_levels", None)
+            if _acfg is not None and getattr(_acfg, "enabled", False) and not is_credit(r):
+                _aref = _ac.read(r.underlying)
+                _nd = abs(float(rec.get("net_delta") or 0.0))
+                _q = abs(int(r.qty))
+                _debit = float(rec.get("debit") or 0.0)
+                if _aref and _nd > 0 and _q > 0 and _debit > 0:
+                    _eps = _debit / (100.0 * _q)
+                    _cap = float(rec.get("stop_pct") or getattr(_rules, "stop_pct", 30.0))
+                    _astop = _alv.atr_stop_pct(_eps, _aref["atr"], _nd, float(_acfg.k_stop),
+                                               _cap, float(_acfg.min_stop_pct))
+                    if _astop is not None:
+                        rec["stop_pct"] = round(float(_astop), 1)
+                        rec["stop_basis"] = "atr_k%.1f" % float(_acfg.k_stop)
+                        rec["stop_atr_ref"] = {"atr": _aref["atr"], "asof": _aref["asof"],
+                                               "net_delta": _nd, "was_pct": _cap}
+                        print("[ATR] %s entry stop %.0f%% -> %.1f%% (%.1f ATR, net_delta %.3f)"
+                              % (r.underlying, _cap, rec["stop_pct"], float(_acfg.k_stop), _nd))
+        except Exception as _se:      # noqa: BLE001 -- sizing must never block an entry
+            print("[ATR] entry stop sizing skipped for %s (%s)"
+                  % (getattr(r, "underlying", "?"), _se))
         with open(self.journal_path, "a") as f:
             f.write(json.dumps(rec, default=str) + "\n")

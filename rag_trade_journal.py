@@ -76,6 +76,17 @@ def load_jsonl(path):
     return rows
 
 
+def _is_exit(t):
+    """True for rows written by close_symbol/liquidate rather than an entry.
+
+    Detected structurally, not just by event name: an entry is meaningless without a strike and
+    a debit, so a row lacking them cannot be described as one no matter what label it carries.
+    """
+    if str(t.get("event", "")).startswith("closed"):
+        return True
+    return t.get("strike") is None or t.get("debit") is None
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     audit = load_jsonl(AUDIT)
@@ -123,9 +134,12 @@ def main():
             "",
         ]
 
-        if s["fills"]:
+        _entries = [t for t in s["fills"] if not _is_exit(t)]
+        _exits = [t for t in s["fills"] if _is_exit(t)]
+
+        if _entries:
             lines.append("## Trades executed")
-            for t in s["fills"]:
+            for t in _entries:
                 sym = t.get("symbol", "?")
                 right = "call" if t.get("right") == "C" else "put"
                 strike = t.get("strike")
@@ -138,10 +152,31 @@ def main():
                     desc = (f"{sym} {exp} {strike}/{spread.get('short_strike')} {right} "
                             f"debit spread (width {spread.get('width')})")
                 else:
-                    desc = f"{sym} {exp} {strike}{('C' if right=='call' else 'P')} (long {right})"
+                    # right is 'C'/'P' on real entries; anything else is not describable as a
+                    # single leg, so say so rather than defaulting it to a put.
+                    _r = t.get("right")
+                    if _r not in ("C", "P") or strike is None:
+                        desc = f"{sym} {exp} single leg (incomplete record)".strip()
+                    else:
+                        desc = f"{sym} {exp} {strike}{_r} (long {right})"
+                _tgt = (f", profit target +{tp}% / stop -{stop}%."
+                        if tp is not None and stop is not None else ".")
                 lines.append(
-                    f"- **{_hm(t.get('ts',''))} UTC** — {desc}, debit ${debit}, "
-                    f"profit target +{tp}% / stop -{stop}%."
+                    f"- **{_hm(t.get('ts',''))} UTC** — {desc}, debit ${debit}{_tgt}"
+                )
+            lines.append("")
+
+        if _exits:
+            # Exits used to be rendered as long-put ENTRIES, inverting the direction of the
+            # trade in a corpus the model is trained on. They get their own section now.
+            lines.append("## Positions closed")
+            for t in _exits:
+                _px = t.get("avg_fill_price")
+                _px_s = f" at ${_px}" if _px is not None else ""
+                _via = t.get("tool") or t.get("event") or "close"
+                lines.append(
+                    f"- **{_hm(t.get('ts',''))} UTC** — {t.get('symbol','?')} "
+                    f"closed{_px_s} (via {_via})."
                 )
             lines.append("")
 

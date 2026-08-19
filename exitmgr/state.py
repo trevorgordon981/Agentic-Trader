@@ -403,6 +403,51 @@ class State:
         self.trail_confirmation[str(con_id)] = rec
         return True
 
+    def ratchet_trail_params(self, con_id, activation_gain_pct, giveback_fraction) -> bool:
+        """Tighten the pinned trail. THE PROTECTED FLOOR MAY ONLY EVER RATCHET UP.
+
+        `pin_trail_params` is FIRST-WRITE-WINS because a floor that wanders on the model's
+        mood is not a floor.  That rule was aimed at a floor that could move DOWN as well
+        as up; it is not a reason to leave a winner protected by the giveback it happened
+        to have when it armed.
+
+        With an ATR-sized trail the floor is `peak - k*ATR*delta`, so as `peak_since_arm`
+        ratchets up the floor follows it, and the giveback FRACTION shrinks on its own
+        (the same ATR distance divided by a larger gain).  This method lets that shrink
+        be persisted.
+
+        Evaluated at a common peak, floor_new > floor_old is exactly gb_new < gb_old, so
+        the monotonic guard reduces to "the pinned giveback may only ever get smaller".
+        A rise in ATR or delta -- which would loosen the floor -- is therefore refused.
+
+        Unarmed positions are never touched: arming owns the first pin.
+        Returns True only when the pin actually tightened, so the caller logs it once.
+        """
+        rec = self.trail_confirmation_for(con_id)
+        if rec["armed_at"] is None:
+            return False
+        try:
+            gb_new = float(giveback_fraction)
+        except (TypeError, ValueError):
+            return False
+        if gb_new != gb_new:                      # NaN is not a parameter
+            return False
+        gb_new = max(0.1, min(0.9, gb_new))
+        gb_old = rec.get("pinned_giveback_fraction")
+        if gb_old is None:
+            rec["pinned_giveback_fraction"] = gb_new
+            try:
+                rec["pinned_activation_gain_pct"] = float(activation_gain_pct)
+            except (TypeError, ValueError):
+                pass
+            self.trail_confirmation[str(con_id)] = rec
+            return True
+        if gb_new >= float(gb_old):               # would loosen (or no change) -> refuse
+            return False
+        rec["pinned_giveback_fraction"] = gb_new
+        self.trail_confirmation[str(con_id)] = rec
+        return True
+
     def pinned_trail_params(self, con_id):
         """The frozen (activation_gain_pct, giveback_fraction) for an armed position, or None."""
         rec = self.trail_confirmation_for(con_id)

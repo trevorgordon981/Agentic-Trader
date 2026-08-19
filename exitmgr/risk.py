@@ -15,6 +15,10 @@ from typing import Dict, List, Optional, Set
 
 from exitmgr import regime as regime_mod
 
+# DO NOT widen this set to fix an earnings-gate problem. Membership grants THREE
+# privileges (see checks 1a/1b below): blocklist exemption, universe exemption (bypasses
+# approved_names entirely), and the earnings exemption in place_trade.py. For "this ticker
+# has no earnings date" use entry_safety.NO_EARNINGS_ETFS, which grants ONLY that.
 INDEX_UNDERLYINGS: Set[str] = {"SPY", "QQQ", "IWM"}
 
 # PENDING CONVICTION CALIBRATION -- do not steepen until journal calibration justifies it.

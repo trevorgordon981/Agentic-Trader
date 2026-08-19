@@ -161,4 +161,5 @@ print(f"v4 paths exercised: {sorted(paths_seen)}")
 if missing:
     print(f"MISSING v4 PATHS (coverage gap): {sorted(missing)}")
 print("==================================================")
-sys.exit(0 if (nfail == 0 and npass > 0 and not missing) else 1)
+if __name__ == "__main__":       # only exit when run AS A SCRIPT; importing this
+    sys.exit(0 if (nfail == 0 and npass > 0 and not missing) else 1)   # module under pytest must not kill the run

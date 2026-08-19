@@ -106,7 +106,17 @@ async def cycle(ib):
 
 def _print(out):
     ts = _now().strftime("%H:%M UTC")
-    print(f"[{ts}] cash ${out['cash']:,} / NetLiq ${out['net_liq']:,}")
+    _vs = ""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from book_return import book_return as _book_return
+        _b = _book_return(out["net_liq"])
+        out["vs_deposits"] = _b
+        _vs = f"  |  vs ${_b['net_deposits']:,.0f} in: {_b['pnl_dollars']:+,.0f} / {_b['pnl_pct']:+.1f}%"
+    except Exception:
+        pass
+    print(f"[{ts}] cash ${out['cash']:,} / NetLiq ${out['net_liq']:,}{_vs}")
     if out.get("propose_error"): print("  propose_error:", out["propose_error"])
     print(f"  EXITS flagged ({len(out['exits'])}):")
     for e in out["exits"]: print(f"    - {e['symbol']} ({e['pnl']:+.0f}%): {e['reason']}")

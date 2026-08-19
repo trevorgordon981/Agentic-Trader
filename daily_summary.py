@@ -67,8 +67,22 @@ async def run():
             pass
         day_chg = netliq - base
         day_pct = (day_chg / base * 100.0) if base else 0.0
-        tot_chg = netliq - start_cap
-        tot_pct = (tot_chg / start_cap * 100.0) if start_cap else 0.0
+        # Book performance must be measured against CAPITAL CONTRIBUTED, not a fixed
+        # starting balance. With start_cap pinned at $1,010 this line reported +339% on a
+        # book that is down 22%, because every deposit was counted as profit.
+        _bk = None
+        try:
+            import sys as _sys
+            _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from book_return import book_return as _book_return
+            _bk = _book_return(netliq)
+            tot_chg = _bk["pnl_dollars"]
+            tot_pct = _bk["pnl_pct"]
+            start_cap = _bk["net_deposits"]
+        except Exception as _e:
+            print("[WARN] book_return unavailable (%s); using start_cap" % str(_e)[:60])
+            tot_chg = netliq - start_cap
+            tot_pct = (tot_chg / start_cap * 100.0) if start_cap else 0.0
         arrow = ":green_circle:" if day_chg >= 0 else ":red_circle:"
 
         L = [f":bar_chart: *Daily Trading Summary — {today.isoformat()}* {arrow}",
@@ -85,7 +99,9 @@ async def run():
             L.append("  (none — all cash)")
         L.append("")
         tarrow = ":chart_with_upwards_trend:" if tot_chg >= 0 else ":chart_with_downwards_trend:"
-        L.append(f"{tarrow} *Since inception (${start_cap:,.0f}): {tot_chg:+,.0f} / {tot_pct:+.1f}%*")
+        L.append(f"{tarrow} *Vs capital deposited (${start_cap:,.0f}): {tot_chg:+,.0f} / {tot_pct:+.1f}%*")
+        if _bk:
+            L.append(f"   _time-weighted {_bk['deposit_weighted_pct']:+.1f}% on avg ${_bk['avg_capital_deployed']:,.0f} deployed over {_bk['days_since_first']}d_")
 
         approval.post_proposal(token, channel, "\n".join(L))
         print("daily summary posted")

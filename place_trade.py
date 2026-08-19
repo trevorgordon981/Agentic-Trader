@@ -228,7 +228,12 @@ async def run(args):
                 # QQQ 725/726C spread was blocked this way at approval. Absence of a thing that
                 # cannot exist is not missing data. Single names are UNCHANGED: an unknown
                 # earnings date there still fails closed, which is a real IV-crush protection.
-                _is_index_sym = args.symbol.upper() in risk.INDEX_UNDERLYINGS
+                # Union, not a swap: INDEX_UNDERLYINGS carries other privileges elsewhere
+                # (blocklist + universe exemption), NO_EARNINGS_ETFS grants only this one.
+                # Keeps this path consistent with trader.py and daily_recommend.py -- a gate
+                # that differs by entry point is unpredictable, which is worse than uniform.
+                _is_index_sym = (args.symbol.upper() in risk.INDEX_UNDERLYINGS
+                                 or entry_safety.is_no_earnings_etf(args.symbol))
                 earnings_days = (None if _is_index_sym else
                                  await asyncio.to_thread(research.days_to_earnings, args.symbol))
                 if _is_index_sym:

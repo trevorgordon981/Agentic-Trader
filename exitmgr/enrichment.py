@@ -22,7 +22,10 @@ from typing import List, Optional
 _IB_READ_TIMEOUT_S = 20
 
 
-CACHE_DIR = os.path.expanduser("~/.cache/exitmgr-research")
+# EXITMGR_ENRICH_CACHE_DIR lets tests point this at tmp_path; without it a test run pollutes
+# (and reads stale entries from) the live research cache.
+CACHE_DIR = (os.environ.get("EXITMGR_ENRICH_CACHE_DIR")
+             or os.path.expanduser("~/.cache/exitmgr-research"))
 TTL = int(os.environ.get("ENRICH_CACHE_TTL_S", "1800"))
 MARKETDATA_TOKEN = os.environ.get("MARKETDATA_TOKEN", "")
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")

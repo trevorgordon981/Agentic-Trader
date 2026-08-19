@@ -147,6 +147,15 @@ async def review_positions(ib, idea=None, thinking="enabled"):
                      "value_usd": round(val), "pnl_pct": round(pnl, 1),
                      "take_profit_pct": e.get("profit_target_pct"), "stop_pct": e.get("stop_pct")})
     payload = {"available_cash": round(pot.available_funds), "net_liq": round(pot.net_liq), "book": book}
+    # Net liq alone cannot distinguish "funded" from "profitable" -- a deposit raises it
+    # while the book earns nothing. Give the reviewer the capital-contributed view too.
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from book_return import book_return as _book_return
+        payload["vs_deposits"] = _book_return(pot.net_liq)
+    except Exception:
+        pass
     if idea:
         payload["new_idea"] = idea
     if not book:
@@ -157,7 +166,12 @@ async def review_positions(ib, idea=None, thinking="enabled"):
 
 def format_synopsis(r):
     cash = r["pot"]["available_cash"]; nl = r["pot"]["net_liq"]
-    lines = [f":clipboard: *Book review* — cash ${cash:,.0f} / NetLiq ${nl:,.0f}"]
+    vd = r["pot"].get("vs_deposits")
+    head = f":clipboard: *Book review* — cash ${cash:,.0f} / NetLiq ${nl:,.0f}"
+    if vd:
+        head += (f"\n     vs ${vd['net_deposits']:,.0f} deposited: "
+                 f"*{vd['pnl_dollars']:+,.0f} / {vd['pnl_pct']:+.1f}%*")
+    lines = [head]
     bym = {b["symbol"]: b for b in r.get("book", [])}
     emoji = {"hold": ":green_circle:", "trim": ":large_yellow_circle:", "sell": ":red_circle:"}
     for rv in r.get("reviews", []):
