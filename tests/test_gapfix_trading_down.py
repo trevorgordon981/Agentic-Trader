@@ -1,0 +1,25 @@
+"""Public API contract; production-derived narrative omitted."""
+
+import run_trader
+
+
+def test_service_start_allowed_for_protective_exits_when_marker_present(tmp_path, monkeypatch):
+    marker = tmp_path / "TRADING_DOWN"
+    marker.write_text("down")
+    monkeypatch.setattr(run_trader, "TRADING_DOWN_MARKER", str(marker))
+    run_trader._refuse_if_trading_down(arm=True)
+
+
+def test_arm_allowed_when_marker_absent(tmp_path, monkeypatch):
+    marker = tmp_path / "TRADING_DOWN"
+    monkeypatch.setattr(run_trader, "TRADING_DOWN_MARKER", str(marker))
+
+    run_trader._refuse_if_trading_down(arm=True)
+
+
+def test_dry_run_never_blocked_even_with_marker(tmp_path, monkeypatch):
+    marker = tmp_path / "TRADING_DOWN"
+    marker.write_text("down")
+    monkeypatch.setattr(run_trader, "TRADING_DOWN_MARKER", str(marker))
+
+    run_trader._refuse_if_trading_down(arm=False)

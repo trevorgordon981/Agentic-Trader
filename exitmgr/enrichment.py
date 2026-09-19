@@ -1,0 +1,386 @@
+"""Public API contract; production-derived narrative omitted."""
+import asyncio
+import hashlib, json, os, time, urllib.request
+from datetime import date, timedelta
+from typing import List, Optional
+
+
+
+
+
+_IB_READ_TIMEOUT_S = 20
+_OPTION_DETAIL_TIMEOUT_S = 10
+_OPTION_SNAPSHOT_TIMEOUT_S = 8
+_OPTION_MAX_PER_RIGHT = 16
+_OPTION_SNAPSHOT_BATCH_SIZE = 16
+
+
+
+
+CACHE_DIR = (os.environ.get("EXITMGR_ENRICH_CACHE_DIR")
+             or os.path.expanduser("~/.cache/exitmgr-research"))
+TTL = int(os.environ.get("ENRICH_CACHE_TTL_S", "1800"))
+MARKETDATA_TOKEN = os.environ.get("MARKETDATA_TOKEN", "")
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
+PARALLEL_API_KEY = os.environ.get("PARALLEL_API_KEY", "")
+PARALLEL_MODE = os.environ.get("ENRICH_PARALLEL_MODE", "basic")
+
+def _cached(key, ttl, producer):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        p = os.path.join(CACHE_DIR, hashlib.md5(key.encode()).hexdigest() + ".json")
+        if os.path.exists(p) and time.time() - os.path.getmtime(p) < ttl:
+            with open(p) as f:
+                return json.load(f)
+        val = producer()
+        with open(p, "w") as f:
+            json.dump(val, f)
+        return val
+    except Exception:
+        try:
+            return producer()
+        except Exception:
+            return []
+
+
+async def movers(ib, want=6) -> Optional[dict]:
+    from ib_async import ScannerSubscription, TagValue
+    filt = [TagValue("priceAbove", "20"), TagValue("volumeAbove", "3000000")]
+    out = {}
+    for label, code in (("gainers", "TOP_PERC_GAIN"), ("losers", "TOP_PERC_LOSE"), ("active", "MOST_ACTIVE")):
+        try:
+            sub = ScannerSubscription(instrument="STK", locationCode="STK.US.MAJOR", scanCode=code)
+            data = await asyncio.wait_for(
+                ib.reqScannerDataAsync(sub, [], filt), _IB_READ_TIMEOUT_S)
+            out[label] = [d.contractDetails.contract.symbol for d in data[:want]]
+        except Exception:
+            out[label] = []
+    return out if any(out.values()) else None
+
+def format_movers(m: Optional[dict]) -> List[str]:
+    if not m:
+        return []
+    rows = []
+    if m.get("gainers"): rows.append("top % gainers: " + ", ".join(m["gainers"]))
+    if m.get("losers"):  rows.append("top % losers: " + ", ".join(m["losers"]))
+    if m.get("active"):  rows.append("most active: " + ", ".join(m["active"]))
+    return rows
+
+
+def _opt_one(sym):
+    if not MARKETDATA_TOKEN:
+        return None
+    to = (date.today() + timedelta(days=21)).isoformat()
+    url = (f"https://api.marketdata.app/v1/options/chain/{sym}/?token={MARKETDATA_TOKEN}"
+           f"&to={to}&strikeLimit=10&columns=side,volume,openInterest,iv,delta")
+    try:
+        with urllib.request.urlopen(url, timeout=12) as r:
+            d = json.load(r)
+    except Exception:
+        return None
+    if "side" not in d:
+        return None
+    sides, vols, ois = d.get("side", []), d.get("volume", []), d.get("openInterest", [])
+    ivs, deltas = d.get("iv", []), d.get("delta", [])
+    cv = sum((vols[i] or 0) for i, s in enumerate(sides) if s == "call")
+    pv = sum((vols[i] or 0) for i, s in enumerate(sides) if s == "put")
+    toi = sum((o or 0) for o in ois)
+    tv = cv + pv
+    atm_iv, best = None, 9.0
+    for i in range(min(len(ivs), len(deltas))):
+        if ivs[i] is None or deltas[i] is None:
+            continue
+        if abs(abs(deltas[i]) - 0.5) < best:
+            best, atm_iv = abs(abs(deltas[i]) - 0.5), ivs[i]
+    parts = []
+    if cv:
+        pcr = pv / cv
+        tag = " call-heavy/bullish" if pcr < 0.7 else " put-heavy/bearish" if pcr > 1.3 else ""
+        parts.append(f"P/C {pcr:.2f}{tag}")
+    if tv and toi and tv > 0.8 * toi:
+        parts.append(f"unusual vol {tv:,}/{toi:,} OI")
+    if atm_iv:
+        parts.append(f"ATM IV {atm_iv*100:.0f}%")
+    return f"{sym}: " + "; ".join(parts) if parts else None
+
+def options_flow(names, limit=5) -> List[str]:
+    names = [n for n in names][:limit]
+    if not names:
+        return []
+    return _cached("optflow:" + ",".join(sorted(names)), TTL,
+                   lambda: [ln for ln in (_opt_one(s) for s in names) if ln])
+
+
+def _fh_one(sym):
+    if not FINNHUB_KEY:
+        return []
+    frm = (date.today() - timedelta(days=4)).isoformat()
+    url = f"https://finnhub.io/api/v1/company-news?symbol={sym}&from={frm}&to={date.today().isoformat()}&token={FINNHUB_KEY}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            arr = json.load(r)
+        return [f"[{sym}] {a['headline']} — {a.get('source','')}" for a in arr[:3] if a.get("headline")]
+    except Exception:
+        return []
+
+def news_finnhub(symbols, limit=6, cap=12) -> List[str]:
+    syms = symbols[:limit]
+    def produce():
+        seen, out = set(), []
+        for s in syms:
+            for h in _fh_one(s):
+                if h not in seen:
+                    seen.add(h); out.append(h)
+        return out[:cap]
+    return _cached("fhnews:" + ",".join(syms), min(TTL, 900), produce)
+
+
+def news_parallel(symbols, limit_syms=6, max_items=8) -> List[str]:
+    if not PARALLEL_API_KEY:
+        return []
+    syms = symbols[:limit_syms]
+    def produce():
+        try:
+            from parallel import Parallel
+            c = Parallel(api_key=PARALLEL_API_KEY)
+            obj = ("Latest market-moving news, catalysts, analyst rating changes, and notable price "
+                   "moves today for: " + ", ".join(syms) + ", and the broad US stock market.")
+            qs = [f"{s} stock news today" for s in syms[:3]] + ["US stock market movers today",
+                  "semiconductor and AI stocks news today"]
+            r = c.search(objective=obj, search_queries=qs[:5], mode=PARALLEL_MODE, max_chars_total=6000)
+            out = []
+            for res in (getattr(r, "results", None) or []):
+                title = (getattr(res, "title", "") or "").strip()
+                dt = getattr(res, "publish_date", "") or ""
+                ex = getattr(res, "excerpts", None) or []
+                snippet = ""
+                if ex:
+                    snippet = " ".join(ex[0].split())[:240]
+                if title:
+                    out.append(f"{title}" + (f" ({dt})" if dt else "") + (f" — {snippet}" if snippet else ""))
+            return out[:max_items]
+        except Exception:
+            return []
+    return _cached(f"pnews:{PARALLEL_MODE}:" + ",".join(syms), TTL, produce)
+
+
+
+def _cache_read(key, ttl):
+    try:
+        p = os.path.join(CACHE_DIR, hashlib.md5(key.encode()).hexdigest() + ".json")
+        if os.path.exists(p) and time.time() - os.path.getmtime(p) < ttl:
+            with open(p) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+def _cache_write(key, val):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, hashlib.md5(key.encode()).hexdigest() + ".json"), "w") as f:
+            json.dump(val, f)
+    except Exception:
+        pass
+
+
+async def _exact_expiry_options(ib, sym, expiry, chain, spot, max_per_right):
+    """Public API contract; production-derived narrative omitted."""
+    from exitmgr.ibkr import Option
+
+    try:
+        ref = float(spot)
+    except (TypeError, ValueError):
+        return []
+    if ref != ref or ref <= 0:
+        return []
+    expiry = str(expiry or "").strip()
+    symbol = str(sym or "").strip().upper()
+    if len(expiry) != 8 or not expiry.isdigit() or not symbol:
+        return []
+    try:
+        cap = min(_OPTION_MAX_PER_RIGHT, max(1, int(max_per_right)))
+    except (TypeError, ValueError):
+        return []
+
+    trading_class = str(getattr(chain, "tradingClass", "") or "").strip().upper()
+    multiplier = str(getattr(chain, "multiplier", "") or "").strip()
+
+    async def _details(right):
+        kwargs = {"tradingClass": trading_class} if trading_class else {}
+        query = Option(symbol, expiry, 0.0, right, "SMART", multiplier, "USD", **kwargs)
+        try:
+            return await asyncio.wait_for(
+                ib.reqContractDetailsAsync(query), _OPTION_DETAIL_TIMEOUT_S)
+        except Exception:
+            return []
+
+    detail_groups = await asyncio.gather(_details("C"), _details("P"))
+    selected = []
+    seen_con_ids = set()
+    for right, details in zip(("C", "P"), detail_groups):
+        candidates = []
+        for detail in details or []:
+            contract = getattr(detail, "contract", None)
+            if contract is None:
+                continue
+            con_id = getattr(contract, "conId", None)
+            try:
+                con_id = int(con_id)
+                strike = float(getattr(contract, "strike", None))
+            except (TypeError, ValueError):
+                continue
+            if con_id <= 0 or strike <= 0 or strike != strike:
+                continue
+            if str(getattr(contract, "secType", "") or "").upper() != "OPT":
+                continue
+            if str(getattr(contract, "symbol", "") or "").strip().upper() != symbol:
+                continue
+            if str(getattr(contract, "lastTradeDateOrContractMonth", "") or "").strip() != expiry:
+                continue
+            if str(getattr(contract, "right", "") or "").upper()[:1] != right:
+                continue
+            if str(getattr(contract, "currency", "") or "").strip().upper() != "USD":
+                continue
+            actual_class = str(getattr(contract, "tradingClass", "") or "").strip().upper()
+            actual_multiplier = str(getattr(contract, "multiplier", "") or "").strip()
+            if trading_class and actual_class != trading_class:
+                continue
+            if multiplier and actual_multiplier != multiplier:
+                continue
+            candidates.append((abs(strike - ref), strike, con_id, contract))
+        for _, _, con_id, contract in sorted(
+                candidates, key=lambda row: (row[0], row[1], row[2]))[:cap]:
+            if con_id in seen_con_ids:
+                continue
+            seen_con_ids.add(con_id)
+            selected.append(contract)
+    return selected
+
+
+async def _bounded_option_tickers(ib, contracts):
+    """Public API contract; production-derived narrative omitted."""
+    unique = []
+    seen = set()
+    for contract in contracts or []:
+        con_id = getattr(contract, "conId", None)
+        try:
+            con_id = int(con_id)
+        except (TypeError, ValueError):
+            continue
+        if con_id <= 0 or con_id in seen:
+            continue
+        seen.add(con_id)
+        unique.append(contract)
+
+    out = []
+    for offset in range(0, len(unique), _OPTION_SNAPSHOT_BATCH_SIZE):
+        batch = unique[offset:offset + _OPTION_SNAPSHOT_BATCH_SIZE]
+        try:
+            out.extend(await asyncio.wait_for(
+                ib.reqTickersAsync(*batch), _OPTION_SNAPSHOT_TIMEOUT_S))
+        except Exception:
+            continue
+    return out
+
+async def _opt_one_ib(ib, sym):
+    import datetime as _dt, statistics as _st
+    from exitmgr.ibkr import Stock, pick_chain, underlying_price
+    stk = (await asyncio.wait_for(
+        ib.qualifyContractsAsync(Stock(sym, "SMART", "USD")), _IB_READ_TIMEOUT_S))[0]
+    params = await asyncio.wait_for(
+        ib.reqSecDefOptParamsAsync(sym, "", "STK", stk.conId), _IB_READ_TIMEOUT_S)
+    p = pick_chain(params, sym)
+    if not p or not p.expirations or not p.strikes:
+        return None
+    spot = await underlying_price(ib, stk)
+    today = _dt.date.today()
+    exps = sorted(p.expirations)
+
+    def _dte(e):
+        return (_dt.datetime.strptime(e, "%Y%m%d").date() - today).days
+
+
+
+    exp = next((e for e in exps if _dte(e) >= 7), exps[0])
+
+
+
+
+    exp_long = next((e for e in exps if _dte(e) >= 365), None)
+
+    async def _sample(expiry, per_side):
+        """Public API contract; production-derived narrative omitted."""
+        q = await _exact_expiry_options(
+            ib, sym, expiry, p, spot, max_per_right=per_side * 2)
+        if not q:
+            return 0.0, 0.0, [], {}
+        tks = await _bounded_option_tickers(ib, q)
+        cv = pv = 0.0
+        ivs = []
+        quotes = {}
+        for t in tks:
+            v = t.volume if (t.volume and t.volume == t.volume and t.volume > 0) else 0
+            if t.contract.right == "C":
+                cv += v
+            else:
+                pv += v
+            g = t.modelGreeks or t.lastGreeks
+            if g and g.impliedVol and g.delta is not None and 0.3 < abs(g.delta) < 0.7:
+                ivs.append(g.impliedVol)
+            b, a = getattr(t, "bid", None), getattr(t, "ask", None)
+            if all(x is not None and x == x and x > 0 for x in (b, a)) and a >= b:
+                quotes[(float(t.contract.strike), t.contract.right)] = (b + a) / 2.0
+        return cv, pv, ivs, quotes
+
+    cv, pv, ivs, _ = await _sample(exp, 5)
+
+    parts = []
+    if cv:
+        pcr = pv / cv
+        tag = " call-heavy/bullish" if pcr < 0.7 else " put-heavy/bearish" if pcr > 1.3 else ""
+        parts.append(f"P/C {pcr:.2f}{tag}")
+    if cv + pv > 0:
+        parts.append(f"{exp[4:6]}/{exp[6:]} opt vol {int(cv+pv):,}")
+    if ivs:
+        parts.append(f"ATM IV {_st.median(ivs)*100:.0f}% ({_dte(exp)}d)")
+
+
+
+    if exp_long:
+        try:
+            _, _, ivs_l, quotes_l = await _sample(exp_long, 4)
+            dte_l = _dte(exp_long)
+            if ivs_l:
+                parts.append(f"ATM IV {_st.median(ivs_l)*100:.0f}% ({dte_l}d)")
+            if quotes_l:
+                picks = sorted(quotes_l.items(), key=lambda kv: abs(kv[0][0] - spot))[:6]
+                shown = "; ".join(
+                    f"{r} {k:g} ${mid * 100:,.0f}" for (k, r), mid in
+                    sorted(picks, key=lambda kv: (kv[0][1], kv[0][0]))
+                )
+                parts.append(
+                    f"{exp_long[:4]}-{exp_long[4:6]}-{exp_long[6:]} mid/contract ({dte_l}d): {shown}")
+        except Exception:
+            pass
+
+    return f"{sym}: " + "; ".join(parts) if parts else None
+
+async def options_flow_ib(ib, names, limit=3):
+    names = [n for n in (names or [])][:limit]
+    if not names:
+        return []
+    key = "optflow_ib:" + ",".join(sorted(names))
+    c = _cache_read(key, TTL)
+    if c is not None:
+        return c
+    out = []
+    for s in names:
+        try:
+            ln = await _opt_one_ib(ib, s)
+            if ln:
+                out.append(ln)
+        except Exception:
+            continue
+    _cache_write(key, out)
+    return out

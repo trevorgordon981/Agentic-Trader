@@ -1,0 +1,44 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - name: Select exhaustive test shard
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          shard = int(os.environ["SHARD"])
+          files = sorted(Path("tests").glob("test_*.py"))
+          selected = [str(path) for index, path in enumerate(files) if index % 4 == shard]
+          if not selected:
+              raise SystemExit(f"empty test shard {shard}")
+          Path("pytest-files.txt").write_text("\n".join(selected) + "\n")
+          print(f"shard {shard}: {len(selected)} of {len(files)} test modules")
+          PY
+      - name: Run shard
+        run: PYTHONPATH=$PWD xargs python -m pytest -q --timeout=60 -- < pytest-files.txt

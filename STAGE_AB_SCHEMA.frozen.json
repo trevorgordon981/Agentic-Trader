@@ -1,0 +1,865 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://alfred.local/contracts/stage-ab.v3",
+  "contract_version": "stage-ab.v3",
+  "supersedes_sha256": "673cf04584a4b77ad0ce30c52ae0b6fb860215d7012a0965cc45c5aace2bae16",
+  "schema_history": [
+    {
+      "contract_version": "stage-ab.v1",
+      "sha256": "df3cc78b4b42750d235c5c0d3f522fcc1b829a5c07aec4c6b3c9bced9745a252",
+      "status": "SUPERSEDED"
+    },
+    {
+      "contract_version": "stage-ab.v2",
+      "sha256": "673cf04584a4b77ad0ce30c52ae0b6fb860215d7012a0965cc45c5aace2bae16",
+      "status": "SUPERSEDED"
+    }
+  ],
+  "status": "FROZEN",
+  "frozen_at": "2026-08-01T18:50:40-07:00",
+  "validation_entrypoints": {
+    "stage_a_output": "#/$defs/stage_a_output",
+    "stage_b_input": "#/$defs/stage_b_input",
+    "stage_b_output": "#/$defs/stage_b_output"
+  },
+  "document_parser": {
+    "mode": "single_json_document",
+    "rule": "Trim leading and trailing whitespace, decode exactly one JSON value, require decoder end position to equal input length, and reject markdown, prose, trailing bytes, or a second JSON value. Never regex-extract JSON.",
+    "unknown_keys": "reject",
+    "non_finite_numbers": "reject"
+  },
+  "model_visible_enums": {
+    "side": [
+      "debit",
+      "credit"
+    ],
+    "direction": [
+      "bullish",
+      "bearish"
+    ],
+    "structure": [
+      "long call",
+      "long put",
+      "call debit spread",
+      "put debit spread",
+      "cash secured put"
+    ],
+    "leg_action": [
+      "buy",
+      "sell"
+    ],
+    "leg_right": [
+      "call",
+      "put"
+    ],
+    "liquidity_status": [
+      "pass"
+    ]
+  },
+  "stage_a": {
+    "purpose": "Choose trade intent and pot-relative allocation without authoring an option price, strike, expiry, contract identifier, or quantity.",
+    "output_schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "intents"
+      ],
+      "properties": {
+        "intents": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/stage_a_intent"
+          }
+        }
+      }
+    },
+    "decline_exact_json": "{\"intents\":[]}",
+    "decline_is_terminal": true
+  },
+  "stage_b": {
+    "purpose": "Select exactly one runtime-priced candidate for one Stage A intent, or decline. The model never authors price or quantity.",
+    "input_schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "intent_id",
+        "intent",
+        "candidates"
+      ],
+      "properties": {
+        "intent_id": {
+          "type": "string",
+          "pattern": "^intent_[1-3]$"
+        },
+        "intent": {
+          "$ref": "#/$defs/stage_a_intent"
+        },
+        "candidates": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/runtime_candidate"
+          }
+        }
+      }
+    },
+    "output_schema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "candidate_id"
+          ],
+          "properties": {
+            "candidate_id": {
+              "type": "string",
+              "pattern": "^cand_[0-9a-f]{64}$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "decline"
+          ],
+          "properties": {
+            "decline": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    "selection_exact_example": "{\"candidate_id\":\"cand_<64 lowercase hex characters>\"}",
+    "decline_exact_json": "{\"decline\":true}",
+    "decline_is_terminal": true
+  },
+  "runtime_ownership": {
+    "model_authors": [
+      "stage_a_intent",
+      "stage_b_candidate_id_or_decline"
+    ],
+    "runtime_authors": [
+      "intent_id",
+      "candidate_id",
+      "quote_observed_at_utc",
+      "quote_age_seconds",
+      "expiry",
+      "dte",
+      "legs",
+      "combo_bid_per_share",
+      "combo_ask_per_share",
+      "width_usd",
+      "primary_leg_delta",
+      "primary_leg_iv",
+      "bid_ask_spread_pct",
+      "one_contract_cost_usd",
+      "one_contract_credit_usd",
+      "one_contract_max_loss_usd",
+      "allocation_budget_usd",
+      "live_cap_usd",
+      "max_affordable_quantity",
+      "quoted_total_debit_usd",
+      "quoted_total_credit_usd",
+      "quantity"
+    ]
+  },
+  "implementation_invariants": [
+    "Both model outputs are parsed as one complete JSON document under document_parser; substring or regex JSON extraction is forbidden.",
+    "Stage A output has exactly one top-level key: intents.",
+    "Stage A decline is exactly {\"intents\":[]} and terminates Stage A processing.",
+    "intended_hold_days is required and must be no greater than target_dte.",
+    "side=debit permits only long call, long put, call debit spread, or put debit spread.",
+    "side=credit permits only cash secured put and direction=bullish.",
+    "call structures require direction=bullish; put debit structures require direction=bearish.",
+    "The model never emits est_debit_usd, price, strike, expiry, con_id, width, or quantity in Stage A.",
+    "Runtime assigns intent IDs by Stage A array order: intent_1 through intent_3.",
+    "Runtime creates candidate_id as cand_ plus the full lowercase SHA-256 of canonical JSON containing contract_version, intent_id, underlying, side, direction, structure, expiry, and ordered leg economic identities {con_id, action, right, strike}.",
+    "Every candidate_id within one Stage B input is distinct; duplicate candidate economic identities are rejected before Stage B.",
+    "Stage B receives 3 to 5 candidates that all match its intent_id, underlying, side, direction, and structure.",
+    "Every Stage B candidate passed fresh two-sided quote, structure, DTE, liquidity, affordability, and live-cap checks before model exposure.",
+    "liquidity_status=pass means every leg has positive bid_per_share and ask_per_share, combo bid and ask are positive, and bid_ask_spread_pct is within the configured entry spread limit; bid_ask_spread_pct is the v2 declared liquidity metric.",
+    "For debit candidates, dte is at least intended_hold_days times the conviction multiplier: 8 for conviction 1 through 6, 6 for 7, 5 for 8, and 4 for 9 through 10. Four times intended hold is the absolute debit floor.",
+    "For cash-secured-put candidates, dte is within the configured 3 through 45 day credit window and no shorter than intended_hold_days.",
+    "A debit candidate has one_contract_credit_usd=null. A cash-secured-put candidate has width_usd=null, exactly one sell put leg, and non-null one_contract_credit_usd.",
+    "A long call has exactly one buy call leg; a long put has exactly one buy put leg; a debit spread has ordered buy then sell legs of the structure's right and a non-null positive width_usd.",
+    "For every debit candidate, one_contract_cost_usd equals combo_ask_per_share times 100 and one_contract_max_loss_usd equals one_contract_cost_usd.",
+    "For a debit spread, 0 < combo_ask_per_share <= width_usd and one_contract_max_loss_usd equals one_contract_cost_usd.",
+    "For a cash secured put, one_contract_cost_usd equals strike times 100 and one_contract_max_loss_usd equals one_contract_cost_usd minus one_contract_credit_usd.",
+    "Stage B selection is valid only when candidate_id exactly matches one supplied candidate; runtime binds the selected ordered con_ids and may never silently substitute a different contract on refresh.",
+    "Stage B decline is exactly {\"decline\":true}, contains no rationale field, and terminates processing for that intent.",
+    "Runtime computes quantity and quoted totals after Stage B, then requotes the exact selected con_ids and revalidates candidate identity, two-sided executable price, width, account state, and caps before approval and again before submission. If the selected candidate fails, runtime declines rather than reselecting silently.",
+    "If fewer than 3 candidates survive prefiltering, runtime does not call Stage B and declines that intent.",
+    "Continuous, daily-slate, and add-name paths use this same contract, units, candidate builder, and revalidation ownership."
+  ],
+  "$defs": {
+    "stage_a_output": {
+      "$ref": "#/stage_a/output_schema"
+    },
+    "stage_b_input": {
+      "$ref": "#/stage_b/input_schema"
+    },
+    "stage_b_output": {
+      "$ref": "#/stage_b/output_schema"
+    },
+    "stage_a_intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "underlying",
+        "side",
+        "direction",
+        "structure",
+        "target_dte",
+        "intended_hold_days",
+        "target_delta",
+        "conviction",
+        "allocation_pct_net_liq",
+        "alpha",
+        "thesis"
+      ],
+      "properties": {
+        "underlying": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9.]{0,7}$"
+        },
+        "side": {
+          "enum": [
+            "debit",
+            "credit"
+          ]
+        },
+        "direction": {
+          "enum": [
+            "bullish",
+            "bearish"
+          ]
+        },
+        "structure": {
+          "enum": [
+            "long call",
+            "long put",
+            "call debit spread",
+            "put debit spread",
+            "cash secured put"
+          ]
+        },
+        "target_dte": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 800
+        },
+        "intended_hold_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 365
+        },
+        "target_delta": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "conviction": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "allocation_pct_net_liq": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "alpha": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600
+        },
+        "thesis": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1200
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "side": {
+                "const": "credit"
+              }
+            },
+            "required": [
+              "side"
+            ]
+          },
+          "then": {
+            "properties": {
+              "direction": {
+                "const": "bullish"
+              },
+              "structure": {
+                "const": "cash secured put"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "structure": {
+                "enum": [
+                  "long call",
+                  "long put",
+                  "call debit spread",
+                  "put debit spread"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "structure": {
+                "enum": [
+                  "long call",
+                  "call debit spread"
+                ]
+              }
+            },
+            "required": [
+              "structure"
+            ]
+          },
+          "then": {
+            "properties": {
+              "direction": {
+                "const": "bullish"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "structure": {
+                "enum": [
+                  "long put",
+                  "put debit spread"
+                ]
+              }
+            },
+            "required": [
+              "structure"
+            ]
+          },
+          "then": {
+            "properties": {
+              "direction": {
+                "const": "bearish"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "runtime_leg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "con_id",
+        "action",
+        "right",
+        "strike",
+        "bid_per_share",
+        "ask_per_share",
+        "delta",
+        "iv"
+      ],
+      "properties": {
+        "con_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "action": {
+          "enum": [
+            "buy",
+            "sell"
+          ]
+        },
+        "right": {
+          "enum": [
+            "call",
+            "put"
+          ]
+        },
+        "strike": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "bid_per_share": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "ask_per_share": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "delta": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 1
+        },
+        "iv": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "runtime_candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "intent_id",
+        "underlying",
+        "side",
+        "direction",
+        "structure",
+        "quote_observed_at_utc",
+        "quote_age_seconds",
+        "expiry",
+        "dte",
+        "legs",
+        "combo_bid_per_share",
+        "combo_ask_per_share",
+        "width_usd",
+        "primary_leg_delta",
+        "primary_leg_iv",
+        "bid_ask_spread_pct",
+        "liquidity_status",
+        "one_contract_cost_usd",
+        "one_contract_credit_usd",
+        "one_contract_max_loss_usd",
+        "allocation_budget_usd",
+        "live_cap_usd",
+        "max_affordable_quantity"
+      ],
+      "properties": {
+        "candidate_id": {
+          "type": "string",
+          "pattern": "^cand_[0-9a-f]{64}$"
+        },
+        "intent_id": {
+          "type": "string",
+          "pattern": "^intent_[1-3]$"
+        },
+        "underlying": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9.]{0,7}$"
+        },
+        "side": {
+          "enum": [
+            "debit",
+            "credit"
+          ]
+        },
+        "direction": {
+          "enum": [
+            "bullish",
+            "bearish"
+          ]
+        },
+        "structure": {
+          "enum": [
+            "long call",
+            "long put",
+            "call debit spread",
+            "put debit spread",
+            "cash secured put"
+          ]
+        },
+        "quote_observed_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "quote_age_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "expiry": {
+          "type": "string",
+          "pattern": "^[0-9]{8}$"
+        },
+        "dte": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "legs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/runtime_leg"
+          }
+        },
+        "combo_bid_per_share": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "combo_ask_per_share": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "width_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "primary_leg_delta": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "primary_leg_iv": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "bid_ask_spread_pct": {
+          "type": "number",
+          "minimum": 0
+        },
+        "liquidity_status": {
+          "const": "pass"
+        },
+        "one_contract_cost_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "one_contract_credit_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "one_contract_max_loss_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "allocation_budget_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "live_cap_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_affordable_quantity": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "structure": {
+                "const": "long call"
+              }
+            },
+            "required": [
+              "structure"
+            ]
+          },
+          "then": {
+            "properties": {
+              "side": {
+                "const": "debit"
+              },
+              "direction": {
+                "const": "bullish"
+              },
+              "legs": {
+                "minItems": 1,
+                "maxItems": 1,
+                "prefixItems": [
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/runtime_leg"
+                      },
+                      {
+                        "properties": {
+                          "action": {
+                            "const": "buy"
+                          },
+                          "right": {
+                            "const": "call"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              "width_usd": {
+                "type": "null"
+              },
+              "one_contract_credit_usd": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "structure": {
+                "const": "long put"
+              }
+            },
+            "required": [
+              "structure"
+            ]
+          },
+          "then": {
+            "properties": {
+              "side": {
+                "const": "debit"
+              },
+              "direction": {
+                "const": "bearish"
+              },
+              "legs": {
+                "minItems": 1,
+                "maxItems": 1,
+                "prefixItems": [
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/runtime_leg"
+                      },
+                      {
+                        "properties": {
+                          "action": {
+                            "const": "buy"
+                          },
+                          "right": {
+                            "const": "put"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              "width_usd": {
+                "type": "null"
+              },
+              "one_contract_credit_usd": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "structure": {
+                "const": "call debit spread"
+              }
+            },
+            "required": [
+              "structure"
+            ]
+          },
+          "then": {
+            "properties": {
+              "side": {
+                "const": "debit"
+              },
+              "direction": {
+                "const": "bullish"
+              },
+              "legs": {
+                "minItems": 2,
+                "maxItems": 2,
+                "prefixItems": [
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/runtime_leg"
+                      },
+                      {
+                        "properties": {
+                          "action": {
+                            "const": "buy"
+                          },
+                          "right": {
+                            "const": "call"
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/runtime_leg"
+                      },
+                      {
+                        "properties": {
+                          "action": {
+                            "const": "sell"
+                          },
+                          "right": {
+                            "const": "call"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              "width_usd": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "one_contract_credit_usd": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "structure": {
+                "const": "put debit spread"
+              }
+            },
+            "required": [
+              "structure"
+            ]
+          },
+          "then": {
+            "properties": {
+              "side": {
+                "const": "debit"
+              },
+              "direction": {
+                "const": "bearish"
+              },
+              "legs": {
+                "minItems": 2,
+                "maxItems": 2,
+                "prefixItems": [
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/runtime_leg"
+                      },
+                      {
+                        "properties": {
+                          "action": {
+                            "const": "buy"
+                          },
+                          "right": {
+                            "const": "put"
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/runtime_leg"
+                      },
+                      {
+                        "properties": {
+                          "action": {
+                            "const": "sell"
+                          },
+                          "right": {
+                            "const": "put"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              "width_usd": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "one_contract_credit_usd": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "structure": {
+                "const": "cash secured put"
+              }
+            },
+            "required": [
+              "structure"
+            ]
+          },
+          "then": {
+            "properties": {
+              "side": {
+                "const": "credit"
+              },
+              "direction": {
+                "const": "bullish"
+              },
+              "legs": {
+                "minItems": 1,
+                "maxItems": 1,
+                "prefixItems": [
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/runtime_leg"
+                      },
+                      {
+                        "properties": {
+                          "action": {
+                            "const": "sell"
+                          },
+                          "right": {
+                            "const": "put"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              "width_usd": {
+                "type": "null"
+              },
+              "one_contract_credit_usd": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
