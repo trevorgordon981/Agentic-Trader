@@ -28,3 +28,7 @@ Install the pinned dependencies from `requirements.txt`, review `config.yaml`, a
 credentials outside the repository. Run the exhaustive suite with `pytest -q`. The public export
 contains synthetic fixtures only; production account history, host identities, and credentials are
 excluded.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
