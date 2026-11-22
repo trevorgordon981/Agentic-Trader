@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from dataclasses import replace
 from types import SimpleNamespace
 import inspect
@@ -9,12 +9,15 @@ import pytest
 import daily_recommend as dr
 from exitmgr.trader import ResolvedOrder
 
+_EXACT_EXPIRY = (date.today() + timedelta(days=86)).strftime("%Y%m%d")
+_OTHER_EXPIRY = (date.today() + timedelta(days=114)).strftime("%Y%m%d")
+
 
 def _args(**overrides):
     base = dict(
         ticker="NVDA", right="C", dte=86, delta=0.60, structure="",
         hold_days=7, conviction=7, thesis="model recommendation", tp=0.0, stop=0.0,
-        exact_expiry="20261120", exact_long_strike=205.0,
+        exact_expiry=_EXACT_EXPIRY, exact_long_strike=205.0,
         exact_short_strike=210.0, exact_qty=1, exact_max_debit=2.70,
         expected_earnings_date="2026-08-26",
         override_earnings_blackout=True,
@@ -26,12 +29,12 @@ def _args(**overrides):
 def _resolved(**overrides):
     long_contract = SimpleNamespace(
         conId=101, secType="OPT", symbol="NVDA", right="C", strike=205.0,
-        lastTradeDateOrContractMonth="20261120")
+        lastTradeDateOrContractMonth=_EXACT_EXPIRY)
     short_contract = SimpleNamespace(
         conId=102, secType="OPT", symbol="NVDA", right="C", strike=210.0,
-        lastTradeDateOrContractMonth="20261120")
+        lastTradeDateOrContractMonth=_EXACT_EXPIRY)
     values = dict(
-        underlying="NVDA", right="C", expiry="20261120", strike=205.0,
+        underlying="NVDA", right="C", expiry=_EXACT_EXPIRY, strike=205.0,
         qty=1, limit=2.65, contract=long_contract,
         short_strike=210.0, short_contract=short_contract,
         structure="call debit spread", entry_bid=2.55, entry_ask=2.65,
@@ -51,7 +54,7 @@ def test_exact_args_are_all_or_none_and_fix_structure_quantity():
     spec = dr.exact_spread_from_args(_args())
     assert (spec.underlying, spec.right, spec.expiry, spec.long_strike,
             spec.short_strike, spec.qty, spec.max_debit) == (
-                "NVDA", "C", "20261120", 205.0, 210.0, 1, 2.70)
+                "NVDA", "C", _EXACT_EXPIRY, 205.0, 210.0, 1, 2.70)
     idea = dr.user_directed_idea(_args())
     assert idea.structure == "call debit spread"
     assert dr.exact_spread_for(idea) == spec
@@ -127,14 +130,14 @@ def test_exact_order_gate_binds_identity_qty_fresh_ask_cap_and_availability():
     lambda r: setattr(r.contract, "secType", "STK"),
     lambda r: setattr(r.contract, "symbol", "SYMU"),
     lambda r: setattr(r.contract, "right", "P"),
-    lambda r: setattr(r.contract, "lastTradeDateOrContractMonth", "20261218"),
+    lambda r: setattr(r.contract, "lastTradeDateOrContractMonth", _OTHER_EXPIRY),
     lambda r: setattr(r.contract, "strike", 210.0),
     lambda r: setattr(r.contract, "conId", 0),
     lambda r: setattr(r.short_contract, "conId", r.contract.conId),
     lambda r: (setattr(r, "contract", r.short_contract),
                setattr(r, "short_contract", SimpleNamespace(
                    conId=101, secType="OPT", symbol="NVDA", right="C", strike=205.0,
-                   lastTradeDateOrContractMonth="20261120"))),
+                   lastTradeDateOrContractMonth=_EXACT_EXPIRY))),
 ])
 def test_exact_money_boundary_rejects_mutated_contract_objects(mutate):
     spec = _bound_spec()
@@ -160,9 +163,9 @@ async def test_exact_resolver_qualifies_only_named_legs_and_uses_combo_ask(monke
     idea = dr.user_directed_idea(_args(exact_max_debit=3.0))
     stock = SimpleNamespace(conId=11, symbol="NVDA")
     long = SimpleNamespace(conId=101, secType="OPT", symbol="NVDA", right="C", strike=205.0,
-                           lastTradeDateOrContractMonth="20261120")
+                           lastTradeDateOrContractMonth=_EXACT_EXPIRY)
     short = SimpleNamespace(conId=102, secType="OPT", symbol="NVDA", right="C", strike=210.0,
-                            lastTradeDateOrContractMonth="20261120")
+                            lastTradeDateOrContractMonth=_EXACT_EXPIRY)
     greeks = SimpleNamespace(delta=0.60, impliedVol=0.40)
 
     class FakeIB:
