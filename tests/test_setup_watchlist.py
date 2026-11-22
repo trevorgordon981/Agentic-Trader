@@ -106,12 +106,10 @@ def test_concurrent_process_additions_do_not_lose_targets(tmp_path):
 def test_active_target_bound_matches_fresh_opening_research_capacity(tmp_path):
     path = str(tmp_path / "watch.md")
     for i in range(sw.MAX_TARGETS):
-        sw.add_target(f"T{i:02d}", setup="bounded", path=path,
-                      added="2026-08-29", expires="2026-09-28")
+        sw.add_target(f"T{i:02d}", setup="bounded", path=path)
     assert sw.MAX_TARGETS == 35
     with pytest.raises(ValueError, match="maximum"):
-        sw.add_target("EXTRA", setup="too many", path=path,
-                      added="2026-08-29", expires="2026-09-28")
+        sw.add_target("EXTRA", setup="too many", path=path)
 
 
 def test_oversize_watchlist_is_ignored(tmp_path):
