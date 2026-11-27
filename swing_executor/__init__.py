@@ -15,6 +15,7 @@ Boundary:
 
 from swing_executor.coordinator import (
     CoordinatorConfig,
+    CoordinatorConfigError,
     CycleReport,
     SwingExecutionCoordinator,
     validate_coordinator_config,
@@ -32,6 +33,7 @@ from swing_executor.graduation import (
 )
 from swing_executor.ledger import (
     AccountCashState,
+    AccountMismatchError,
     LedgerCorruptionError,
     ReservationDecision,
     ReservationError,
@@ -60,11 +62,13 @@ from swing_executor.stops import (
 
 __all__ = [
     "AccountCashState",
+    "AccountMismatchError",
     "BrokerOrder",
     "BrokerPosition",
     "BrokerStopClient",
     "ClosedPaperTrade",
     "CoordinatorConfig",
+    "CoordinatorConfigError",
     "CycleReport",
     "GraduationContract",
     "GraduationReport",

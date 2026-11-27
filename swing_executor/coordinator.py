@@ -14,7 +14,9 @@ from typing import Mapping, Optional, Sequence
 from swing_executor.graduation import format_entry_alert, format_exit_alert
 from swing_executor.ledger import (
     AccountCashState,
+    AccountMismatchError,
     LedgerCorruptionError,
+    ReservationError,
     SlotLedger,
     round_tick,
 )
@@ -23,7 +25,10 @@ from swing_executor.stops import (
     BrokerOrder,
     BrokerStopClient,
     ProtectiveStopEngine,
+    SimulatedBroker,
     StopActionResult,
+    TERMINAL_STATUSES,
+    WORKING_STATUSES,
 )
 
 
@@ -53,8 +58,8 @@ class CoordinatorConfig:
 
 def validate_coordinator_config(cfg: CoordinatorConfig) -> CoordinatorConfig:
     """Validate config with fail-closed armed-startup and domain checks."""
-    if not str(cfg.account or "").strip():
-        raise CoordinatorConfigError("account must be a non-empty string")
+    if not isinstance(cfg.account, str) or not cfg.account.strip() or cfg.account != cfg.account.strip():
+        raise CoordinatorConfigError("account must be a non-empty trimmed string")
     if isinstance(cfg.client_id, bool) or not isinstance(cfg.client_id, int) or cfg.client_id < 0:
         raise CoordinatorConfigError(f"client_id must be a non-negative integer, got {cfg.client_id!r}")
 
@@ -106,6 +111,7 @@ class CycleReport:
     session_day: str
     proposals_seen: int = 0
     reserved: list[str] = field(default_factory=list)
+    filled: list[dict[str, object]] = field(default_factory=list)
     rejected: list[dict[str, str]] = field(default_factory=list)
     stops_armed: list[StopActionResult] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
@@ -128,6 +134,7 @@ class SwingExecutionCoordinator:
         self.broker = broker
         self.ledger = SlotLedger(
             self.config.db_path,
+            account=self.config.account,
             max_concurrent_slots=self.config.max_concurrent_slots,
             max_slot_exposure_fraction=self.config.max_slot_exposure_fraction,
             max_deployed_fraction=self.config.max_deployed_fraction,
@@ -168,6 +175,26 @@ class SwingExecutionCoordinator:
         """Execute one deterministic entry + protective-stop arming cycle."""
         report = CycleReport(session_day=session_day)
 
+        # Preflight 0: demo-only simulation switch constraint & strict account binding
+        # BEFORE touching ledger or broker.
+        if auto_fill_in_sim and not isinstance(self.broker, SimulatedBroker):
+            raise CoordinatorConfigError(
+                "auto_fill_in_sim=True is restricted to SimulatedBroker demo instances"
+            )
+        if cash_state.account != self.config.account:
+            raise AccountMismatchError(
+                f"cash_state.account {cash_state.account!r} does not match coordinator account {self.config.account!r}"
+            )
+        if self.ledger.account is not None and self.ledger.account != self.config.account:
+            raise AccountMismatchError(
+                f"ledger.account {self.ledger.account!r} does not match coordinator account {self.config.account!r}"
+            )
+        broker_account = getattr(self.broker, "account", None)
+        if isinstance(broker_account, str) and broker_account.strip() and broker_account != self.config.account:
+            raise AccountMismatchError(
+                f"broker.account {broker_account!r} does not match coordinator account {self.config.account!r}"
+            )
+
         # Preflight 1: kill switch check BEFORE touching broker
         if Path(self.config.kill_switch_path).exists():
             report.blocked_reason = "kill_switch_active"
@@ -175,7 +202,7 @@ class SwingExecutionCoordinator:
 
         # Preflight 2: persisted ledger & counter integrity BEFORE touching broker
         try:
-            self.ledger.validate_integrity(cash_state.account, session_day)
+            self.ledger.validate_integrity(self.config.account, session_day)
         except LedgerCorruptionError:
             raise
 
@@ -201,6 +228,7 @@ class SwingExecutionCoordinator:
                 session_day=session_day,
                 external_open_symbols=external_open_symbols,
                 now_iso=as_of,
+                expected_account=self.config.account,
             )
             if not decision.allowed or decision.reservation is None:
                 report.rejected.append({"symbol": proposal.symbol, "reason": decision.reason})
@@ -210,7 +238,12 @@ class SwingExecutionCoordinator:
             report.reserved.append(res.reservation_id)
 
             if not self.config.arm:
-                self.ledger.update_reservation_status(res.reservation_id, status="CANCELLED", now_iso=as_of)
+                self.ledger.update_reservation_status(
+                    res.reservation_id,
+                    status="CANCELLED",
+                    now_iso=as_of,
+                    expected_account=self.config.account,
+                )
                 report.rejected.append({"symbol": proposal.symbol, "reason": "dry_run_not_armed"})
                 continue
 
@@ -228,27 +261,132 @@ class SwingExecutionCoordinator:
                 tif="DAY",
             )
             placed = await self.broker.place_order(entry_order)
-            self.ledger.update_reservation_status(
-                res.reservation_id,
-                status="WORKING" if placed.status in ("PreSubmitted", "Submitted") else "REJECTED",
-                order_id=placed.order_id,
-                perm_id=placed.perm_id,
-                now_iso=as_of,
-            )
-            if placed.status not in ("PreSubmitted", "Submitted", "Filled"):
-                report.rejected.append({"symbol": proposal.symbol, "reason": f"broker_rejected({placed.status})"})
-                continue
 
-            if auto_fill_in_sim and hasattr(self.broker, "simulate_partial_fill"):
-                self.broker.simulate_partial_fill(placed, qty)  # type: ignore[attr-defined]
+            # Reconcile returned broker order identity before trusting status or arming protection.
+            if placed.account != self.config.account:
                 self.ledger.update_reservation_status(
                     res.reservation_id,
-                    status="FILLED",
+                    status="UNKNOWN",
                     order_id=placed.order_id,
                     perm_id=placed.perm_id,
                     now_iso=as_of,
+                    expected_account=self.config.account,
                 )
-                filled_notional = round(qty * limit_px, 2)
+                raise AccountMismatchError(
+                    f"broker returned order for account {placed.account!r}, expected {self.config.account!r}"
+                )
+            if placed.symbol.upper() != proposal.symbol.upper():
+                self.ledger.update_reservation_status(
+                    res.reservation_id,
+                    status="UNKNOWN",
+                    order_id=placed.order_id,
+                    perm_id=placed.perm_id,
+                    now_iso=as_of,
+                    expected_account=self.config.account,
+                )
+                raise ReservationError(
+                    f"broker returned order for symbol {placed.symbol!r}, expected {proposal.symbol!r}"
+                )
+
+            # Demo-only fill driver for SimulatedBroker: transitions a working order to Filled
+            # so it flows through the exact same broker-response reconciliation path below.
+            if (
+                auto_fill_in_sim
+                and isinstance(self.broker, SimulatedBroker)
+                and placed.status in WORKING_STATUSES
+                and placed.remaining > 0
+            ):
+                self.broker.simulate_partial_fill(placed, placed.remaining)
+
+            raw_filled = placed.filled
+            if isinstance(raw_filled, bool) or not isinstance(raw_filled, int) or raw_filled < 0 or raw_filled > qty:
+                self.ledger.update_reservation_status(
+                    res.reservation_id,
+                    status="UNKNOWN",
+                    order_id=placed.order_id,
+                    perm_id=placed.perm_id,
+                    now_iso=as_of,
+                    expected_account=self.config.account,
+                )
+                report.rejected.append(
+                    {
+                        "symbol": proposal.symbol,
+                        "reason": f"invalid_broker_fill_qty({raw_filled!r},ordered={qty})",
+                    }
+                )
+                continue
+            filled_qty = int(raw_filled)
+
+            if placed.status == "Filled":
+                if filled_qty <= 0:
+                    self.ledger.update_reservation_status(
+                        res.reservation_id,
+                        status="UNKNOWN",
+                        order_id=placed.order_id,
+                        perm_id=placed.perm_id,
+                        filled_qty=0,
+                        now_iso=as_of,
+                        expected_account=self.config.account,
+                    )
+                    report.rejected.append({"symbol": proposal.symbol, "reason": "broker_filled_without_fill_qty"})
+                    continue
+                ledger_status = "FILLED" if filled_qty == qty else "PARTIALLY_FILLED"
+            elif placed.status in WORKING_STATUSES:
+                ledger_status = "FILLED" if filled_qty == qty else "WORKING"
+            elif placed.status in TERMINAL_STATUSES:
+                if filled_qty > 0:
+                    ledger_status = "FILLED" if filled_qty == qty else "PARTIALLY_FILLED"
+                else:
+                    ledger_status = "CANCELLED" if placed.status in ("Cancelled", "ApiCancelled") else "REJECTED"
+                    self.ledger.update_reservation_status(
+                        res.reservation_id,
+                        status=ledger_status,
+                        order_id=placed.order_id,
+                        perm_id=placed.perm_id,
+                        filled_qty=0,
+                        now_iso=as_of,
+                        expected_account=self.config.account,
+                    )
+                    report.rejected.append({"symbol": proposal.symbol, "reason": f"broker_rejected({placed.status})"})
+                    continue
+            else:
+                ledger_status = "UNKNOWN"
+                self.ledger.update_reservation_status(
+                    res.reservation_id,
+                    status=ledger_status,
+                    order_id=placed.order_id,
+                    perm_id=placed.perm_id,
+                    filled_qty=filled_qty,
+                    now_iso=as_of,
+                    expected_account=self.config.account,
+                )
+                report.rejected.append({"symbol": proposal.symbol, "reason": f"broker_unknown_status({placed.status})"})
+                if filled_qty <= 0:
+                    continue
+
+            if ledger_status != "UNKNOWN":
+                self.ledger.update_reservation_status(
+                    res.reservation_id,
+                    status=ledger_status,
+                    order_id=placed.order_id,
+                    perm_id=placed.perm_id,
+                    filled_qty=filled_qty,
+                    now_iso=as_of,
+                    expected_account=self.config.account,
+                )
+
+            if filled_qty > 0:
+                fill_px = (
+                    float(placed.limit_price)
+                    if (
+                        not isinstance(placed.limit_price, bool)
+                        and isinstance(placed.limit_price, (int, float))
+                        and math.isfinite(placed.limit_price)
+                        and placed.limit_price > 0.0
+                    )
+                    else limit_px
+                )
+                filled_notional = round(filled_qty * fill_px, 2)
                 updated_open = dict(effective_cash.open_symbol_notional)
                 updated_open[proposal.symbol] = round(updated_open.get(proposal.symbol, 0.0) + filled_notional, 2)
                 effective_cash = AccountCashState(
@@ -261,11 +399,24 @@ class SwingExecutionCoordinator:
                     unsettled_t1_proceeds_usd=effective_cash.unsettled_t1_proceeds_usd,
                     open_symbol_notional=updated_open,
                 )
+                report.filled.append(
+                    {
+                        "reservation_id": res.reservation_id,
+                        "symbol": proposal.symbol,
+                        "order_id": placed.order_id,
+                        "perm_id": placed.perm_id,
+                        "ordered_qty": qty,
+                        "filled_qty": filled_qty,
+                        "fill_price": fill_px,
+                        "ledger_status": ledger_status,
+                        "broker_status": placed.status,
+                    }
+                )
                 report.alerts.append(
                     format_entry_alert(
                         symbol=proposal.symbol,
-                        qty=qty,
-                        fill_price=limit_px,
+                        qty=filled_qty,
+                        fill_price=fill_px,
                         stop_price=proposal.stop_price,
                         strategy_id=proposal.strategy_id,
                     )
@@ -274,7 +425,7 @@ class SwingExecutionCoordinator:
                     symbol=proposal.symbol,
                     direction=proposal.direction,
                     stop_price=proposal.stop_price,
-                    managed_qty=qty,
+                    managed_qty=filled_qty,
                     trade_key=res.reservation_id,
                     dry_run=False,
                 )

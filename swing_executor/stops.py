@@ -349,6 +349,17 @@ class ProtectiveStopEngine:
                 tif="GTC",
             )
             placed = await self.broker.place_order(new_order)
+            if placed.account != self.account:
+                return StopActionResult(
+                    action="stop_arm_account_mismatch",
+                    symbol=sym,
+                    fresh_held_qty=fresh_held,
+                    stop_rearmed=False,
+                    uncertain_holdings=True,
+                    rearm_deferred_uncertain_qty=True,
+                    order=placed,
+                    detail={"expected_account": self.account, "returned_account": placed.account},
+                )
             if placed.status in TERMINAL_STATUSES:
                 return StopActionResult(
                     action="stop_arm_rejected",
@@ -479,6 +490,17 @@ class ProtectiveStopEngine:
                 tif=live_stop.tif,
             )
             placed = await self.broker.place_order(updated)
+            if placed.account != self.account:
+                return StopActionResult(
+                    action="stop_sync_account_mismatch",
+                    symbol=sym,
+                    fresh_held_qty=fresh_held,
+                    stop_rearmed=False,
+                    uncertain_holdings=True,
+                    rearm_deferred_uncertain_qty=True,
+                    order=placed,
+                    detail={"expected_account": self.account, "returned_account": placed.account},
+                )
             if placed.status in TERMINAL_STATUSES:
                 return StopActionResult(
                     action="stop_sync_rejected",

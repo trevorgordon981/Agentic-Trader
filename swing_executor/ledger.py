@@ -23,12 +23,26 @@ from typing import Mapping, Optional, Sequence
 OWNED_REF_PREFIXES: tuple[str, ...] = ("SWING_ENTRY:", "SWING_STOP:", "SWING_EXIT:")
 ACTIVE_RESERVATION_STATUSES: frozenset[str] = frozenset({"RESERVED", "SUBMITTED", "WORKING", "UNKNOWN"})
 ALL_RESERVATION_STATUSES: frozenset[str] = frozenset(
-    {"RESERVED", "SUBMITTED", "WORKING", "FILLED", "CANCELLED", "REJECTED", "EXPIRED", "UNKNOWN"}
+    {
+        "RESERVED",
+        "SUBMITTED",
+        "WORKING",
+        "PARTIALLY_FILLED",
+        "FILLED",
+        "CANCELLED",
+        "REJECTED",
+        "EXPIRED",
+        "UNKNOWN",
+    }
 )
 
 
 class ReservationError(RuntimeError):
     """Raised when a reservation request violates domain invariants."""
+
+
+class AccountMismatchError(ReservationError):
+    """Raised when snapshot, ledger, coordinator, or broker order accounts do not match."""
 
 
 class LedgerCorruptionError(RuntimeError):
@@ -204,6 +218,7 @@ class SlotReservation:
     updated_at: str
     order_id: Optional[int] = None
     perm_id: Optional[int] = None
+    filled_qty: int = 0
 
 
 @dataclass(frozen=True)
@@ -222,6 +237,7 @@ class SlotLedger:
         self,
         db_path: Path | str,
         *,
+        account: Optional[str] = None,
         lock_path: Optional[Path | str] = None,
         max_concurrent_slots: int = 4,
         max_slot_exposure_fraction: float = 0.20,
@@ -232,6 +248,10 @@ class SlotLedger:
         max_notional_per_day: float = 50000.0,
         sector_groups: Optional[Mapping[str, Sequence[str]]] = None,
     ) -> None:
+        if account is not None:
+            if not isinstance(account, str) or not account.strip() or account != account.strip():
+                raise LedgerCorruptionError(f"SlotLedger.account must be a non-empty trimmed string, got {account!r}")
+        self.account: Optional[str] = account
         self.max_concurrent_slots = _require_int(max_concurrent_slots, name="max_concurrent_slots", positive=True)
         self.max_slot_exposure_fraction = _require_finite(
             max_slot_exposure_fraction, name="max_slot_exposure_fraction", positive=True
@@ -297,10 +317,14 @@ class SlotLedger:
                     updated_at TEXT NOT NULL,
                     order_id INTEGER,
                     perm_id INTEGER,
+                    filled_qty INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(account, order_ref)
                 )
                 """
             )
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(slot_reservations)").fetchall()}
+            if "filled_qty" not in cols:
+                conn.execute("ALTER TABLE slot_reservations ADD COLUMN filled_qty INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_slot_res_active ON slot_reservations(account, status, symbol)"
             )
@@ -338,7 +362,37 @@ class SlotLedger:
             finally:
                 os.close(fd)
 
+    def _assert_account_match(
+        self,
+        account: str,
+        *,
+        context: str,
+        expected_account: Optional[str] = None,
+    ) -> None:
+        if not isinstance(account, str) or not account.strip() or account != account.strip():
+            raise AccountMismatchError(f"{context}: account must be a non-empty trimmed string, got {account!r}")
+        if self.account is not None and account != self.account:
+            raise AccountMismatchError(
+                f"{context}: account mismatch (ledger={self.account!r}, got={account!r})"
+            )
+        if expected_account is not None:
+            if (
+                not isinstance(expected_account, str)
+                or not expected_account.strip()
+                or expected_account != expected_account.strip()
+            ):
+                raise AccountMismatchError(
+                    f"{context}: expected_account must be a non-empty trimmed string, got {expected_account!r}"
+                )
+            if account != expected_account:
+                raise AccountMismatchError(
+                    f"{context}: account mismatch (expected={expected_account!r}, got={account!r})"
+                )
+
     def _validate_row(self, row: sqlite3.Row) -> SlotReservation:
+        account = str(row["account"] or "")
+        if not account.strip() or account != account.strip():
+            raise LedgerCorruptionError(f"invalid reservation account {account!r}")
         status = str(row["status"] or "")
         if status not in ALL_RESERVATION_STATUSES:
             raise LedgerCorruptionError(f"invalid reservation status {status!r}")
@@ -357,9 +411,19 @@ class SlotLedger:
         client_id = _require_int(row["client_id"], name="reservation.client_id", non_negative=True)
         order_id = None if row["order_id"] is None else _require_int(row["order_id"], name="reservation.order_id", non_negative=True)
         perm_id = None if row["perm_id"] is None else _require_int(row["perm_id"], name="reservation.perm_id", non_negative=True)
+        row_keys = row.keys()
+        filled_qty = (
+            _require_int(row["filled_qty"], name="reservation.filled_qty", non_negative=True)
+            if "filled_qty" in row_keys and row["filled_qty"] is not None
+            else 0
+        )
+        if filled_qty > qty:
+            raise LedgerCorruptionError(
+                f"reservation.filled_qty ({filled_qty}) exceeds reservation.qty ({qty})"
+            )
         return SlotReservation(
             reservation_id=str(row["reservation_id"]),
-            account=str(row["account"]),
+            account=account,
             client_id=client_id,
             symbol=sym,
             side=side,
@@ -373,10 +437,12 @@ class SlotLedger:
             updated_at=str(row["updated_at"]),
             order_id=order_id,
             perm_id=perm_id,
+            filled_qty=filled_qty,
         )
 
     def validate_integrity(self, account: str, session_day: str) -> tuple[list[SlotReservation], int, float]:
         """Validate ALL persisted reservations and daily counters for ``account``; fail closed on corruption."""
+        self._assert_account_match(account, context="validate_integrity")
         conn = self._connect()
         try:
             rows = conn.execute(
@@ -413,8 +479,14 @@ class SlotLedger:
         order_ref: Optional[str] = None,
         external_open_symbols: Sequence[str] = (),
         now_iso: Optional[str] = None,
+        expected_account: Optional[str] = None,
     ) -> ReservationDecision:
         """Atomically validate limits and reserve a multi-slot entry under the mutation lock."""
+        self._assert_account_match(
+            cash_state.account,
+            context="reserve_entry_slot",
+            expected_account=expected_account,
+        )
         sym = str(symbol or "").strip().upper()
         if not sym:
             raise ReservationError("symbol must be non-empty")
@@ -477,7 +549,12 @@ class SlotLedger:
                 )
 
             # Portfolio gross deployed cap
-            active_reserved_notional = sum(r.notional_usd for r in active if r.side == "BUY")
+            def _unfilled_notional(r: SlotReservation) -> float:
+                if r.filled_qty > 0:
+                    return round(max(0, r.qty - r.filled_qty) * r.limit_price, 2)
+                return r.notional_usd
+
+            active_reserved_notional = sum(_unfilled_notional(r) for r in active if r.side == "BUY")
             current_deployed = sum(cash_state.open_symbol_notional.values()) + active_reserved_notional
             deployed_cap = cash_state.net_liq_usd * self.max_deployed_fraction
             if current_deployed + notional > deployed_cap + 1e-9:
@@ -490,7 +567,7 @@ class SlotLedger:
             symbol_notional = {s.upper(): float(v) for s, v in cash_state.open_symbol_notional.items()}
             for r in active:
                 if r.side == "BUY":
-                    symbol_notional[r.symbol] = symbol_notional.get(r.symbol, 0.0) + r.notional_usd
+                    symbol_notional[r.symbol] = symbol_notional.get(r.symbol, 0.0) + _unfilled_notional(r)
             for group_name, members in self.sector_groups.items():
                 if sym in members:
                     group_total = sum(val for s, val in symbol_notional.items() if s in members)
@@ -578,7 +655,9 @@ class SlotLedger:
         status: str,
         order_id: Optional[int] = None,
         perm_id: Optional[int] = None,
+        filled_qty: Optional[int] = None,
         now_iso: Optional[str] = None,
+        expected_account: Optional[str] = None,
     ) -> None:
         if status not in ALL_RESERVATION_STATUSES:
             raise ReservationError(f"unsupported reservation status {status!r}")
@@ -586,20 +665,38 @@ class SlotLedger:
             _require_int(order_id, name="order_id", non_negative=True)
         if perm_id is not None:
             _require_int(perm_id, name="perm_id", non_negative=True)
+        if filled_qty is not None:
+            filled_qty = _require_int(filled_qty, name="filled_qty", non_negative=True)
         ts = now_iso or dt.datetime.now(dt.timezone.utc).isoformat()
         with self.mutation_lock():
             conn = self._connect()
             try:
+                existing = conn.execute(
+                    "SELECT account, qty FROM slot_reservations WHERE reservation_id = ?",
+                    (reservation_id,),
+                ).fetchone()
+                if existing is None:
+                    raise ReservationError(f"reservation_id not found: {reservation_id!r}")
+                self._assert_account_match(
+                    str(existing["account"]),
+                    context="update_reservation_status",
+                    expected_account=expected_account,
+                )
+                if filled_qty is not None and filled_qty > int(existing["qty"]):
+                    raise ReservationError(
+                        f"filled_qty ({filled_qty}) exceeds reserved qty ({existing['qty']})"
+                    )
                 cur = conn.execute(
                     """
                     UPDATE slot_reservations
                     SET status = ?,
                         order_id = COALESCE(?, order_id),
                         perm_id = COALESCE(?, perm_id),
+                        filled_qty = COALESCE(?, filled_qty),
                         updated_at = ?
                     WHERE reservation_id = ?
                     """,
-                    (status, order_id, perm_id, ts, reservation_id),
+                    (status, order_id, perm_id, filled_qty, ts, reservation_id),
                 )
                 if cur.rowcount != 1:
                     raise ReservationError(f"reservation_id not found: {reservation_id!r}")

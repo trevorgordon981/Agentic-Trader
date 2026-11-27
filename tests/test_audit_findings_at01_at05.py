@@ -178,6 +178,9 @@ def test_at02_manager_check_caps_fails_closed_on_invalid_caps(tmp_path: Path) ->
         '{"2026-08-12": {"orders_opened": 1, "notional_opened": false}}',
         '{"2026-08-12": {"orders_opened": 1, "orders_opened": 2, "notional_opened": 10.0}}',
         '{"2026-08-12": ["not", "an", "object"]}',
+        '{"2026-08-12": null}',
+        '{"2026-08-11": null}',
+        '{"2026-08-11": {"orders_opened": -1, "notional_opened": 10.0}}',
     ],
 )
 def test_at03_throttle_store_refuses_malformed_records_and_preserves_evidence(
@@ -189,10 +192,31 @@ def test_at03_throttle_store_refuses_malformed_records_and_preserves_evidence(
 
     with pytest.raises(EntryThrottleUnreadable):
         store.read_day(day)
+    with pytest.raises(EntryThrottleUnreadable):
+        entry_day_open_counts(None, store, day)
 
     # Attempting to add MUST fail closed and NEVER overwrite corrupted evidence.
     assert store.add(day, 1, 50.0) is False
     assert store.path.read_text(encoding="utf-8") == raw_json
+
+
+def test_at03_null_current_day_record_never_reads_as_zero_and_blocks_pre_submit(tmp_path: Path) -> None:
+    day = "2026-01-02"
+    raw = '{"2026-01-02": null}'
+    store = EntryThrottleStore(tmp_path / "null.json")
+    store.path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(EntryThrottleUnreadable):
+        store.read_day(day)
+    with pytest.raises(EntryThrottleUnreadable):
+        entry_day_open_counts(None, store, day)
+    assert store.add(day, 1, 100.0) is False
+    assert store.path.read_text(encoding="utf-8") == raw
+
+    sm = StateManager(tmp_path / "state.json")
+    sm.state.daily_stats[day] = None  # type: ignore[assignment]
+    with pytest.raises(EntryThrottleUnreadable):
+        entry_day_open_counts(sm, None, day)
 
 
 @pytest.mark.parametrize(

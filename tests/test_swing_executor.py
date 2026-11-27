@@ -11,13 +11,17 @@ import pytest
 
 from swing_executor import (
     AccountCashState,
+    AccountMismatchError,
     BrokerOrder,
+    BrokerPosition,
     ClosedPaperTrade,
     CoordinatorConfig,
+    CoordinatorConfigError,
     GraduationContract,
     LedgerCorruptionError,
     PriceBar,
     ProtectiveStopEngine,
+    ReservationError,
     SignalProposal,
     SimulatedBroker,
     SlotLedger,
@@ -35,7 +39,6 @@ from swing_executor import (
     same_broker_order,
     validate_coordinator_config,
 )
-from swing_executor.coordinator import CoordinatorConfigError
 from swing_executor.ledger import validate_persisted_counter_json
 
 
@@ -374,6 +377,11 @@ def test_ledger_fails_closed_on_corrupted_counters_and_json(tmp_path: Path) -> N
     with pytest.raises(LedgerCorruptionError):
         validate_persisted_counter_json(bad_json)
 
+    null_json = tmp_path / "null_counters.json"
+    null_json.write_text('{"2026-06-06": null}', encoding="utf-8")
+    with pytest.raises(LedgerCorruptionError):
+        validate_persisted_counter_json(null_json)
+
 
 def test_monotonic_and_trailing_stop_math() -> None:
     assert compute_monotonic_stop("LONG", 48.0, 47.0) == 48.0
@@ -547,3 +555,365 @@ def test_paper_graduation_excludes_proxy_exits_and_never_auto_promotes() -> None
 
     p_demote = evaluate_live_probation([100.0, -650.0], live_net_liq_usd=10_000.0)
     assert p_demote.status == "PROBATION_DEMOTED" and p_demote.allow_new_entries is False
+
+
+# ---------------------------------------------------------------------------
+# AT06: Strict account binding across coordinator, ledger, snapshot, and broker
+# ---------------------------------------------------------------------------
+
+
+def _crossover_bars(symbol: str = "SYN2X_A") -> dict[str, list[PriceBar]]:
+    closes = [48.0, 47.5, 47.0, 46.8, 47.2, 50.0]
+    return {
+        symbol: [
+            PriceBar(f"2026-06-0{i + 1}T15:55:00-04:00", px - 0.2, px + 0.3, px - 0.4, px, 1000.0)
+            for i, px in enumerate(closes)
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_at06_cross_account_cash_snapshot_rejected_before_ledger_or_broker(tmp_path: Path) -> None:
+    """Reproduces exact AT06 counterexample: cap=1 must NOT be bypassed by a second account snapshot."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "ledger.sqlite"
+    broker = SimulatedBroker(account="SIM_ACCT_A")
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_ACCT_A",
+            client_id=77,
+            db_path=db_path,
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+            max_orders_per_day=1,
+            max_notional_per_day=20_000.0,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+
+    cash_a = AccountCashState("SIM_ACCT_A", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    first = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash_a,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    assert len(first.reserved) == 1
+    assert broker.place_order_calls == 1
+
+    # Control: same account hits daily_order_cap=1.
+    second_same = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash_a,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:56:00Z",
+    )
+    assert second_same.reserved == []
+    assert second_same.rejected[0]["reason"].startswith("daily_order_cap")
+    assert broker.place_order_calls == 1
+
+    # Attack / counterexample: supplying a DIFFERENT account's cash snapshot MUST fail closed
+    # BEFORE touching the ledger or broker.
+    cash_b = AccountCashState("SIM_ACCT_B", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    with pytest.raises(AccountMismatchError, match="SIM_ACCT_B"):
+        await coord.run_entry_cycle(
+            bars_by_symbol=_crossover_bars("SYN2X_A"),
+            cash_state=cash_b,
+            session_day="2026-06-06",
+            as_of="2026-06-06T15:57:00Z",
+        )
+    assert broker.place_order_calls == 1
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        b_res = conn.execute("SELECT COUNT(*) FROM slot_reservations WHERE account = 'SIM_ACCT_B'").fetchone()[0]
+        b_cnt = conn.execute("SELECT COUNT(*) FROM daily_counters WHERE account = 'SIM_ACCT_B'").fetchone()[0]
+        a_cnt = conn.execute("SELECT orders_opened FROM daily_counters WHERE account = 'SIM_ACCT_A'").fetchone()[0]
+    finally:
+        conn.close()
+    assert b_res == 0
+    assert b_cnt == 0
+    assert a_cnt == 1
+
+
+def test_at06_slot_ledger_enforces_account_equality_before_mutation(tmp_path: Path) -> None:
+    ledger = SlotLedger(tmp_path / "bound.sqlite", account="SIM_ACCT_A", max_orders_per_day=1)
+    cash_b = AccountCashState("SIM_ACCT_B", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+
+    with pytest.raises(AccountMismatchError):
+        ledger.validate_integrity("SIM_ACCT_B", "2026-06-06")
+
+    with pytest.raises(AccountMismatchError):
+        ledger.reserve_entry_slot(
+            cash_state=cash_b,
+            client_id=77,
+            symbol="SYN2X_A",
+            qty=10,
+            limit_price=50.0,
+            session_day="2026-06-06",
+        )
+
+    # Even an unbound ledger enforces explicit expected_account.
+    unbound = SlotLedger(tmp_path / "unbound.sqlite", max_orders_per_day=1)
+    with pytest.raises(AccountMismatchError):
+        unbound.reserve_entry_slot(
+            cash_state=cash_b,
+            client_id=77,
+            symbol="SYN2X_A",
+            qty=10,
+            limit_price=50.0,
+            session_day="2026-06-06",
+            expected_account="SIM_ACCT_A",
+        )
+
+
+@pytest.mark.asyncio
+async def test_at06_broker_returned_mismatched_order_account_fails_closed_to_unknown(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "ledger.sqlite"
+
+    class _WrongAccountBroker:
+        async def req_open_orders(self) -> list[BrokerOrder]:
+            return []
+
+        async def req_positions(self) -> list[BrokerPosition]:
+            return []
+
+        async def place_order(self, order: BrokerOrder) -> BrokerOrder:
+            return BrokerOrder(
+                account="WRONG_ACCT",
+                symbol=order.symbol,
+                action=order.action,
+                order_type=order.order_type,
+                total_quantity=order.total_quantity,
+                client_id=order.client_id,
+                order_id=order.order_id,
+                perm_id=99901,
+                order_ref=order.order_ref,
+                limit_price=order.limit_price,
+                status="Filled",
+                filled=order.total_quantity,
+            )
+
+        async def cancel_order(self, order: BrokerOrder) -> None:
+            return None
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_ACCT_A",
+            client_id=77,
+            db_path=db_path,
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=_WrongAccountBroker(),
+    )
+    cash_a = AccountCashState("SIM_ACCT_A", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    with pytest.raises(AccountMismatchError, match="WRONG_ACCT"):
+        await coord.run_entry_cycle(
+            bars_by_symbol=_crossover_bars("SYN2X_A"),
+            cash_state=cash_a,
+            session_day="2026-06-06",
+            as_of="2026-06-06T15:55:00Z",
+        )
+
+    rows, _, _ = coord.ledger.validate_integrity("SIM_ACCT_A", "2026-06-06")
+    assert len(rows) == 1
+    assert rows[0].status == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# AT07: Immediate Filled & partial-fill reconciliation on generic BrokerStopClient
+# ---------------------------------------------------------------------------
+
+
+class _ProtocolImmediateFillBroker:
+    """Strict 4-method BrokerStopClient wrapper with NO simulate_partial_fill attribute."""
+
+    def __init__(self, *, account: str, fill_qty_override: int | None = None, post_status: str | None = None) -> None:
+        self._inner = SimulatedBroker(account=account)
+        self._fill_qty_override = fill_qty_override
+        self._post_status = post_status
+
+    async def req_open_orders(self) -> list[BrokerOrder]:
+        return await self._inner.req_open_orders()
+
+    async def req_positions(self) -> list[BrokerPosition]:
+        return await self._inner.req_positions()
+
+    async def place_order(self, order: BrokerOrder) -> BrokerOrder:
+        placed = await self._inner.place_order(order)
+        if placed.action.upper() == "BUY":
+            fill_n = placed.total_quantity if self._fill_qty_override is None else self._fill_qty_override
+            if fill_n > 0:
+                self._inner.simulate_partial_fill(placed, fill_n)
+            if self._post_status is not None:
+                placed.status = self._post_status
+        return placed
+
+    async def cancel_order(self, order: BrokerOrder) -> None:
+        await self._inner.cancel_order(order)
+
+
+@pytest.mark.asyncio
+async def test_at07_generic_protocol_broker_immediate_filled_records_fill_and_arms_stop(tmp_path: Path) -> None:
+    """Reproduces exact AT07 counterexample: 4-method BrokerStopClient returning Filled 40/40."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "ledger.sqlite"
+
+    broker = _ProtocolImmediateFillBroker(account="SIM_PROTO")
+    assert not hasattr(broker, "simulate_partial_fill")
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_PROTO",
+            client_id=77,
+            db_path=db_path,
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState("SIM_PROTO", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+
+    # Default auto_fill_in_sim=False!
+    report = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+
+    assert len(report.reserved) == 1
+    assert report.rejected == []
+    assert len(report.filled) == 1
+    assert report.filled[0]["symbol"] == "SYN2X_A"
+    assert report.filled[0]["ordered_qty"] == 40
+    assert report.filled[0]["filled_qty"] == 40
+    assert report.filled[0]["ledger_status"] == "FILLED"
+    assert report.filled[0]["broker_status"] == "Filled"
+    assert len(report.alerts) == 1 and "SYN2X_A BUY 40" in report.alerts[0]
+
+    # Ledger must record FILLED with filled_qty=40 (NEVER REJECTED).
+    rows, _, _ = coord.ledger.validate_integrity("SIM_PROTO", "2026-06-06")
+    assert len(rows) == 1
+    assert rows[0].status == "FILLED"
+    assert rows[0].filled_qty == 40
+
+    # Protective stop must be armed immediately for all 40 held shares.
+    assert len(report.stops_armed) == 1
+    stop_res = report.stops_armed[0]
+    assert stop_res.action == "stop_armed_gtc"
+    assert stop_res.stop_rearmed is True
+    assert stop_res.fresh_held_qty == 40
+    assert stop_res.order is not None
+    assert stop_res.order.order_type == "STP"
+    assert stop_res.order.total_quantity == 40
+    assert stop_res.order.aux_price == 47.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "post_status,expected_ledger_status",
+    [
+        ("Submitted", "WORKING"),
+        ("Cancelled", "PARTIALLY_FILLED"),
+    ],
+)
+async def test_at07_partial_fill_binds_stop_quantity_to_executed_shares(
+    tmp_path: Path, post_status: str, expected_ledger_status: str
+) -> None:
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    broker = _ProtocolImmediateFillBroker(account="SIM_PROTO", fill_qty_override=15, post_status=post_status)
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_PROTO",
+            client_id=77,
+            db_path=tmp_path / "ledger.sqlite",
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState("SIM_PROTO", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    report = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+
+    assert report.rejected == []
+    assert len(report.filled) == 1
+    assert report.filled[0]["filled_qty"] == 15
+    assert report.filled[0]["ordered_qty"] == 40
+    assert report.filled[0]["ledger_status"] == expected_ledger_status
+
+    rows, _, _ = coord.ledger.validate_integrity("SIM_PROTO", "2026-06-06")
+    assert rows[0].status == expected_ledger_status
+    assert rows[0].filled_qty == 15
+
+    # Stop MUST be sized to 15 executed/held shares, NOT 40 ordered shares.
+    assert len(report.stops_armed) == 1
+    assert report.stops_armed[0].action == "stop_armed_gtc"
+    assert report.stops_armed[0].order is not None
+    assert report.stops_armed[0].order.total_quantity == 15
+
+
+@pytest.mark.asyncio
+async def test_at07_inconsistent_filled_zero_qty_and_demo_switch_constraint(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    broker = _ProtocolImmediateFillBroker(account="SIM_PROTO", fill_qty_override=0, post_status="Filled")
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_PROTO",
+            client_id=77,
+            db_path=tmp_path / "ledger.sqlite",
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState("SIM_PROTO", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+
+    # Demo-only switch MUST be rejected for non-SimulatedBroker adapters before touching broker.
+    with pytest.raises(CoordinatorConfigError, match="SimulatedBroker"):
+        await coord.run_entry_cycle(
+            bars_by_symbol=_crossover_bars("SYN2X_A"),
+            cash_state=cash,
+            session_day="2026-06-06",
+            as_of="2026-06-06T15:55:00Z",
+            auto_fill_in_sim=True,
+        )
+
+    # Filled status with filled=0 has no execution evidence -> fail closed to UNKNOWN with rejection reason.
+    report = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    assert report.filled == []
+    assert report.stops_armed == []
+    assert report.rejected == [{"symbol": "SYN2X_A", "reason": "broker_filled_without_fill_qty"}]
+    rows, _, _ = coord.ledger.validate_integrity("SIM_PROTO", "2026-06-06")
+    assert rows[0].status == "UNKNOWN"
+    assert rows[0].filled_qty == 0

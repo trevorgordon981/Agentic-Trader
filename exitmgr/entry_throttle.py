@@ -132,14 +132,20 @@ class EntryThrottleStore:
         if not isinstance(data, dict):
             raise EntryThrottleUnreadable(
                 f"entry throttle file is a {type(data).__name__}, not an object ({self.path})")
+        for day_key, rec in data.items():
+            if not isinstance(day_key, str) or not day_key.strip():
+                raise EntryThrottleUnreadable(
+                    f"entry throttle file contains invalid day key {day_key!r} ({self.path})")
+            _validate_day_record(rec, day_key, self.path)
         return data
 
     def read_day(self, date_str) -> Tuple[int, float]:
         """Public API contract; production-derived narrative omitted."""
-        rec = self._read_all().get(str(date_str))
-        if rec is None:
+        key = str(date_str)
+        data = self._read_all()
+        if key not in data:
             return 0, 0.0
-        return _validate_day_record(rec, date_str, self.path)
+        return _validate_day_record(data[key], key, self.path)
 
 
 
@@ -241,12 +247,25 @@ def entry_day_open_counts(state_manager, throttle_store: Optional[EntryThrottleS
 
         orders, notional = throttle_store.read_day(date_str)
     ds = None
+    key = str(date_str)
+    daily_stats = None
     try:
         daily_stats = state_manager.state.daily_stats if state_manager is not None else None
-        if isinstance(daily_stats, dict):
-            ds = daily_stats.get(date_str)
     except Exception:
-        ds = None
+        daily_stats = None
+    if isinstance(daily_stats, dict):
+        if date_str in daily_stats:
+            ds = daily_stats[date_str]
+            if ds is None:
+                raise EntryThrottleUnreadable(
+                    f"in-memory entry throttle record for {date_str} is NoneType, not DailyStats (<in-memory>)"
+                )
+        elif key in daily_stats:
+            ds = daily_stats[key]
+            if ds is None:
+                raise EntryThrottleUnreadable(
+                    f"in-memory entry throttle record for {key} is NoneType, not DailyStats (<in-memory>)"
+                )
     if ds is not None:
         mem_orders = _validate_nonneg_int(
             getattr(ds, "orders_opened", 0),
