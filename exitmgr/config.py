@@ -1006,23 +1006,33 @@ def load_config(
 ) -> Config:
     """Public API contract; production-derived narrative omitted."""
 
-    if os.path.exists(config_path):
+    if os.path.isfile(config_path):
         cfg = Config.from_yaml(config_path)
+    elif arm:
+        raise ConfigError(
+            "config",
+            f"armed startup requires an existing config file; not found: {config_path!r}",
+        )
     else:
-
-
         cfg = Config()
         _apply_trading(cfg, None)
 
-
     if interval is not None:
-        cfg.loop.interval_seconds = interval
+        cfg.loop.interval_seconds = _check_value(
+            "loop.interval_seconds", interval, _spec_for("loop.interval_seconds", "int")
+        )
     if max_orders_cycle is not None:
-        cfg.caps.max_orders_per_cycle = max_orders_cycle
+        cfg.caps.max_orders_per_cycle = _check_value(
+            "caps.max_orders_per_cycle", max_orders_cycle, _spec_for("caps.max_orders_per_cycle", "int")
+        )
     if max_orders_day is not None:
-        cfg.caps.max_orders_per_day = max_orders_day
+        cfg.caps.max_orders_per_day = _check_value(
+            "caps.max_orders_per_day", max_orders_day, _spec_for("caps.max_orders_per_day", "int")
+        )
     if max_notional_day is not None:
-        cfg.caps.max_notional_per_day = max_notional_day
+        cfg.caps.max_notional_per_day = _check_value(
+            "caps.max_notional_per_day", max_notional_day, _spec_for("caps.max_notional_per_day", "number")
+        )
 
 
     cfg.dry_run = not arm

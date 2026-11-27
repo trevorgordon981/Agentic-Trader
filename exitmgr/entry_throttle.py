@@ -7,6 +7,7 @@ from pathlib import Path, PurePath
 from typing import Optional, Tuple
 import fcntl
 import json
+import math
 import os
 import time
 
@@ -15,10 +16,83 @@ import time
 RETENTION_DAYS = 30
 
 DEFAULT_LOCK_TIMEOUT_SECONDS = 2.0
+_DAY_RECORD_KEYS = frozenset({"orders_opened", "notional_opened"})
 
 
 class EntryThrottleUnreadable(RuntimeError):
     """Public API contract; production-derived narrative omitted."""
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value!r}")
+
+
+def _no_duplicate_keys(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        out[key] = value
+    return out
+
+
+def _validate_nonneg_int(value, *, field_name: str, date_str, path: Path) -> int:
+    if isinstance(value, bool):
+        raise EntryThrottleUnreadable(
+            f"entry throttle {field_name} for {date_str} must be an integer, not bool ({path})"
+        )
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise EntryThrottleUnreadable(
+                f"entry throttle {field_name} for {date_str} must be a whole number, got {value!r} ({path})"
+            )
+        parsed = int(value)
+    elif isinstance(value, int):
+        parsed = value
+    else:
+        raise EntryThrottleUnreadable(
+            f"entry throttle {field_name} for {date_str} must be an integer, got {type(value).__name__} ({path})"
+        )
+    if parsed < 0:
+        raise EntryThrottleUnreadable(
+            f"entry throttle {field_name} for {date_str} must be >= 0, got {parsed!r} ({path})"
+        )
+    return parsed
+
+
+def _validate_nonneg_finite(value, *, field_name: str, date_str, path: Path) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise EntryThrottleUnreadable(
+            f"entry throttle {field_name} for {date_str} must be a finite number, got {type(value).__name__} ({path})"
+        )
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise EntryThrottleUnreadable(
+            f"entry throttle {field_name} for {date_str} must be finite and >= 0, got {value!r} ({path})"
+        )
+    return parsed
+
+
+def _validate_day_record(rec, date_str, path: Path) -> Tuple[int, float]:
+    if not isinstance(rec, dict):
+        raise EntryThrottleUnreadable(
+            f"entry throttle record for {date_str} is a {type(rec).__name__}, not an object ({path})"
+        )
+    keys = set(rec.keys())
+    if keys != _DAY_RECORD_KEYS:
+        missing = sorted(_DAY_RECORD_KEYS - keys)
+        extra = sorted(keys - _DAY_RECORD_KEYS)
+        raise EntryThrottleUnreadable(
+            f"entry throttle record for {date_str} has invalid schema "
+            f"(missing={missing}, extra={extra}) ({path})"
+        )
+    orders = _validate_nonneg_int(
+        rec["orders_opened"], field_name="orders_opened", date_str=date_str, path=path
+    )
+    notional = _validate_nonneg_finite(
+        rec["notional_opened"], field_name="notional_opened", date_str=date_str, path=path
+    )
+    return orders, notional
 
 
 class EntryThrottleStore:
@@ -45,7 +119,11 @@ class EntryThrottleStore:
         """Public API contract; production-derived narrative omitted."""
         try:
             with open(self.path, "r") as f:
-                data = json.load(f)
+                data = json.load(
+                    f,
+                    parse_constant=_reject_json_constant,
+                    object_pairs_hook=_no_duplicate_keys,
+                )
         except FileNotFoundError:
             return {}
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
@@ -61,16 +139,7 @@ class EntryThrottleStore:
         rec = self._read_all().get(str(date_str))
         if rec is None:
             return 0, 0.0
-        if not isinstance(rec, dict):
-            raise EntryThrottleUnreadable(
-                f"entry throttle record for {date_str} is a {type(rec).__name__}, not an object "
-                f"({self.path})")
-        try:
-            return (int(rec.get("orders_opened", 0) or 0),
-                    float(rec.get("notional_opened", 0.0) or 0.0))
-        except (TypeError, ValueError) as e:
-            raise EntryThrottleUnreadable(
-                f"entry throttle counters for {date_str} are unusable ({self.path}): {e}") from e
+        return _validate_day_record(rec, date_str, self.path)
 
 
 
@@ -105,7 +174,7 @@ class EntryThrottleStore:
         fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
+            json.dump(data, f, indent=2, sort_keys=True, allow_nan=False)
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp_path, self.path)
@@ -124,34 +193,33 @@ class EntryThrottleStore:
         """Public API contract; production-derived narrative omitted."""
         key = str(date_str)
         try:
+            delta_orders = _validate_nonneg_int(
+                order_count, field_name="order_count", date_str=key, path=self.path
+            )
+            delta_notional = _validate_nonneg_finite(
+                notional, field_name="notional", date_str=key, path=self.path
+            )
             with self._locked():
                 data = self._read_all()
-                rec = data.get(key)
-                if not isinstance(rec, dict):
-                    rec = {"orders_opened": 0, "notional_opened": 0.0}
-                try:
-                    prev_orders = int(rec.get("orders_opened", 0) or 0)
-                except (TypeError, ValueError):
-                    prev_orders = 0
-                try:
-                    prev_notional = float(rec.get("notional_opened", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    prev_notional = 0.0
+                if key in data:
+                    prev_orders, prev_notional = _validate_day_record(data[key], key, self.path)
+                else:
+                    prev_orders, prev_notional = 0, 0.0
+                new_notional = round(prev_notional + delta_notional, 6)
+                if not math.isfinite(new_notional):
+                    raise EntryThrottleUnreadable(
+                        f"entry throttle notional overflow for {key} ({self.path})"
+                    )
                 data[key] = {
-                    "orders_opened": prev_orders + int(order_count),
-                    "notional_opened": round(prev_notional + float(notional), 6),
+                    "orders_opened": prev_orders + delta_orders,
+                    "notional_opened": new_notional,
                 }
-
 
                 for stale in sorted(data)[:-RETENTION_DAYS]:
                     data.pop(stale, None)
                 self._write_all(data)
             return True
         except EntryThrottleUnreadable as e:
-
-
-
-
             print(f"[WARN] entry throttle counter NOT persisted for {key}: {e}. "
                   f"Entries are BLOCKED until this file is repaired or removed.")
             return False
@@ -172,18 +240,28 @@ def entry_day_open_counts(state_manager, throttle_store: Optional[EntryThrottleS
     if throttle_store is not None:
 
         orders, notional = throttle_store.read_day(date_str)
+    ds = None
     try:
-        ds = state_manager.state.daily_stats.get(date_str) if state_manager is not None else None
-        if ds is not None:
-            orders = max(orders, int(getattr(ds, "orders_opened", 0)))
-            notional = max(notional, float(getattr(ds, "notional_opened", 0.0)))
+        daily_stats = state_manager.state.daily_stats if state_manager is not None else None
+        if isinstance(daily_stats, dict):
+            ds = daily_stats.get(date_str)
     except Exception:
-
-
-
-
-
-        pass
+        ds = None
+    if ds is not None:
+        mem_orders = _validate_nonneg_int(
+            getattr(ds, "orders_opened", 0),
+            field_name="in_memory.orders_opened",
+            date_str=date_str,
+            path=Path("<in-memory>"),
+        )
+        mem_notional = _validate_nonneg_finite(
+            getattr(ds, "notional_opened", 0.0),
+            field_name="in_memory.notional_opened",
+            date_str=date_str,
+            path=Path("<in-memory>"),
+        )
+        orders = max(orders, mem_orders)
+        notional = max(notional, mem_notional)
     return orders, notional
 
 

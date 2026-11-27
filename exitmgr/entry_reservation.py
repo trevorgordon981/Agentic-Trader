@@ -529,9 +529,22 @@ class EntryReservationLedger:
         path = self.ledger_path if path is None else Path(path)
         if not path.exists():
             return self._empty_state()
+        def _reject_constant(value):
+            raise ValueError(f"non-finite JSON constant {value!r}")
+        def _no_dup_keys(pairs):
+            out = {}
+            for k, v in pairs:
+                if k in out:
+                    raise ValueError(f"duplicate JSON object key {k!r}")
+                out[k] = v
+            return out
         try:
             with path.open() as handle:
-                state = json.load(handle)
+                state = json.load(
+                    handle,
+                    parse_constant=_reject_constant,
+                    object_pairs_hook=_no_dup_keys,
+                )
         except Exception as exc:
             raise EntryReservationError(
                 f"entry reservation ledger unreadable: {path}: {exc}") from exc

@@ -1,0 +1,73 @@
+# Safe paper-trading profile for local IBKR paper gateway (port 7497).
+# Autonomous approval is disabled by default; caps and paths are explicit.
+ib:
+  host: 127.0.0.1
+  port: 7497
+  client_id: 42
+  protective_client_id: 189
+  market_data_type: 3
+journal:
+  path: ./paper_trades.log
+state:
+  path: ./paper_exitmgr_state.json
+kill_switch:
+  path: ./KILL_SWITCH
+loop:
+  interval_seconds: 60
+scope:
+  mode: journal
+caps:
+  max_orders_per_cycle: 3
+  max_orders_per_day: 10
+  max_notional_per_day: 25000.0
+rules:
+  profit_target_pct: null
+  stop_pct: 30.0
+  time_stop_days: 15
+  spread_exit_bid_anchor: true
+  exit_market_orders: false
+  exit_slippage_floor: 0.50
+  scale_out:
+    enabled: false
+    first_target_pct: 20.0
+    trim_fraction: 0.5
+  trailing:
+    enabled: true
+    activation_gain_pct: 20.0
+    giveback_fraction: 0.4
+  auto_trail:
+    enabled: true
+    activation_gain_pct: 20.0
+    giveback_fraction: 0.5
+construction:
+  min_dte: 25
+  prefer_dte_max: 800
+  sl_pct: -0.30
+  deterministic_construction: true
+  earnings_use_hold_window: true
+  max_entry_spread_pct: 25.0
+  max_combo_spread_pct: 45.0
+  stage_b_quote_max_age_s: 45.0
+trading:
+  auto_approve_within_gates: false
+  manage_positions: true
+  manage_positions_shadow_only: true
+  allow_model_names: false
+  approved_names:
+    - SPY
+    - QQQ
+    - IWM
+  blocked_names: []
+  blocked_sector_keywords: []
+  max_sector_agg_pct: 0.35
+  max_trade_pct: 0.10
+  max_single_name_agg_pct: 0.25
+  max_trade_pct_hard: 0.15
+  max_concurrent: 4
+  daily_halt_pct: 0.10
+  cash_buffer_pct: 0.05
+  entry_limit_buffer_pct: 0.05
+  credit_entries_enabled: false
+  assigned_stock_authority_enabled: false
+  baseline_path: ./paper_day_baseline.json
+  audit_path: ./paper_audit.jsonl

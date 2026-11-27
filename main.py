@@ -3,9 +3,9 @@
 import asyncio
 import typer
 
-from exitmgr.config import load_config
-from exitmgr.manager import ExitManager
-from exitmgr.runtime_identity import freeze_runtime_identity
+from exitmgr.config import ConfigError, load_config
+from exitmgr.manager import BrokerStartupError, ExitManager
+from exitmgr.runtime_identity import RuntimeIdentityError, freeze_runtime_identity
 
 
 app = typer.Typer(
@@ -27,26 +27,31 @@ def main(
 ):
     """Public API contract; production-derived narrative omitted."""
 
-    cfg = load_config(
-        config_path=config,
-        dry_run=dry_run,
-        arm=arm,
-        loop=loop,
-        interval=interval,
-        max_orders_cycle=max_orders_cycle,
-        max_orders_day=max_orders_day,
-        max_notional_day=max_notional_day,
-    )
+    try:
+        cfg = load_config(
+            config_path=config,
+            dry_run=dry_run,
+            arm=arm,
+            loop=loop,
+            interval=interval,
+            max_orders_cycle=max_orders_cycle,
+            max_orders_day=max_orders_day,
+            max_notional_day=max_notional_day,
+        )
+        runtime_identity = freeze_runtime_identity(cfg, require_clean_code=True)
+    except (ConfigError, RuntimeIdentityError) as e:
+        typer.echo(f"[ERROR] Startup configuration refused: {e}", err=True)
+        raise typer.Exit(code=2)
 
-
-    runtime_identity = freeze_runtime_identity(cfg, require_clean_code=True)
     manager = ExitManager(cfg, runtime_identity=runtime_identity)
-
 
     try:
         asyncio.run(manager.run())
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user")
+    except BrokerStartupError as e:
+        typer.echo(f"[ERROR] Broker startup failed: {e}", err=True)
+        raise typer.Exit(code=1)
     except Exception as e:
         print(f"[ERROR] Unexpected error: {e}")
         raise

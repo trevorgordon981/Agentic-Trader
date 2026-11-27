@@ -9,6 +9,22 @@ permissions:
   contents: read
 
 jobs:
+  offline-demo-and-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - name: Run broker-free offline simulation demo
+        run: PYTHONPATH=$PWD python scripts/demo_offline_simulation.py
+      - name: Run audit regression and swing_executor suites
+        run: PYTHONPATH=$PWD python -m pytest -q --timeout=60 tests/test_audit_findings_at01_at05.py tests/test_swing_executor.py
+
   pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 25

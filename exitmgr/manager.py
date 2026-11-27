@@ -52,6 +52,10 @@ from exitmgr.campaign_conflicts import (
 _STOP_BACKSTOP_PCT = 30.0
 
 
+class BrokerStartupError(RuntimeError):
+    """Raised when the exit manager cannot establish an initial broker session."""
+
+
 
 
 
@@ -3774,12 +3778,40 @@ class ExitManager:
             notional_today = daily_stats.notional_closed
 
 
-        if orders_today >= self.config.caps.max_orders_per_day:
-            return False, f"Daily order cap reached: {orders_today} >= {self.config.caps.max_orders_per_day}"
+        max_orders = self.config.caps.max_orders_per_day
+        max_notional = self.config.caps.max_notional_per_day
+        if (
+            isinstance(max_orders, bool)
+            or not isinstance(max_orders, int)
+            or max_orders < 1
+        ):
+            return False, f"Invalid daily order cap configured: {max_orders!r}"
+        if (
+            isinstance(max_notional, bool)
+            or not isinstance(max_notional, (int, float))
+            or not math.isfinite(float(max_notional))
+            or float(max_notional) <= 0.0
+        ):
+            return False, f"Invalid daily notional cap configured: {max_notional!r}"
+        if (
+            isinstance(orders_today, bool)
+            or not isinstance(orders_today, int)
+            or orders_today < 0
+        ):
+            return False, f"Invalid daily orders counter: {orders_today!r}"
+        if (
+            isinstance(notional_today, bool)
+            or not isinstance(notional_today, (int, float))
+            or not math.isfinite(float(notional_today))
+            or float(notional_today) < 0.0
+        ):
+            return False, f"Invalid daily notional counter: {notional_today!r}"
 
+        if orders_today >= max_orders:
+            return False, f"Daily order cap reached: {orders_today} >= {max_orders}"
 
-        if notional_today >= self.config.caps.max_notional_per_day:
-            return False, f"Daily notional cap reached: ${notional_today:.2f} >= ${self.config.caps.max_notional_per_day:.2f}"
+        if notional_today >= max_notional:
+            return False, f"Daily notional cap reached: ${notional_today:.2f} >= ${max_notional:.2f}"
 
         return True, ""
 
@@ -9686,7 +9718,7 @@ class ExitManager:
         connected = await self.ib_conn.connect()
         if not connected:
             print("[ERROR] Could not connect to IB - exiting")
-            return
+            raise BrokerStartupError("Could not connect to IB")
 
 
         if not await self._reconcile_on_startup():
