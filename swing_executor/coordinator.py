@@ -266,7 +266,7 @@ class SwingExecutionCoordinator:
             return 0
         return int(slot_budget // proposal.signal_price)
 
-    def _has_adequate_owned_stop(
+    def _inspect_owned_stop_coverage(
         self,
         fresh_orders: list[BrokerOrder],
         *,
@@ -274,7 +274,8 @@ class SwingExecutionCoordinator:
         expected_action: str,
         desired_qty: int,
         held_abs: int,
-    ) -> bool:
+    ) -> tuple[bool, int]:
+        """Return ``(adequately_covered, actual_covered_qty)`` from live broker open orders."""
         sym = symbol.upper()
         owned_stops = [
             o
@@ -288,8 +289,6 @@ class SwingExecutionCoordinator:
                 expected_action=expected_action,
             )
         ]
-        if not owned_stops:
-            return False
         owned_stop_ids = {id(o) for o in owned_stops}
         non_owned_orders = [o for o in fresh_orders if id(o) not in owned_stop_ids]
         other_close_qty = count_other_working_close_qty(
@@ -299,8 +298,28 @@ class SwingExecutionCoordinator:
             close_side=expected_action,
         )
         uncovered_target = max(0, min(desired_qty, held_abs - other_close_qty))
-        covered_qty = sum(max(0, o.remaining) for o in owned_stops)
-        return covered_qty >= uncovered_target
+        owned_stop_qty = sum(max(0, o.remaining) for o in owned_stops)
+        shortfall = max(0, uncovered_target - owned_stop_qty)
+        actual_covered_qty = max(0, desired_qty - shortfall)
+        return shortfall == 0, actual_covered_qty
+
+    def _has_adequate_owned_stop(
+        self,
+        fresh_orders: list[BrokerOrder],
+        *,
+        symbol: str,
+        expected_action: str,
+        desired_qty: int,
+        held_abs: int,
+    ) -> bool:
+        adequately_covered, _ = self._inspect_owned_stop_coverage(
+            fresh_orders,
+            symbol=symbol,
+            expected_action=expected_action,
+            desired_qty=desired_qty,
+            held_abs=held_abs,
+        )
+        return adequately_covered
 
     async def _ensure_protective_stop(
         self,
@@ -372,7 +391,8 @@ class SwingExecutionCoordinator:
             confirmed_remaining = max(0, int(stop_res.order.remaining))
             if confirmed_remaining >= required_stop_qty:
                 return True, managed_qty
-            partial_covered = min(managed_qty, confirmed_remaining + other_close_qty)
+            shortfall = required_stop_qty - confirmed_remaining
+            partial_covered = max(0, managed_qty - shortfall)
             return False, max(prev_clamped, partial_covered)
         return False, prev_clamped
 
@@ -383,11 +403,14 @@ class SwingExecutionCoordinator:
         as_of: Optional[str] = None,
         dry_run: Optional[bool] = None,
     ) -> ReconciliationReport:
-        """Reconcile persisted WORKING/PARTIALLY_FILLED entries against live broker state.
+        """Reconcile persisted WORKING/PARTIALLY_FILLED entries and verify FILLED stop coverage.
 
         Queries broker open orders, positions, and optional terminal order status;
         transitions newly filled entries to ``FILLED``/``PARTIALLY_FILLED`` and
         idempotently arms GTC protective stops via ``ProtectiveStopEngine``.
+        Also verifies claimed-protected ``FILLED`` positions against live broker
+        open orders and positions so stale cached ``stop_covered_qty`` values never
+        mask an under-covered position.
         Transitions zero-fill non-open entries to ``CANCELLED`` to free the slot.
         Fails closed (``uncertain_holdings=True``) on broker timeout or ambiguity.
         """
@@ -403,8 +426,15 @@ class SwingExecutionCoordinator:
             return report
 
         candidates = self.ledger.reconcilable_reservations(self.config.account, eff_session_day)
-        report.checked_reservations = len(candidates)
-        if not candidates:
+        candidate_symbols = {r.symbol for r in candidates}
+        audit_candidates = [
+            r
+            for r in self.ledger.filled_protected_reservations(self.config.account, eff_session_day)
+            if r.symbol not in candidate_symbols
+        ]
+        all_checked = candidates + audit_candidates
+        report.checked_reservations = len(all_checked)
+        if not all_checked:
             return report
 
         try:
@@ -414,7 +444,7 @@ class SwingExecutionCoordinator:
         except Exception as exc:
             report.uncertain_holdings = True
             report.broker_read_failed = True
-            report.uncertain_symbols = sorted({r.symbol for r in candidates})
+            report.uncertain_symbols = sorted({r.symbol for r in all_checked})
             report.errors.append({"stage": "open_orders_read", "error": f"{type(exc).__name__}: {exc}"})
             return report
 
@@ -425,13 +455,13 @@ class SwingExecutionCoordinator:
         except Exception as exc:
             report.uncertain_holdings = True
             report.broker_read_failed = True
-            report.uncertain_symbols = sorted({r.symbol for r in candidates})
+            report.uncertain_symbols = sorted({r.symbol for r in all_checked})
             report.errors.append({"stage": "positions_read", "error": f"{type(exc).__name__}: {exc}"})
             return report
 
         completed_orders: list[BrokerOrder] = []
         req_completed = getattr(self.broker, "req_completed_orders", None)
-        if callable(req_completed):
+        if candidates and callable(req_completed):
             try:
                 completed_orders = list(
                     await asyncio.wait_for(req_completed(), timeout=self._broker_timeout_seconds)
@@ -439,7 +469,7 @@ class SwingExecutionCoordinator:
             except Exception as exc:
                 report.uncertain_holdings = True
                 report.broker_read_failed = True
-                report.uncertain_symbols = sorted({r.symbol for r in candidates})
+                report.uncertain_symbols = sorted({r.symbol for r in all_checked})
                 report.errors.append({"stage": "completed_orders_read", "error": f"{type(exc).__name__}: {exc}"})
                 return report
 
@@ -676,7 +706,7 @@ class SwingExecutionCoordinator:
             if new_filled_qty <= 0:
                 continue
 
-            already_covered = self._has_adequate_owned_stop(
+            already_covered, actual_covered_qty = self._inspect_owned_stop_coverage(
                 fresh_orders,
                 symbol=res.symbol,
                 expected_action=expected_stop_action,
@@ -708,6 +738,23 @@ class SwingExecutionCoordinator:
                         expected_account=self.config.account,
                     )
                 continue
+
+            baseline_covered = actual_covered_qty if directional_held > 0 else res.stop_covered_qty
+            if (
+                not eff_dry_run
+                and directional_held > 0
+                and not already_covered
+                and (res.stop_armed or baseline_covered < res.stop_covered_qty)
+            ):
+                self.ledger.update_reservation_status(
+                    res.reservation_id,
+                    status=new_status,
+                    filled_qty=new_filled_qty,
+                    stop_armed=False,
+                    stop_covered_qty=baseline_covered,
+                    now_iso=eff_as_of,
+                    expected_account=self.config.account,
+                )
 
             if res.stop_price is None:
                 report.uncertain_holdings = True
@@ -745,7 +792,7 @@ class SwingExecutionCoordinator:
                 fully_protected, confirmed_covered = self._confirmed_stop_coverage(
                     stop_res,
                     managed_qty=new_filled_qty,
-                    previous_covered_qty=res.stop_covered_qty,
+                    previous_covered_qty=baseline_covered,
                 )
                 if fully_protected:
                     self.ledger.update_reservation_status(
@@ -766,11 +813,111 @@ class SwingExecutionCoordinator:
                             "detail": dict(stop_res.detail),
                         }
                     )
-                    if res.stop_armed or confirmed_covered != res.stop_covered_qty:
+                    if res.stop_armed or confirmed_covered != baseline_covered or confirmed_covered != res.stop_covered_qty:
                         self.ledger.update_reservation_status(
                             res.reservation_id,
                             status=new_status,
                             filled_qty=new_filled_qty,
+                            stop_armed=False,
+                            stop_covered_qty=confirmed_covered,
+                            now_iso=eff_as_of,
+                            expected_account=self.config.account,
+                        )
+
+        # Broker-truth verification for FILLED reservations that claim full stop coverage in SQLite.
+        # Never blindly trust cached stop_covered_qty from prior migrations or stale DB state when
+        # live broker protective orders cover fewer shares than the held filled quantity.
+        for res in audit_candidates:
+            direction = "LONG" if res.side == "BUY" else "SHORT"
+            expected_stop_action = "SELL" if direction == "LONG" else "BUY"
+            held_qty = _held_qty_for_symbol(fresh_positions, account=self.config.account, symbol=res.symbol)
+            directional_held = held_qty if direction == "LONG" else -held_qty
+            if directional_held <= 0:
+                continue
+
+            already_covered, actual_covered_qty = self._inspect_owned_stop_coverage(
+                fresh_orders,
+                symbol=res.symbol,
+                expected_action=expected_stop_action,
+                desired_qty=res.filled_qty,
+                held_abs=directional_held,
+            )
+            if already_covered:
+                continue
+
+            if not eff_dry_run:
+                self.ledger.update_reservation_status(
+                    res.reservation_id,
+                    status=res.status,
+                    filled_qty=res.filled_qty,
+                    stop_armed=False,
+                    stop_covered_qty=actual_covered_qty,
+                    now_iso=eff_as_of,
+                    expected_account=self.config.account,
+                )
+
+            if res.stop_price is None:
+                report.uncertain_holdings = True
+                uncertain_symbols_set.add(res.symbol)
+                report.errors.append(
+                    {
+                        "reservation_id": res.reservation_id,
+                        "symbol": res.symbol,
+                        "reason": "missing_persisted_stop_price",
+                    }
+                )
+                continue
+
+            stop_res = await self._ensure_protective_stop(
+                symbol=res.symbol,
+                direction=direction,
+                stop_price=res.stop_price,
+                managed_qty=res.filled_qty,
+                trade_key=res.reservation_id,
+                dry_run=eff_dry_run,
+            )
+            report.stops_armed.append(stop_res)
+            if stop_res.uncertain_holdings:
+                report.uncertain_holdings = True
+                uncertain_symbols_set.add(res.symbol)
+                report.errors.append(
+                    {
+                        "reservation_id": res.reservation_id,
+                        "symbol": res.symbol,
+                        "reason": stop_res.action,
+                        "detail": dict(stop_res.detail),
+                    }
+                )
+            elif not eff_dry_run:
+                fully_protected, confirmed_covered = self._confirmed_stop_coverage(
+                    stop_res,
+                    managed_qty=res.filled_qty,
+                    previous_covered_qty=actual_covered_qty,
+                )
+                if fully_protected:
+                    self.ledger.update_reservation_status(
+                        res.reservation_id,
+                        status=res.status,
+                        filled_qty=res.filled_qty,
+                        stop_armed=True,
+                        stop_covered_qty=confirmed_covered,
+                        now_iso=eff_as_of,
+                        expected_account=self.config.account,
+                    )
+                else:
+                    report.errors.append(
+                        {
+                            "reservation_id": res.reservation_id,
+                            "symbol": res.symbol,
+                            "reason": stop_res.action,
+                            "detail": dict(stop_res.detail),
+                        }
+                    )
+                    if confirmed_covered != actual_covered_qty:
+                        self.ledger.update_reservation_status(
+                            res.reservation_id,
+                            status=res.status,
+                            filled_qty=res.filled_qty,
                             stop_armed=False,
                             stop_covered_qty=confirmed_covered,
                             now_iso=eff_as_of,

@@ -1973,3 +1973,587 @@ async def test_at10_legacy_db_control_confirms_existing_full_stop_without_duplic
     )
     assert c2.stops_armed == []
     assert inner.place_order_calls == calls_before
+
+
+# ---------------------------------------------------------------------------
+# AT10-staged-upgrade: Broker-truth reconciliation for staged upgrades & stale DB claims
+# ---------------------------------------------------------------------------
+
+
+def _apply_prior_1a45609_migration(db_path: Path) -> tuple[str, int, int, int]:
+    """Apply the exact 1a45609 legacy migration that backfilled stop_covered_qty from stop_armed."""
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("ALTER TABLE slot_reservations ADD COLUMN stop_covered_qty INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "UPDATE slot_reservations SET stop_covered_qty = filled_qty "
+            "WHERE stop_armed = 1 AND filled_qty > 0 AND stop_covered_qty = 0"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT status, filled_qty, stop_armed, stop_covered_qty FROM slot_reservations"
+        ).fetchone()
+    assert row is not None
+    return (str(row[0]), int(row[1]), int(row[2]), int(row[3]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_protocol", [False, True])
+async def test_at10_staged_upgrade_from_1a45609_resizes_underprotected_stop_and_stays_idempotent(
+    tmp_path: Path, strict_protocol: bool
+) -> None:
+    """Reproduces AT10-staged-upgrade: legacy DB -> 1a45609 (FILLED/40/armed=1/covered=40) + 15-share stop -> resizes to 40 once."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "staged_at10.sqlite"
+    account = "SIM_AT10_STAGED_PROTO" if strict_protocol else "SIM_AT10_STAGED"
+
+    entry_ref = _create_legacy_pre_at09_db(
+        db_path,
+        account=account,
+        client_id=77,
+        symbol="SYN2X_A",
+        qty=40,
+        filled_qty=40,
+        status="FILLED",
+        stop_armed=1,
+        stop_price=47.5,
+        order_id=5001,
+        perm_id=9001,
+        reservation_id="res_staged_at10",
+    )
+    prior_state = _apply_prior_1a45609_migration(db_path)
+    assert prior_state == ("FILLED", 40, 1, 40)
+
+    broker = _ProtocolDeferredBroker(account=account) if strict_protocol else SimulatedBroker(account=account)
+    inner = broker._inner if strict_protocol else broker
+    inner.set_position("SYN2X_A", 40, avg_cost=50.0)
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="BUY",
+            order_type="LMT",
+            total_quantity=40,
+            client_id=77,
+            order_id=5001,
+            perm_id=9001,
+            order_ref=entry_ref,
+            status="Filled",
+            limit_price=50.0,
+            filled=40,
+            tif="DAY",
+        )
+    )
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="SELL",
+            order_type="STP",
+            total_quantity=15,
+            client_id=77,
+            order_id=1001,
+            perm_id=9002,
+            order_ref="SWING_STOP:res_staged_at10",
+            status="Submitted",
+            aux_price=47.5,
+            filled=0,
+            tif="GTC",
+        )
+    )
+
+    cfg = CoordinatorConfig(
+        account=account,
+        client_id=77,
+        db_path=db_path,
+        kill_switch_path=tmp_path / "KILL_SWITCH",
+        config_path=cfg_file,
+        arm=True,
+    )
+    coord = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+
+    cash = AccountCashState(account, 10_000.0, 8_000.0, 8_000.0, 8_000.0, open_symbol_notional={"SYN2X_A": 2_000.0})
+    calls_before = inner.place_order_calls
+    c1 = await coord.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:58:00Z",
+    )
+    assert c1.uncertain_holdings is False
+    assert c1.reconciled_fills == []
+    assert len(c1.stops_armed) == 1
+    assert c1.stops_armed[0].action == "stop_synced_gtc"
+    assert c1.stops_armed[0].stop_rearmed is True
+    assert c1.stops_armed[0].order is not None
+    assert c1.stops_armed[0].order.total_quantity == 40
+    assert c1.stops_armed[0].order.remaining == 40
+    assert c1.stops_armed[0].order.order_id == 1001
+    assert c1.stops_armed[0].order.perm_id == 9002
+    assert inner.place_order_calls == calls_before + 1
+
+    working_stops = [o for o in inner.orders if o.order_type == "STP" and o.status == "Submitted"]
+    assert len(working_stops) == 1
+    assert working_stops[0].total_quantity == 40
+    assert working_stops[0].remaining == 40
+
+    rows_after, _, _ = coord.ledger.validate_integrity(account, "2026-06-06")
+    assert rows_after[0].status == "FILLED"
+    assert rows_after[0].filled_qty == 40
+    assert rows_after[0].stop_armed is True
+    assert rows_after[0].stop_covered_qty == 40
+
+    # Second cycle after a fresh restart is strictly idempotent (zero broker orders).
+    coord2 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    calls_before_restart = inner.place_order_calls
+    c2 = await coord2.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:59:00Z",
+    )
+    assert c2.uncertain_holdings is False
+    assert c2.reconciled_fills == []
+    assert c2.stops_armed == []
+    assert inner.place_order_calls == calls_before_restart
+    working_stops_restart = [o for o in inner.orders if o.order_type == "STP" and o.status == "Submitted"]
+    assert len(working_stops_restart) == 1 and working_stops_restart[0].remaining == 40
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_protocol", [False, True])
+async def test_at10_staged_upgrade_rejected_resize_persists_broker_truth_and_retries(
+    tmp_path: Path, strict_protocol: bool
+) -> None:
+    """When staged-upgrade resize is rejected, ledger downgrades to broker truth (15) and retries cleanly."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "staged_at10_reject.sqlite"
+    account = "SIM_AT10_REJ_PROTO" if strict_protocol else "SIM_AT10_REJ"
+
+    entry_ref = _create_legacy_pre_at09_db(
+        db_path,
+        account=account,
+        client_id=77,
+        symbol="SYN2X_A",
+        qty=40,
+        filled_qty=40,
+        status="FILLED",
+        stop_armed=1,
+        stop_price=47.5,
+        order_id=5001,
+        perm_id=9001,
+        reservation_id="res_staged_rej",
+    )
+    assert _apply_prior_1a45609_migration(db_path) == ("FILLED", 40, 1, 40)
+
+    broker = _ProtocolDeferredBroker(account=account) if strict_protocol else SimulatedBroker(account=account)
+    inner = broker._inner if strict_protocol else broker
+    inner.set_position("SYN2X_A", 40, avg_cost=50.0)
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="BUY",
+            order_type="LMT",
+            total_quantity=40,
+            client_id=77,
+            order_id=5001,
+            perm_id=9001,
+            order_ref=entry_ref,
+            status="Filled",
+            limit_price=50.0,
+            filled=40,
+            tif="DAY",
+        )
+    )
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="SELL",
+            order_type="STP",
+            total_quantity=15,
+            client_id=77,
+            order_id=1001,
+            perm_id=9002,
+            order_ref="SWING_STOP:res_staged_rej",
+            status="Submitted",
+            aux_price=47.5,
+            filled=0,
+            tif="GTC",
+        )
+    )
+
+    cfg = CoordinatorConfig(
+        account=account,
+        client_id=77,
+        db_path=db_path,
+        kill_switch_path=tmp_path / "KILL_SWITCH",
+        config_path=cfg_file,
+        arm=True,
+    )
+    cash = AccountCashState(account, 10_000.0, 8_000.0, 8_000.0, 8_000.0, open_symbol_notional={"SYN2X_A": 2_000.0})
+
+    # First startup: resize rejected as Inactive -> ledger must record actual broker truth (armed=False, covered=15).
+    inner.reject_next_place_status = "Inactive"
+    coord1 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    c1 = await coord1.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:58:00Z",
+    )
+    assert len(c1.stops_armed) == 1
+    assert c1.stops_armed[0].action == "stop_sync_rejected"
+    rows1, _, _ = coord1.ledger.validate_integrity(account, "2026-06-06")
+    assert rows1[0].stop_armed is False
+    assert rows1[0].stop_covered_qty == 15
+    assert [r.reservation_id for r in coord1.ledger.reconcilable_reservations(account, "2026-06-06")] == [
+        "res_staged_rej"
+    ]
+
+    # Second restart: resize succeeds once to 40, updating ledger to armed=True, covered=40.
+    coord2 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    c2 = await coord2.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:59:00Z",
+    )
+    assert len(c2.stops_armed) == 1
+    assert c2.stops_armed[0].action == "stop_synced_gtc"
+    assert c2.stops_armed[0].order is not None and c2.stops_armed[0].order.remaining == 40
+    rows2, _, _ = coord2.ledger.validate_integrity(account, "2026-06-06")
+    assert rows2[0].stop_armed is True
+    assert rows2[0].stop_covered_qty == 40
+
+    # Third restart: strict zero-order no-op.
+    calls_before = inner.place_order_calls
+    coord3 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    c3 = await coord3.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T16:00:00Z",
+    )
+    assert c3.stops_armed == []
+    assert inner.place_order_calls == calls_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_protocol", [False, True])
+async def test_at10_staged_upgrade_already_protected_position_submits_zero_orders(
+    tmp_path: Path, strict_protocol: bool
+) -> None:
+    """Staged-upgrade DB with an already-full 40-share broker stop submits zero orders on startup."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "staged_at10_full.sqlite"
+    account = "SIM_AT10_FULL_PROTO" if strict_protocol else "SIM_AT10_FULL"
+
+    entry_ref = _create_legacy_pre_at09_db(
+        db_path,
+        account=account,
+        client_id=77,
+        symbol="SYN2X_A",
+        qty=40,
+        filled_qty=40,
+        status="FILLED",
+        stop_armed=1,
+        stop_price=47.5,
+        order_id=5001,
+        perm_id=9001,
+        reservation_id="res_staged_full",
+    )
+    assert _apply_prior_1a45609_migration(db_path) == ("FILLED", 40, 1, 40)
+
+    broker = _ProtocolDeferredBroker(account=account) if strict_protocol else SimulatedBroker(account=account)
+    inner = broker._inner if strict_protocol else broker
+    inner.set_position("SYN2X_A", 40, avg_cost=50.0)
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="BUY",
+            order_type="LMT",
+            total_quantity=40,
+            client_id=77,
+            order_id=5001,
+            perm_id=9001,
+            order_ref=entry_ref,
+            status="Filled",
+            limit_price=50.0,
+            filled=40,
+            tif="DAY",
+        )
+    )
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="SELL",
+            order_type="STP",
+            total_quantity=40,
+            client_id=77,
+            order_id=1001,
+            perm_id=9002,
+            order_ref="SWING_STOP:res_staged_full",
+            status="Submitted",
+            aux_price=47.5,
+            filled=0,
+            tif="GTC",
+        )
+    )
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account=account,
+            client_id=77,
+            db_path=db_path,
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState(account, 10_000.0, 8_000.0, 8_000.0, 8_000.0, open_symbol_notional={"SYN2X_A": 2_000.0})
+    calls_before = inner.place_order_calls
+    c1 = await coord.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:58:00Z",
+    )
+    assert c1.uncertain_holdings is False
+    assert c1.reconciled_fills == []
+    assert c1.stops_armed == []
+    assert inner.place_order_calls == calls_before
+
+
+@pytest.mark.asyncio
+async def test_at10_staged_upgrade_open_orders_read_failure_fails_closed(tmp_path: Path) -> None:
+    """If broker open-orders query fails during FILLED stop audit, fail closed with zero blind orders."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "staged_at10_fail_closed.sqlite"
+    account = "SIM_AT10_FAIL"
+
+    entry_ref = _create_legacy_pre_at09_db(
+        db_path,
+        account=account,
+        client_id=77,
+        symbol="SYN2X_A",
+        qty=40,
+        filled_qty=40,
+        status="FILLED",
+        stop_armed=1,
+        stop_price=47.5,
+        order_id=5001,
+        perm_id=9001,
+        reservation_id="res_staged_fail",
+    )
+    assert _apply_prior_1a45609_migration(db_path) == ("FILLED", 40, 1, 40)
+
+    broker = SimulatedBroker(account=account)
+    broker.set_position("SYN2X_A", 40, avg_cost=50.0)
+    broker.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="BUY",
+            order_type="LMT",
+            total_quantity=40,
+            client_id=77,
+            order_id=5001,
+            perm_id=9001,
+            order_ref=entry_ref,
+            status="Filled",
+            limit_price=50.0,
+            filled=40,
+            tif="DAY",
+        )
+    )
+    broker.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="SELL",
+            order_type="STP",
+            total_quantity=15,
+            client_id=77,
+            order_id=1001,
+            perm_id=9002,
+            order_ref="SWING_STOP:res_staged_fail",
+            status="Submitted",
+            aux_price=47.5,
+            filled=0,
+            tif="GTC",
+        )
+    )
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account=account,
+            client_id=77,
+            db_path=db_path,
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState(account, 10_000.0, 8_000.0, 8_000.0, 8_000.0, open_symbol_notional={"SYN2X_A": 2_000.0})
+
+    broker.fail_open_orders_exc = asyncio.TimeoutError("open orders unavailable")
+    c_fail = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_B"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:58:00Z",
+    )
+    assert c_fail.uncertain_holdings is True
+    assert c_fail.blocked_reason == "reconciliation_uncertain_holdings"
+    assert "SYN2X_A" in c_fail.uncertain_symbols
+    assert c_fail.stops_armed == []
+    assert c_fail.reserved == []
+    assert broker.place_order_calls == 0
+
+    # Once broker read recovers, reconciliation repairs the 15 -> 40 stop in one call.
+    broker.fail_open_orders_exc = None
+    c_ok = await coord.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:59:00Z",
+    )
+    assert c_ok.uncertain_holdings is False
+    assert len(c_ok.stops_armed) == 1
+    assert c_ok.stops_armed[0].action == "stop_synced_gtc"
+    assert c_ok.stops_armed[0].order is not None and c_ok.stops_armed[0].order.remaining == 40
+    assert broker.place_order_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_at10_closed_or_superseded_filled_reservation_submits_zero_orders(tmp_path: Path) -> None:
+    """Flat closed trades and older superseded FILLED reservations never trigger spurious stops."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "historical_filled.sqlite"
+    account = "SIM_HIST"
+
+    ledger = SlotLedger(db_path, account=account)
+    cash = AccountCashState(account, 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    d1 = ledger.reserve_entry_slot(
+        cash_state=cash,
+        client_id=77,
+        symbol="SYN2X_A",
+        qty=40,
+        limit_price=50.0,
+        session_day="2026-06-05",
+        stop_price=47.5,
+        now_iso="2026-06-05T15:55:00Z",
+    )
+    assert d1.allowed and d1.reservation is not None
+    ledger.update_reservation_status(
+        d1.reservation.reservation_id,
+        status="FILLED",
+        filled_qty=40,
+        stop_armed=True,
+        stop_covered_qty=40,
+        now_iso="2026-06-05T15:56:00Z",
+    )
+
+    # Case 1: Broker is flat -> zero orders submitted.
+    broker = SimulatedBroker(account=account)
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account=account,
+            client_id=77,
+            db_path=db_path,
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    c_flat = await coord.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    assert c_flat.uncertain_holdings is False
+    assert c_flat.stops_armed == []
+    assert broker.place_order_calls == 0
+
+    # Case 2: Newer 20-share trade on Day 2 is fully covered by a 20-share stop (older Day 1 was 40 shares).
+    d2 = ledger.reserve_entry_slot(
+        cash_state=cash,
+        client_id=77,
+        symbol="SYN2X_A",
+        qty=20,
+        limit_price=55.0,
+        session_day="2026-06-06",
+        stop_price=52.25,
+        now_iso="2026-06-06T15:55:00Z",
+    )
+    assert d2.allowed and d2.reservation is not None
+    ledger.update_reservation_status(
+        d2.reservation.reservation_id,
+        status="FILLED",
+        filled_qty=20,
+        stop_armed=True,
+        stop_covered_qty=20,
+        now_iso="2026-06-06T15:56:00Z",
+    )
+    broker.set_position("SYN2X_A", 20, avg_cost=55.0)
+    broker.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="SELL",
+            order_type="STP",
+            total_quantity=20,
+            client_id=77,
+            order_id=1002,
+            perm_id=9010,
+            order_ref=f"SWING_STOP:{d2.reservation.reservation_id}",
+            status="Submitted",
+            aux_price=52.25,
+            filled=0,
+            tif="GTC",
+        )
+    )
+    c_superseded = await coord.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:57:00Z",
+    )
+    assert c_superseded.uncertain_holdings is False
+    assert c_superseded.stops_armed == []
+    assert broker.place_order_calls == 0

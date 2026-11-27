@@ -851,6 +851,32 @@ class SlotLedger:
         candidates.sort(key=lambda r: (r.created_at, r.reservation_id))
         return candidates
 
+    def filled_protected_reservations(self, account: str, session_day: str) -> list[SlotReservation]:
+        """Return the latest claimed-protected FILLED reservation per ``(symbol, side)``.
+
+        Allows startup and cycle reconciliation to verify cached ``stop_armed=True`` /
+        ``stop_covered_qty`` ledger claims against live broker positions and open stops,
+        catching stale migrations (e.g. ledgers upgraded through an earlier release that
+        backfilled ``stop_covered_qty`` without checking the broker) as well as external
+        broker stop drift.
+        """
+        rows, _, _ = self.validate_integrity(account, session_day)
+        latest_by_key: dict[tuple[str, str], SlotReservation] = {}
+        for r in rows:
+            if (
+                r.status == "FILLED"
+                and r.filled_qty > 0
+                and r.stop_armed
+                and r.stop_covered_qty >= r.filled_qty
+            ):
+                key = (r.symbol, r.side)
+                prev = latest_by_key.get(key)
+                if prev is None or (r.created_at, r.reservation_id) > (prev.created_at, prev.reservation_id):
+                    latest_by_key[key] = r
+        result = list(latest_by_key.values())
+        result.sort(key=lambda r: (r.created_at, r.reservation_id))
+        return result
+
 
 def validate_persisted_counter_json(path: Path | str) -> dict[str, dict[str, float | int]]:
     """Strict validator for standalone JSON counter snapshots (rejects NaN/Inf/negatives/partial keys)."""
