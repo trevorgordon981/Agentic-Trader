@@ -222,6 +222,7 @@ class SlotReservation:
     stop_price: Optional[float] = None
     strategy_id: str = ""
     stop_armed: bool = False
+    stop_covered_qty: int = 0
 
 
 @dataclass(frozen=True)
@@ -324,6 +325,7 @@ class SlotLedger:
                     stop_price REAL,
                     strategy_id TEXT NOT NULL DEFAULT '',
                     stop_armed INTEGER NOT NULL DEFAULT 0,
+                    stop_covered_qty INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(account, order_ref)
                 )
                 """
@@ -337,6 +339,12 @@ class SlotLedger:
                 conn.execute("ALTER TABLE slot_reservations ADD COLUMN strategy_id TEXT NOT NULL DEFAULT ''")
             if "stop_armed" not in cols:
                 conn.execute("ALTER TABLE slot_reservations ADD COLUMN stop_armed INTEGER NOT NULL DEFAULT 0")
+            if "stop_covered_qty" not in cols:
+                conn.execute("ALTER TABLE slot_reservations ADD COLUMN stop_covered_qty INTEGER NOT NULL DEFAULT 0")
+                conn.execute(
+                    "UPDATE slot_reservations SET stop_covered_qty = filled_qty "
+                    "WHERE stop_armed = 1 AND filled_qty > 0 AND stop_covered_qty = 0"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_slot_res_active ON slot_reservations(account, status, symbol)"
             )
@@ -450,6 +458,19 @@ class SlotLedger:
         )
         if stop_armed_raw not in (0, 1):
             raise LedgerCorruptionError(f"reservation.stop_armed must be 0 or 1, got {stop_armed_raw!r}")
+        stop_covered_qty = (
+            _require_int(row["stop_covered_qty"], name="reservation.stop_covered_qty", non_negative=True)
+            if "stop_covered_qty" in row_keys and row["stop_covered_qty"] is not None
+            else 0
+        )
+        if stop_covered_qty > qty:
+            raise LedgerCorruptionError(
+                f"reservation.stop_covered_qty ({stop_covered_qty}) exceeds reservation.qty ({qty})"
+            )
+        if stop_covered_qty > filled_qty:
+            raise LedgerCorruptionError(
+                f"reservation.stop_covered_qty ({stop_covered_qty}) exceeds reservation.filled_qty ({filled_qty})"
+            )
         return SlotReservation(
             reservation_id=str(row["reservation_id"]),
             account=account,
@@ -470,6 +491,7 @@ class SlotLedger:
             stop_price=stop_price,
             strategy_id=strategy_id,
             stop_armed=bool(stop_armed_raw),
+            stop_covered_qty=stop_covered_qty,
         )
 
     def validate_integrity(self, account: str, session_day: str) -> tuple[list[SlotReservation], int, float]:
@@ -644,6 +666,7 @@ class SlotLedger:
                 stop_price=stp,
                 strategy_id=strat,
                 stop_armed=False,
+                stop_covered_qty=0,
             )
 
             conn = self._connect()
@@ -654,8 +677,8 @@ class SlotLedger:
                     INSERT INTO slot_reservations (
                         reservation_id, account, client_id, symbol, side, qty, limit_price,
                         notional_usd, order_ref, status, session_day, created_at, updated_at,
-                        stop_price, strategy_id, stop_armed
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        stop_price, strategy_id, stop_armed, stop_covered_qty
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         reservation.reservation_id,
@@ -673,6 +696,7 @@ class SlotLedger:
                         reservation.updated_at,
                         reservation.stop_price,
                         reservation.strategy_id,
+                        0,
                         0,
                     ),
                 )
@@ -704,6 +728,7 @@ class SlotLedger:
         perm_id: Optional[int] = None,
         filled_qty: Optional[int] = None,
         stop_armed: Optional[bool] = None,
+        stop_covered_qty: Optional[int] = None,
         now_iso: Optional[str] = None,
         expected_account: Optional[str] = None,
     ) -> None:
@@ -717,13 +742,16 @@ class SlotLedger:
             filled_qty = _require_int(filled_qty, name="filled_qty", non_negative=True)
         if stop_armed is not None and not isinstance(stop_armed, bool):
             raise ReservationError(f"stop_armed must be a bool, got {type(stop_armed).__name__} {stop_armed!r}")
+        if stop_covered_qty is not None:
+            stop_covered_qty = _require_int(stop_covered_qty, name="stop_covered_qty", non_negative=True)
         stop_armed_int = None if stop_armed is None else (1 if stop_armed else 0)
         ts = now_iso or dt.datetime.now(dt.timezone.utc).isoformat()
         with self.mutation_lock():
             conn = self._connect()
             try:
                 existing = conn.execute(
-                    "SELECT account, qty FROM slot_reservations WHERE reservation_id = ?",
+                    "SELECT account, qty, filled_qty, stop_armed, stop_covered_qty "
+                    "FROM slot_reservations WHERE reservation_id = ?",
                     (reservation_id,),
                 ).fetchone()
                 if existing is None:
@@ -733,10 +761,32 @@ class SlotLedger:
                     context="update_reservation_status",
                     expected_account=expected_account,
                 )
-                if filled_qty is not None and filled_qty > int(existing["qty"]):
+                eff_qty = int(existing["qty"])
+                if filled_qty is not None and filled_qty > eff_qty:
                     raise ReservationError(
-                        f"filled_qty ({filled_qty}) exceeds reserved qty ({existing['qty']})"
+                        f"filled_qty ({filled_qty}) exceeds reserved qty ({eff_qty})"
                     )
+                eff_filled_qty = int(existing["filled_qty"]) if filled_qty is None else filled_qty
+                existing_covered = (
+                    int(existing["stop_covered_qty"]) if existing["stop_covered_qty"] is not None else 0
+                )
+                if stop_covered_qty is None and stop_armed is True:
+                    eff_stop_covered_qty = eff_filled_qty
+                    stop_covered_qty_val: Optional[int] = eff_filled_qty
+                else:
+                    eff_stop_covered_qty = existing_covered if stop_covered_qty is None else stop_covered_qty
+                    stop_covered_qty_val = stop_covered_qty
+                if eff_stop_covered_qty > eff_filled_qty:
+                    raise ReservationError(
+                        f"stop_covered_qty ({eff_stop_covered_qty}) exceeds filled_qty ({eff_filled_qty})"
+                    )
+                if eff_filled_qty > eff_stop_covered_qty:
+                    if stop_armed is True:
+                        raise ReservationError(
+                            f"cannot mark stop_armed=True while stop_covered_qty ({eff_stop_covered_qty}) "
+                            f"< filled_qty ({eff_filled_qty})"
+                        )
+                    stop_armed_int = 0
                 cur = conn.execute(
                     """
                     UPDATE slot_reservations
@@ -745,10 +795,20 @@ class SlotLedger:
                         perm_id = COALESCE(?, perm_id),
                         filled_qty = COALESCE(?, filled_qty),
                         stop_armed = COALESCE(?, stop_armed),
+                        stop_covered_qty = COALESCE(?, stop_covered_qty),
                         updated_at = ?
                     WHERE reservation_id = ?
                     """,
-                    (status, order_id, perm_id, filled_qty, stop_armed_int, ts, reservation_id),
+                    (
+                        status,
+                        order_id,
+                        perm_id,
+                        filled_qty,
+                        stop_armed_int,
+                        stop_covered_qty_val,
+                        ts,
+                        reservation_id,
+                    ),
                 )
                 if cur.rowcount != 1:
                     raise ReservationError(f"reservation_id not found: {reservation_id!r}")
@@ -766,7 +826,11 @@ class SlotLedger:
             r
             for r in rows
             if r.status in ("SUBMITTED", "WORKING", "PARTIALLY_FILLED")
-            or (r.status == "FILLED" and r.filled_qty > 0 and not r.stop_armed)
+            or (
+                r.status == "FILLED"
+                and r.filled_qty > 0
+                and (not r.stop_armed or r.stop_covered_qty < r.filled_qty)
+            )
         ]
         candidates.sort(key=lambda r: (r.created_at, r.reservation_id))
         return candidates

@@ -80,10 +80,6 @@ def test_a_terminal_order_is_still_not_counted(tmp_path):
 
 
 
-@pytest.mark.xfail(reason="call sites live in daily_recommend.py / place_trade.py, which this "
-                          "change does not own; open_book now REFUSES them at runtime. "
-                          "Flip to a plain assertion once the one-line fixes land.",
-                   strict=False)
 def test_no_production_caller_omits_open_orders():
     calls = []
     for name in ("daily_recommend.py", "place_trade.py"):

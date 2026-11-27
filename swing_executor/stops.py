@@ -310,12 +310,20 @@ class ProtectiveStopEngine:
             ]
             if existing:
                 existing.sort(key=lambda o: o.order_id)
+                other_close_qty = count_other_working_close_qty(
+                    fresh_orders,
+                    symbol=sym,
+                    account=self.account,
+                    close_side=expected_action,
+                    exclude_order=existing[-1],
+                )
                 return StopActionResult(
                     action="stop_already_armed",
                     symbol=sym,
                     fresh_held_qty=fresh_held,
                     stop_rearmed=True,
                     order=existing[-1],
+                    detail={"other_working_close_qty": other_close_qty},
                 )
 
             other_close_qty = count_other_working_close_qty(
@@ -470,6 +478,7 @@ class ProtectiveStopEngine:
                     fresh_held_qty=fresh_held,
                     stop_rearmed=True,
                     order=live_stop,
+                    detail={"other_working_close_qty": other_close_qty},
                 )
 
             updated = BrokerOrder(

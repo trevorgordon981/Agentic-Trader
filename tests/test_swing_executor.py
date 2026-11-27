@@ -1359,3 +1359,244 @@ async def test_at08_retries_stop_protection_after_transient_stop_rejection(tmp_p
     )
     assert c4.stops_armed == []
     assert broker.place_order_calls == calls_before
+
+
+# ---------------------------------------------------------------------------
+# AT09: Rejected stop resize must remain retryable across fresh restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_protocol", [False, True])
+async def test_at09_rejected_stop_resize_retries_after_fresh_restart_without_duplicates(
+    tmp_path: Path, strict_protocol: bool
+) -> None:
+    """Reproduces AT09: 40-share reserve -> 15 fill + 15 stop -> +25 fill + Inactive resize -> restart retries to 40."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "ledger.sqlite"
+    account = "SIM_AT09_PROTO" if strict_protocol else "SIM_AT09"
+    broker = _ProtocolDeferredBroker(account=account) if strict_protocol else SimulatedBroker(account=account)
+    inner = broker._inner if strict_protocol else broker
+
+    cfg = CoordinatorConfig(
+        account=account,
+        client_id=77,
+        db_path=db_path,
+        kill_switch_path=tmp_path / "KILL_SWITCH",
+        config_path=cfg_file,
+        arm=True,
+    )
+    coord1 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState(account, 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+
+    # Cycle 1: Reserve 40 synthetic shares; entry order stays working with 0 filled.
+    c1 = await coord1.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    assert len(c1.reserved) == 1
+    assert c1.stops_armed == []
+    entry_order = inner.orders[0]
+    assert entry_order.total_quantity == 40 and entry_order.filled == 0
+
+    # Partial fill of 15 shares -> Cycle 2 arms a confirmed 15-share GTC protective stop.
+    inner.simulate_partial_fill(entry_order, 15)
+    c2 = await coord1.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:56:00Z",
+    )
+    assert len(c2.reconciled_fills) == 1
+    assert c2.reconciled_fills[0]["filled_qty"] == 15
+    assert len(c2.stops_armed) == 1
+    assert c2.stops_armed[0].action == "stop_armed_gtc"
+    assert c2.stops_armed[0].order is not None and c2.stops_armed[0].order.total_quantity == 15
+    stop_order_id = c2.stops_armed[0].order.order_id
+    stop_perm_id = c2.stops_armed[0].order.perm_id
+
+    rows2, _, _ = coord1.ledger.validate_integrity(account, "2026-06-06")
+    assert rows2[0].status == "WORKING"
+    assert rows2[0].filled_qty == 15
+    assert rows2[0].stop_armed is True
+    assert rows2[0].stop_covered_qty == 15
+
+    # Remaining 25 shares fill (total 40), and broker rejects the stop resize as Inactive.
+    inner.simulate_partial_fill(entry_order, 25)
+    assert inner.positions["SYN2X_A"].quantity == 40
+    inner.reject_next_place_status = "Inactive"
+
+    c3 = await coord1.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:57:00Z",
+    )
+    assert len(c3.reconciled_fills) == 1
+    assert c3.reconciled_fills[0]["filled_qty"] == 40
+    assert c3.reconciled_fills[0]["newly_filled_qty"] == 25
+    assert c3.reconciled_fills[0]["ledger_status"] == "FILLED"
+    assert len(c3.stops_armed) == 1
+    assert c3.stops_armed[0].action == "stop_sync_rejected"
+    assert c3.stops_armed[0].stop_rearmed is False
+
+    # Ledger MUST NOT mark full protection complete: stop_armed=False, stop_covered_qty=15 (< 40).
+    rows3, _, _ = coord1.ledger.validate_integrity(account, "2026-06-06")
+    assert rows3[0].status == "FILLED"
+    assert rows3[0].filled_qty == 40
+    assert rows3[0].stop_armed is False
+    assert rows3[0].stop_covered_qty == 15
+    reconcilable_after_reject = coord1.ledger.reconcilable_reservations(account, "2026-06-06")
+    assert len(reconcilable_after_reject) == 1
+    assert reconcilable_after_reject[0].reservation_id == rows3[0].reservation_id
+
+    working_stops_before_restart = [o for o in inner.orders if o.order_type == "STP" and o.status == "Submitted"]
+    assert len(working_stops_before_restart) == 1
+    assert working_stops_before_restart[0].total_quantity == 15
+
+    # Fresh coordinator restart against the same SQLite database + broker.
+    coord2 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    c4 = await coord2.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:58:00Z",
+    )
+    assert c4.uncertain_holdings is False
+    assert c4.reconciled_fills == []
+    assert len(c4.stops_armed) == 1
+    assert c4.stops_armed[0].action == "stop_synced_gtc"
+    assert c4.stops_armed[0].stop_rearmed is True
+    assert c4.stops_armed[0].order is not None
+    assert c4.stops_armed[0].order.total_quantity == 40
+    assert c4.stops_armed[0].order.tif == "GTC"
+    assert c4.stops_armed[0].order.order_id == stop_order_id
+    assert c4.stops_armed[0].order.perm_id == stop_perm_id
+
+    # Exactly one 40-share protective stop is working (resized in place, zero duplicates).
+    working_stops_after_retry = [o for o in inner.orders if o.order_type == "STP" and o.status == "Submitted"]
+    assert len(working_stops_after_retry) == 1
+    assert working_stops_after_retry[0].total_quantity == 40
+    assert working_stops_after_retry[0].remaining == 40
+
+    rows4, _, _ = coord2.ledger.validate_integrity(account, "2026-06-06")
+    assert rows4[0].status == "FILLED"
+    assert rows4[0].filled_qty == 40
+    assert rows4[0].stop_armed is True
+    assert rows4[0].stop_covered_qty == 40
+    assert coord2.ledger.reconcilable_reservations(account, "2026-06-06") == []
+
+    # Next cycle after another fresh restart is a strict idempotent no-op.
+    calls_before = inner.place_order_calls
+    coord3 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    c5 = await coord3.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:59:00Z",
+    )
+    assert c5.reconciled_fills == []
+    assert c5.stops_armed == []
+    assert inner.place_order_calls == calls_before
+    working_stops_final = [o for o in inner.orders if o.order_type == "STP" and o.status == "Submitted"]
+    assert len(working_stops_final) == 1 and working_stops_final[0].total_quantity == 40
+
+
+def test_at09_ledger_stop_covered_qty_invariants_and_corruption_guards(tmp_path: Path) -> None:
+    """Ledger enforces stop_covered_qty <= filled_qty, clears stale stop_armed, and stays retryable."""
+    db_path = tmp_path / "at09_ledger.sqlite"
+    ledger = SlotLedger(db_path, account="SIM_INV")
+    cash = AccountCashState("SIM_INV", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    dec = ledger.reserve_entry_slot(
+        cash_state=cash,
+        client_id=77,
+        symbol="SYN2X_A",
+        qty=40,
+        limit_price=50.0,
+        session_day="2026-06-06",
+        stop_price=47.5,
+        now_iso="2026-06-06T15:55:00Z",
+    )
+    assert dec.allowed and dec.reservation is not None
+    rid = dec.reservation.reservation_id
+
+    # Armed for initial 15-share partial fill.
+    ledger.update_reservation_status(
+        rid,
+        status="WORKING",
+        filled_qty=15,
+        stop_armed=True,
+        stop_covered_qty=15,
+        now_iso="2026-06-06T15:56:00Z",
+    )
+    rows, _, _ = ledger.validate_integrity("SIM_INV", "2026-06-06")
+    assert rows[0].stop_armed is True and rows[0].stop_covered_qty == 15
+
+    # Refuses claiming stop_armed=True while stop_covered_qty < filled_qty.
+    with pytest.raises(ReservationError, match="stop_covered_qty"):
+        ledger.update_reservation_status(
+            rid,
+            status="FILLED",
+            filled_qty=40,
+            stop_armed=True,
+            stop_covered_qty=15,
+            now_iso="2026-06-06T15:57:00Z",
+        )
+
+    # Refuses stop_covered_qty > filled_qty.
+    with pytest.raises(ReservationError, match="exceeds filled_qty"):
+        ledger.update_reservation_status(
+            rid,
+            status="WORKING",
+            filled_qty=15,
+            stop_covered_qty=20,
+            now_iso="2026-06-06T15:57:00Z",
+        )
+
+    # Growing filled_qty past stop_covered_qty automatically clears stop_armed even if omitted.
+    ledger.update_reservation_status(
+        rid,
+        status="FILLED",
+        filled_qty=40,
+        now_iso="2026-06-06T15:57:00Z",
+    )
+    rows_after, _, _ = ledger.validate_integrity("SIM_INV", "2026-06-06")
+    assert rows_after[0].status == "FILLED"
+    assert rows_after[0].filled_qty == 40
+    assert rows_after[0].stop_armed is False
+    assert rows_after[0].stop_covered_qty == 15
+    assert [r.reservation_id for r in ledger.reconcilable_reservations("SIM_INV", "2026-06-06")] == [rid]
+
+    # Even if an external/stale DB write set stop_armed=1 with stop_covered_qty=15 < 40, still reconcilable.
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "UPDATE slot_reservations SET stop_armed = 1, stop_covered_qty = 15 WHERE reservation_id = ?",
+            (rid,),
+        )
+        conn.commit()
+    assert [r.reservation_id for r in ledger.reconcilable_reservations("SIM_INV", "2026-06-06")] == [rid]
+
+    # Corrupted stop_covered_qty > filled_qty fails closed on validate_integrity.
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "UPDATE slot_reservations SET stop_covered_qty = 45 WHERE reservation_id = ?",
+            (rid,),
+        )
+        conn.commit()
+    with pytest.raises(LedgerCorruptionError, match="stop_covered_qty"):
+        ledger.validate_integrity("SIM_INV", "2026-06-06")
