@@ -917,3 +917,445 @@ async def test_at07_inconsistent_filled_zero_qty_and_demo_switch_constraint(tmp_
     rows, _, _ = coord.ledger.validate_integrity("SIM_PROTO", "2026-06-06")
     assert rows[0].status == "UNKNOWN"
     assert rows[0].filled_qty == 0
+
+
+# ---------------------------------------------------------------------------
+# AT08: Durable deferred/async fill reconciliation & idempotent stop arming
+# ---------------------------------------------------------------------------
+
+
+class _ProtocolDeferredBroker:
+    """Strict 4-method BrokerStopClient (no req_completed_orders / simulate_partial_fill exposed)."""
+
+    def __init__(self, *, account: str) -> None:
+        self._inner = SimulatedBroker(account=account)
+
+    async def req_open_orders(self) -> list[BrokerOrder]:
+        return await self._inner.req_open_orders()
+
+    async def req_positions(self) -> list[BrokerPosition]:
+        return await self._inner.req_positions()
+
+    async def place_order(self, order: BrokerOrder) -> BrokerOrder:
+        return await self._inner.place_order(order)
+
+    async def cancel_order(self, order: BrokerOrder) -> None:
+        await self._inner.cancel_order(order)
+
+
+@pytest.mark.asyncio
+async def test_at08_deferred_full_fill_reconciles_arms_gtc_stop_and_stays_idempotent(tmp_path: Path) -> None:
+    """Reproduces exact AT08 counterexample: WORKING (0 filled) -> broker fills 40 -> next cycle arms stop."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "ledger.sqlite"
+    broker = SimulatedBroker(account="SIM_AT08")
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_AT08",
+            client_id=77,
+            db_path=db_path,
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+            max_orders_per_day=1,
+            max_notional_per_day=20_000.0,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState("SIM_AT08", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+
+    # Cycle 1: working limit submitted with 0 filled -> WORKING, 0 stops.
+    c1 = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    assert len(c1.reserved) == 1
+    assert c1.filled == []
+    assert c1.stops_armed == []
+    assert broker.place_order_calls == 1
+    entry_order = broker.orders[0]
+    assert entry_order.status == "Submitted" and entry_order.filled == 0 and entry_order.total_quantity == 40
+
+    rows1, _, _ = coord.ledger.validate_integrity("SIM_AT08", "2026-06-06")
+    assert rows1[0].status == "WORKING"
+    assert rows1[0].filled_qty == 0
+    assert rows1[0].stop_price == 47.5
+
+    # Async/deferred full fill arrives on broker between cycles.
+    broker.simulate_partial_fill(entry_order, entry_order.remaining)
+    assert broker.positions["SYN2X_A"].quantity == 40
+    assert entry_order.status == "Filled"
+
+    # Cycle 2: reconciles WORKING -> FILLED (40) and immediately arms GTC protective stop for 40 shares.
+    c2 = await coord.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T16:00:00Z",
+    )
+    assert c2.uncertain_holdings is False
+    assert len(c2.reconciled_fills) == 1
+    assert len(c2.filled) == 1
+    assert c2.reconciled_fills[0]["symbol"] == "SYN2X_A"
+    assert c2.reconciled_fills[0]["filled_qty"] == 40
+    assert c2.reconciled_fills[0]["ledger_status"] == "FILLED"
+    assert len(c2.alerts) == 1 and "SYN2X_A BUY 40" in c2.alerts[0]
+
+    assert len(c2.stops_armed) == 1
+    stop_res = c2.stops_armed[0]
+    assert stop_res.action == "stop_armed_gtc"
+    assert stop_res.stop_rearmed is True
+    assert stop_res.fresh_held_qty == 40
+    assert stop_res.order is not None
+    assert stop_res.order.order_type == "STP"
+    assert stop_res.order.tif == "GTC"
+    assert stop_res.order.total_quantity == 40
+    assert stop_res.order.aux_price == 47.5
+    assert broker.place_order_calls == 2
+
+    rows2, _, _ = coord.ledger.validate_integrity("SIM_AT08", "2026-06-06")
+    assert rows2[0].status == "FILLED"
+    assert rows2[0].filled_qty == 40
+    assert rows2[0].stop_armed is True
+
+    # Cycle 3: strictly idempotent — does NOT double-arm stops or re-emit fills.
+    c3 = await coord.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T16:05:00Z",
+    )
+    assert c3.reconciled_fills == []
+    assert c3.filled == []
+    assert c3.stops_armed == []
+    assert broker.place_order_calls == 2
+    working_stops = [o for o in broker.orders if o.order_type == "STP" and o.status == "Submitted"]
+    assert len(working_stops) == 1
+
+
+@pytest.mark.asyncio
+async def test_at08_strict_protocol_broker_and_restart_durable_reconcile_working_entries(tmp_path: Path) -> None:
+    """Verifies strict 4-method BrokerStopClient reconciliation survives coordinator restart."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "ledger.sqlite"
+    broker = _ProtocolDeferredBroker(account="SIM_PROTO_DEF")
+    assert not hasattr(broker, "req_completed_orders")
+
+    cfg = CoordinatorConfig(
+        account="SIM_PROTO_DEF",
+        client_id=77,
+        db_path=db_path,
+        kill_switch_path=tmp_path / "KILL_SWITCH",
+        config_path=cfg_file,
+        arm=True,
+    )
+    coord1 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState("SIM_PROTO_DEF", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    c1 = await coord1.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    assert len(c1.reserved) == 1 and c1.stops_armed == []
+
+    # Broker fills all 40 shares asynchronously; entry order leaves req_open_orders(), position=40.
+    broker._inner.simulate_partial_fill(broker._inner.orders[0], 40)
+
+    # Fresh coordinator instance (simulated process restart) calls reconcile_working_entries() directly.
+    coord2 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    rec = await coord2.reconcile_working_entries(session_day="2026-06-06", as_of="2026-06-06T16:00:00Z")
+    assert rec.uncertain_holdings is False
+    assert len(rec.reconciled_fills) == 1
+    assert rec.reconciled_fills[0]["filled_qty"] == 40
+    assert rec.reconciled_fills[0]["ledger_status"] == "FILLED"
+    assert len(rec.stops_armed) == 1
+    assert rec.stops_armed[0].action == "stop_armed_gtc"
+    assert rec.stops_armed[0].order is not None
+    assert rec.stops_armed[0].order.total_quantity == 40
+    assert rec.stops_armed[0].order.aux_price == 47.5
+
+    # Repeating reconcile_working_entries() is completely idempotent.
+    calls_before = broker._inner.place_order_calls
+    rec2 = await coord2.reconcile_working_entries(session_day="2026-06-06", as_of="2026-06-06T16:01:00Z")
+    assert rec2.reconciled_fills == []
+    assert rec2.stops_armed == []
+    assert broker._inner.place_order_calls == calls_before
+
+
+@pytest.mark.asyncio
+async def test_at08_partial_fill_growth_resizes_existing_stop_without_duplicating(tmp_path: Path) -> None:
+    """Partial fill (15/40) arms 15-share stop; subsequent remaining fill (40/40) resizes stop to 40."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    broker = SimulatedBroker(account="SIM_PARTIAL")
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_PARTIAL",
+            client_id=77,
+            db_path=tmp_path / "ledger.sqlite",
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState("SIM_PARTIAL", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    entry_order = broker.orders[0]
+
+    # First deferred partial fill: 15 shares (25 still working).
+    broker.simulate_partial_fill(entry_order, 15)
+    c2 = await coord.run_entry_cycle(
+        bars_by_symbol={}, cash_state=cash, session_day="2026-06-06", as_of="2026-06-06T15:56:00Z"
+    )
+    assert len(c2.reconciled_fills) == 1
+    assert c2.reconciled_fills[0]["filled_qty"] == 15
+    assert c2.reconciled_fills[0]["ledger_status"] == "WORKING"
+    assert len(c2.stops_armed) == 1
+    assert c2.stops_armed[0].action == "stop_armed_gtc"
+    assert c2.stops_armed[0].order is not None and c2.stops_armed[0].order.total_quantity == 15
+
+    # Remaining 25 shares fill (total 40).
+    broker.simulate_partial_fill(entry_order, 25)
+    c3 = await coord.run_entry_cycle(
+        bars_by_symbol={}, cash_state=cash, session_day="2026-06-06", as_of="2026-06-06T15:57:00Z"
+    )
+    assert len(c3.reconciled_fills) == 1
+    assert c3.reconciled_fills[0]["filled_qty"] == 40
+    assert c3.reconciled_fills[0]["newly_filled_qty"] == 25
+    assert c3.reconciled_fills[0]["ledger_status"] == "FILLED"
+    assert len(c3.stops_armed) == 1
+    assert c3.stops_armed[0].action == "stop_synced_gtc"
+    assert c3.stops_armed[0].order is not None and c3.stops_armed[0].order.total_quantity == 40
+    working_stops = [o for o in broker.orders if o.order_type == "STP" and o.status == "Submitted"]
+    assert len(working_stops) == 1 and working_stops[0].total_quantity == 40
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_protocol", [False, True])
+async def test_at08_cancelled_without_fill_transitions_to_cancelled_and_frees_slot(
+    tmp_path: Path, strict_protocol: bool
+) -> None:
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    broker = _ProtocolDeferredBroker(account="SIM_CANCEL") if strict_protocol else SimulatedBroker(account="SIM_CANCEL")
+    inner = broker._inner if strict_protocol else broker
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_CANCEL",
+            client_id=77,
+            db_path=tmp_path / "ledger.sqlite",
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+            max_concurrent_slots=1,
+            max_orders_per_day=2,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState("SIM_CANCEL", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    c1 = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    assert len(c1.reserved) == 1
+
+    # Entry order expires/cancels with 0 fill and 0 shares held.
+    await inner.cancel_order(inner.orders[0])
+
+    # Cycle 2 reconciles SYN2X_A -> CANCELLED, freeing the single concurrent slot for SYN2X_B!
+    c2 = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_B"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:56:00Z",
+    )
+    assert c2.uncertain_holdings is False
+    assert len(c2.reconciled_cancellations) == 1
+    assert c2.reconciled_cancellations[0]["symbol"] == "SYN2X_A"
+    assert c2.reconciled_cancellations[0]["ledger_status"] == "CANCELLED"
+    assert c2.stops_armed == []
+    assert len(c2.reserved) == 1
+
+    rows, _, _ = coord.ledger.validate_integrity("SIM_CANCEL", "2026-06-06")
+    by_sym = {r.symbol: r for r in rows}
+    assert by_sym["SYN2X_A"].status == "CANCELLED"
+    assert by_sym["SYN2X_A"].filled_qty == 0
+    assert by_sym["SYN2X_B"].status == "WORKING"
+
+
+@pytest.mark.asyncio
+async def test_at08_broker_timeout_and_ambiguous_position_fail_closed(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    broker = SimulatedBroker(account="SIM_TO")
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_TO",
+            client_id=77,
+            db_path=tmp_path / "ledger.sqlite",
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+            max_concurrent_slots=2,
+            max_orders_per_day=5,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+        broker_timeout_seconds=0.5,
+    )
+    cash = AccountCashState("SIM_TO", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    assert broker.place_order_calls == 1
+
+    # Broker positions read times out -> fail closed with uncertain_holdings=True and zero new orders.
+    broker.fail_positions_exc = asyncio.TimeoutError("positions read timed out")
+    c_timeout = await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:56:00Z",
+    )
+    assert c_timeout.uncertain_holdings is True
+    assert "SYN2X_A" in c_timeout.uncertain_symbols
+    assert c_timeout.blocked_reason == "reconciliation_uncertain_holdings"
+    assert c_timeout.reserved == []
+    assert c_timeout.stops_armed == []
+    assert c_timeout.rejected == [{"symbol": "SYN2X_A", "reason": "reconciliation_uncertain_holdings"}]
+    assert broker.place_order_calls == 1
+    rows, _, _ = coord.ledger.validate_integrity("SIM_TO", "2026-06-06")
+    assert rows[0].status == "WORKING"
+
+    # Ambiguous excess position on strict 4-method broker -> fail closed for that symbol only.
+    proto_broker = _ProtocolDeferredBroker(account="SIM_AMB")
+    coord_amb = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_AMB",
+            client_id=77,
+            db_path=tmp_path / "amb.sqlite",
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+            max_concurrent_slots=2,
+            max_orders_per_day=5,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=proto_broker,
+    )
+    cash_amb = AccountCashState("SIM_AMB", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    await coord_amb.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash_amb,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    # Entry order disappears from open orders, but broker holds 100 shares (> 40 ordered) with no order-status endpoint.
+    proto_broker._inner.orders[0].status = "Cancelled"
+    proto_broker._inner.set_position("SYN2X_A", 100, avg_cost=50.0)
+
+    bars_both = {**_crossover_bars("SYN2X_A"), **_crossover_bars("SYN2X_B")}
+    c_amb = await coord_amb.run_entry_cycle(
+        bars_by_symbol=bars_both,
+        cash_state=cash_amb,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:56:00Z",
+    )
+    assert c_amb.uncertain_holdings is True
+    assert c_amb.uncertain_symbols == ["SYN2X_A"]
+    assert {"symbol": "SYN2X_A", "reason": "reconciliation_uncertain_holdings"} in c_amb.rejected
+    assert c_amb.stops_armed == []
+    # Unrelated symbol SYN2X_B is still admitted cleanly while SYN2X_A remains fail-closed WORKING.
+    amb_rows, _, _ = coord_amb.ledger.validate_integrity("SIM_AMB", "2026-06-06")
+    amb_by_sym = {r.symbol: r for r in amb_rows}
+    assert amb_by_sym["SYN2X_A"].status == "WORKING"
+    assert amb_by_sym["SYN2X_B"].status == "WORKING"
+
+
+@pytest.mark.asyncio
+async def test_at08_retries_stop_protection_after_transient_stop_rejection(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    broker = SimulatedBroker(account="SIM_RETRY")
+
+    coord = SwingExecutionCoordinator(
+        config=CoordinatorConfig(
+            account="SIM_RETRY",
+            client_id=77,
+            db_path=tmp_path / "ledger.sqlite",
+            kill_switch_path=tmp_path / "KILL_SWITCH",
+            config_path=cfg_file,
+            arm=True,
+        ),
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    cash = AccountCashState("SIM_RETRY", 10_000.0, 10_000.0, 10_000.0, 10_000.0)
+    await coord.run_entry_cycle(
+        bars_by_symbol=_crossover_bars("SYN2X_A"),
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:55:00Z",
+    )
+    broker.simulate_partial_fill(broker.orders[0], 40)
+
+    # First reconciliation cycle: broker transiently rejects the stop order -> stop_armed remains False.
+    broker.reject_next_place_status = "Inactive"
+    c2 = await coord.run_entry_cycle(
+        bars_by_symbol={}, cash_state=cash, session_day="2026-06-06", as_of="2026-06-06T15:56:00Z"
+    )
+    assert len(c2.reconciled_fills) == 1
+    assert c2.stops_armed[0].action == "stop_arm_rejected"
+    rows2, _, _ = coord.ledger.validate_integrity("SIM_RETRY", "2026-06-06")
+    assert rows2[0].status == "FILLED"
+    assert rows2[0].stop_armed is False
+
+    # Next cycle automatically retries arming protection without double-reporting the fill.
+    c3 = await coord.run_entry_cycle(
+        bars_by_symbol={}, cash_state=cash, session_day="2026-06-06", as_of="2026-06-06T15:57:00Z"
+    )
+    assert c3.reconciled_fills == []
+    assert len(c3.stops_armed) == 1
+    assert c3.stops_armed[0].action == "stop_armed_gtc"
+    assert c3.stops_armed[0].order is not None and c3.stops_armed[0].order.total_quantity == 40
+    rows3, _, _ = coord.ledger.validate_integrity("SIM_RETRY", "2026-06-06")
+    assert rows3[0].stop_armed is True
+
+    # Cycle 4 is a complete idempotent no-op.
+    calls_before = broker.place_order_calls
+    c4 = await coord.run_entry_cycle(
+        bars_by_symbol={}, cash_state=cash, session_day="2026-06-06", as_of="2026-06-06T15:58:00Z"
+    )
+    assert c4.stops_armed == []
+    assert broker.place_order_calls == calls_before

@@ -17,6 +17,7 @@ from swing_executor.coordinator import (
     CoordinatorConfig,
     CoordinatorConfigError,
     CycleReport,
+    ReconciliationReport,
     SwingExecutionCoordinator,
     validate_coordinator_config,
 )
@@ -76,6 +77,7 @@ __all__ = [
     "PriceBar",
     "ProbationDecision",
     "ProtectiveStopEngine",
+    "ReconciliationReport",
     "ReservationDecision",
     "ReservationError",
     "SignalProposal",

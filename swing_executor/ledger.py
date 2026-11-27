@@ -219,6 +219,9 @@ class SlotReservation:
     order_id: Optional[int] = None
     perm_id: Optional[int] = None
     filled_qty: int = 0
+    stop_price: Optional[float] = None
+    strategy_id: str = ""
+    stop_armed: bool = False
 
 
 @dataclass(frozen=True)
@@ -318,6 +321,9 @@ class SlotLedger:
                     order_id INTEGER,
                     perm_id INTEGER,
                     filled_qty INTEGER NOT NULL DEFAULT 0,
+                    stop_price REAL,
+                    strategy_id TEXT NOT NULL DEFAULT '',
+                    stop_armed INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(account, order_ref)
                 )
                 """
@@ -325,6 +331,12 @@ class SlotLedger:
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(slot_reservations)").fetchall()}
             if "filled_qty" not in cols:
                 conn.execute("ALTER TABLE slot_reservations ADD COLUMN filled_qty INTEGER NOT NULL DEFAULT 0")
+            if "stop_price" not in cols:
+                conn.execute("ALTER TABLE slot_reservations ADD COLUMN stop_price REAL")
+            if "strategy_id" not in cols:
+                conn.execute("ALTER TABLE slot_reservations ADD COLUMN strategy_id TEXT NOT NULL DEFAULT ''")
+            if "stop_armed" not in cols:
+                conn.execute("ALTER TABLE slot_reservations ADD COLUMN stop_armed INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_slot_res_active ON slot_reservations(account, status, symbol)"
             )
@@ -421,6 +433,23 @@ class SlotLedger:
             raise LedgerCorruptionError(
                 f"reservation.filled_qty ({filled_qty}) exceeds reservation.qty ({qty})"
             )
+        stop_price = (
+            _require_finite(row["stop_price"], name="reservation.stop_price", positive=True)
+            if "stop_price" in row_keys and row["stop_price"] is not None
+            else None
+        )
+        strategy_id = (
+            str(row["strategy_id"] or "")
+            if "strategy_id" in row_keys and row["strategy_id"] is not None
+            else ""
+        )
+        stop_armed_raw = (
+            _require_int(row["stop_armed"], name="reservation.stop_armed", non_negative=True)
+            if "stop_armed" in row_keys and row["stop_armed"] is not None
+            else 0
+        )
+        if stop_armed_raw not in (0, 1):
+            raise LedgerCorruptionError(f"reservation.stop_armed must be 0 or 1, got {stop_armed_raw!r}")
         return SlotReservation(
             reservation_id=str(row["reservation_id"]),
             account=account,
@@ -438,6 +467,9 @@ class SlotLedger:
             order_id=order_id,
             perm_id=perm_id,
             filled_qty=filled_qty,
+            stop_price=stop_price,
+            strategy_id=strategy_id,
+            stop_armed=bool(stop_armed_raw),
         )
 
     def validate_integrity(self, account: str, session_day: str) -> tuple[list[SlotReservation], int, float]:
@@ -476,6 +508,9 @@ class SlotLedger:
         qty: int,
         limit_price: float,
         session_day: str,
+        side: str = "BUY",
+        stop_price: Optional[float] = None,
+        strategy_id: str = "",
         order_ref: Optional[str] = None,
         external_open_symbols: Sequence[str] = (),
         now_iso: Optional[str] = None,
@@ -490,9 +525,14 @@ class SlotLedger:
         sym = str(symbol or "").strip().upper()
         if not sym:
             raise ReservationError("symbol must be non-empty")
+        side_u = str(side or "").strip().upper()
+        if side_u not in ("BUY", "SELL"):
+            raise ReservationError(f"side must be 'BUY' or 'SELL', got {side!r}")
         cid = _require_int(client_id, name="client_id", non_negative=True)
         q = _require_int(qty, name="qty", positive=True)
         lmt = _require_finite(limit_price, name="limit_price", positive=True)
+        stp = None if stop_price is None else _require_finite(stop_price, name="stop_price", positive=True)
+        strat = str(strategy_id or "").strip()
         notional = round(q * lmt, 2)
         if notional <= 0.0:
             raise ReservationError("computed order notional must be positive")
@@ -522,10 +562,10 @@ class SlotLedger:
                 )
 
             # Duplicate active symbol guard (includes external/manual symbols)
-            active_buy_syms = {r.symbol for r in active if r.side == "BUY"}
+            active_entry_syms = {r.symbol for r in active if r.side in ("BUY", "SELL")}
             open_syms = {s.upper() for s, val in cash_state.open_symbol_notional.items() if val > 0.0}
             ext_syms = {str(s).strip().upper() for s in external_open_symbols if str(s).strip()}
-            if sym in active_buy_syms:
+            if sym in active_entry_syms:
                 return ReservationDecision(False, f"duplicate_active_reservation({sym})")
             if sym in open_syms:
                 return ReservationDecision(False, f"position_already_open({sym})")
@@ -533,7 +573,7 @@ class SlotLedger:
                 return ReservationDecision(False, f"external_order_conflict({sym})")
 
             # Concurrent slot cap
-            occupied_slots = open_syms | active_buy_syms
+            occupied_slots = open_syms | active_entry_syms
             if len(occupied_slots) >= self.max_concurrent_slots:
                 return ReservationDecision(
                     False,
@@ -554,7 +594,7 @@ class SlotLedger:
                     return round(max(0, r.qty - r.filled_qty) * r.limit_price, 2)
                 return r.notional_usd
 
-            active_reserved_notional = sum(_unfilled_notional(r) for r in active if r.side == "BUY")
+            active_reserved_notional = sum(_unfilled_notional(r) for r in active if r.side in ("BUY", "SELL"))
             current_deployed = sum(cash_state.open_symbol_notional.values()) + active_reserved_notional
             deployed_cap = cash_state.net_liq_usd * self.max_deployed_fraction
             if current_deployed + notional > deployed_cap + 1e-9:
@@ -566,7 +606,7 @@ class SlotLedger:
             # Correlated sector-group exposure cap
             symbol_notional = {s.upper(): float(v) for s, v in cash_state.open_symbol_notional.items()}
             for r in active:
-                if r.side == "BUY":
+                if r.side in ("BUY", "SELL"):
                     symbol_notional[r.symbol] = symbol_notional.get(r.symbol, 0.0) + _unfilled_notional(r)
             for group_name, members in self.sector_groups.items():
                 if sym in members:
@@ -592,7 +632,7 @@ class SlotLedger:
                 account=cash_state.account,
                 client_id=cid,
                 symbol=sym,
-                side="BUY",
+                side=side_u,
                 qty=q,
                 limit_price=lmt,
                 notional_usd=notional,
@@ -601,6 +641,9 @@ class SlotLedger:
                 session_day=session_day,
                 created_at=ts,
                 updated_at=ts,
+                stop_price=stp,
+                strategy_id=strat,
+                stop_armed=False,
             )
 
             conn = self._connect()
@@ -610,8 +653,9 @@ class SlotLedger:
                     """
                     INSERT INTO slot_reservations (
                         reservation_id, account, client_id, symbol, side, qty, limit_price,
-                        notional_usd, order_ref, status, session_day, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        notional_usd, order_ref, status, session_day, created_at, updated_at,
+                        stop_price, strategy_id, stop_armed
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         reservation.reservation_id,
@@ -627,6 +671,9 @@ class SlotLedger:
                         reservation.session_day,
                         reservation.created_at,
                         reservation.updated_at,
+                        reservation.stop_price,
+                        reservation.strategy_id,
+                        0,
                     ),
                 )
                 conn.execute(
@@ -656,6 +703,7 @@ class SlotLedger:
         order_id: Optional[int] = None,
         perm_id: Optional[int] = None,
         filled_qty: Optional[int] = None,
+        stop_armed: Optional[bool] = None,
         now_iso: Optional[str] = None,
         expected_account: Optional[str] = None,
     ) -> None:
@@ -667,6 +715,9 @@ class SlotLedger:
             _require_int(perm_id, name="perm_id", non_negative=True)
         if filled_qty is not None:
             filled_qty = _require_int(filled_qty, name="filled_qty", non_negative=True)
+        if stop_armed is not None and not isinstance(stop_armed, bool):
+            raise ReservationError(f"stop_armed must be a bool, got {type(stop_armed).__name__} {stop_armed!r}")
+        stop_armed_int = None if stop_armed is None else (1 if stop_armed else 0)
         ts = now_iso or dt.datetime.now(dt.timezone.utc).isoformat()
         with self.mutation_lock():
             conn = self._connect()
@@ -693,10 +744,11 @@ class SlotLedger:
                         order_id = COALESCE(?, order_id),
                         perm_id = COALESCE(?, perm_id),
                         filled_qty = COALESCE(?, filled_qty),
+                        stop_armed = COALESCE(?, stop_armed),
                         updated_at = ?
                     WHERE reservation_id = ?
                     """,
-                    (status, order_id, perm_id, filled_qty, ts, reservation_id),
+                    (status, order_id, perm_id, filled_qty, stop_armed_int, ts, reservation_id),
                 )
                 if cur.rowcount != 1:
                     raise ReservationError(f"reservation_id not found: {reservation_id!r}")
@@ -706,6 +758,18 @@ class SlotLedger:
     def active_reservations(self, account: str, session_day: str) -> list[SlotReservation]:
         rows, _, _ = self.validate_integrity(account, session_day)
         return [r for r in rows if r.status in ACTIVE_RESERVATION_STATUSES]
+
+    def reconcilable_reservations(self, account: str, session_day: str) -> list[SlotReservation]:
+        """Return persisted reservations requiring broker fill/stop reconciliation."""
+        rows, _, _ = self.validate_integrity(account, session_day)
+        candidates = [
+            r
+            for r in rows
+            if r.status in ("SUBMITTED", "WORKING", "PARTIALLY_FILLED")
+            or (r.status == "FILLED" and r.filled_qty > 0 and not r.stop_armed)
+        ]
+        candidates.sort(key=lambda r: (r.created_at, r.reservation_id))
+        return candidates
 
 
 def validate_persisted_counter_json(path: Path | str) -> dict[str, dict[str, float | int]]:

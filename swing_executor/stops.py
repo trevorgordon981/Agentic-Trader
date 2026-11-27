@@ -664,6 +664,11 @@ class SimulatedBroker:
             raise self.fail_open_orders_exc
         return [o for o in self.orders if o.status not in TERMINAL_STATUSES]
 
+    async def req_completed_orders(self) -> list[BrokerOrder]:
+        if self.fail_open_orders_exc is not None:
+            raise self.fail_open_orders_exc
+        return [o for o in self.orders if o.status in TERMINAL_STATUSES]
+
     async def req_positions(self) -> list[BrokerPosition]:
         if self.fail_positions_exc is not None:
             raise self.fail_positions_exc
