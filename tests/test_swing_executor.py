@@ -1600,3 +1600,376 @@ def test_at09_ledger_stop_covered_qty_invariants_and_corruption_guards(tmp_path:
         conn.commit()
     with pytest.raises(LedgerCorruptionError, match="stop_covered_qty"):
         ledger.validate_integrity("SIM_INV", "2026-06-06")
+
+
+# ---------------------------------------------------------------------------
+# AT10: Legacy ledger upgrade must never infer stop_covered_qty from stop_armed
+# ---------------------------------------------------------------------------
+
+
+def _create_legacy_pre_at09_db(
+    db_path: Path,
+    *,
+    account: str,
+    client_id: int = 77,
+    symbol: str = "SYN2X_A",
+    qty: int = 40,
+    filled_qty: int = 40,
+    status: str = "FILLED",
+    stop_armed: int = 1,
+    stop_price: float = 47.5,
+    order_id: int = 5001,
+    perm_id: int = 9001,
+    reservation_id: str = "res_legacy_at10",
+    session_day: str = "2026-06-06",
+) -> str:
+    """Create a genuine pre-AT09 SQLite ledger (without stop_covered_qty column)."""
+    order_ref = f"SWING_ENTRY:{symbol}:{reservation_id}"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE slot_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                account TEXT NOT NULL,
+                client_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty INTEGER NOT NULL,
+                limit_price REAL NOT NULL,
+                notional_usd REAL NOT NULL,
+                order_ref TEXT NOT NULL,
+                status TEXT NOT NULL,
+                session_day TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                order_id INTEGER,
+                perm_id INTEGER,
+                filled_qty INTEGER NOT NULL DEFAULT 0,
+                stop_price REAL,
+                strategy_id TEXT NOT NULL DEFAULT '',
+                stop_armed INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(account, order_ref)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE daily_counters (
+                account TEXT NOT NULL,
+                session_day TEXT NOT NULL,
+                orders_opened INTEGER NOT NULL,
+                notional_opened REAL NOT NULL,
+                PRIMARY KEY(account, session_day)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO slot_reservations (
+                reservation_id, account, client_id, symbol, side, qty, limit_price,
+                notional_usd, order_ref, status, session_day, created_at, updated_at,
+                order_id, perm_id, filled_qty, stop_price, strategy_id, stop_armed
+            ) VALUES (?, ?, ?, ?, 'BUY', ?, 50.0, ?, ?, ?, ?, '2026-06-06T15:55:00Z',
+                      '2026-06-06T15:57:00Z', ?, ?, ?, ?, 'toy_sma_crossover', ?)
+            """,
+            (
+                reservation_id,
+                account,
+                client_id,
+                symbol,
+                qty,
+                round(qty * 50.0, 2),
+                order_ref,
+                status,
+                session_day,
+                order_id,
+                perm_id,
+                filled_qty,
+                stop_price,
+                stop_armed,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO daily_counters (account, session_day, orders_opened, notional_opened)
+            VALUES (?, ?, 1, ?)
+            """,
+            (account, session_day, round(qty * 50.0, 2)),
+        )
+        conn.commit()
+    return order_ref
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_protocol", [False, True])
+async def test_at10_legacy_db_upgrade_resizes_underprotected_stop_on_first_reconciliation(
+    tmp_path: Path, strict_protocol: bool
+) -> None:
+    """Reproduces AT10: legacy DB (FILLED/40/stop_armed=1, no stop_covered_qty) + 15-share stop -> resizes to 40."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "legacy_at10.sqlite"
+    account = "SIM_AT10_PROTO" if strict_protocol else "SIM_AT10"
+
+    entry_ref = _create_legacy_pre_at09_db(
+        db_path,
+        account=account,
+        client_id=77,
+        symbol="SYN2X_A",
+        qty=40,
+        filled_qty=40,
+        status="FILLED",
+        stop_armed=1,
+        stop_price=47.5,
+        order_id=5001,
+        perm_id=9001,
+        reservation_id="res_legacy_at10",
+    )
+
+    # Confirm the fixture is genuinely pre-AT09 before current code opens it.
+    with sqlite3.connect(str(db_path)) as conn:
+        legacy_cols = {row[1] for row in conn.execute("PRAGMA table_info(slot_reservations)").fetchall()}
+        legacy_row = conn.execute(
+            "SELECT status, qty, filled_qty, stop_armed FROM slot_reservations WHERE reservation_id = ?",
+            ("res_legacy_at10",),
+        ).fetchone()
+    assert "stop_covered_qty" not in legacy_cols
+    assert legacy_row == ("FILLED", 40, 40, 1)
+
+    broker = _ProtocolDeferredBroker(account=account) if strict_protocol else SimulatedBroker(account=account)
+    inner = broker._inner if strict_protocol else broker
+    inner.set_position("SYN2X_A", 40, avg_cost=50.0)
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="BUY",
+            order_type="LMT",
+            total_quantity=40,
+            client_id=77,
+            order_id=5001,
+            perm_id=9001,
+            order_ref=entry_ref,
+            status="Filled",
+            limit_price=50.0,
+            filled=40,
+            tif="DAY",
+        )
+    )
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="SELL",
+            order_type="STP",
+            total_quantity=15,
+            client_id=77,
+            order_id=1001,
+            perm_id=9002,
+            order_ref="SWING_STOP:res_legacy_at10",
+            status="Submitted",
+            aux_price=47.5,
+            filled=0,
+            tif="GTC",
+        )
+    )
+
+    cfg = CoordinatorConfig(
+        account=account,
+        client_id=77,
+        db_path=db_path,
+        kill_switch_path=tmp_path / "KILL_SWITCH",
+        config_path=cfg_file,
+        arm=True,
+    )
+    coord = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+
+    # Migration must NOT infer stop_covered_qty=40 from legacy stop_armed=1.
+    migrated_rows, _, _ = coord.ledger.validate_integrity(account, "2026-06-06")
+    assert len(migrated_rows) == 1
+    assert migrated_rows[0].status == "FILLED"
+    assert migrated_rows[0].filled_qty == 40
+    assert migrated_rows[0].stop_armed is False
+    assert migrated_rows[0].stop_covered_qty == 0
+    assert [r.reservation_id for r in coord.ledger.reconcilable_reservations(account, "2026-06-06")] == [
+        "res_legacy_at10"
+    ]
+
+    # One normal reconciliation cycle resizes the 15-share stop in place to 40 shares.
+    cash = AccountCashState(account, 10_000.0, 8_000.0, 8_000.0, 8_000.0, open_symbol_notional={"SYN2X_A": 2_000.0})
+    calls_before = inner.place_order_calls
+    c1 = await coord.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:58:00Z",
+    )
+    assert c1.uncertain_holdings is False
+    assert c1.reconciled_fills == []
+    assert len(c1.stops_armed) == 1
+    assert c1.stops_armed[0].action == "stop_synced_gtc"
+    assert c1.stops_armed[0].stop_rearmed is True
+    assert c1.stops_armed[0].order is not None
+    assert c1.stops_armed[0].order.total_quantity == 40
+    assert c1.stops_armed[0].order.remaining == 40
+    assert c1.stops_armed[0].order.tif == "GTC"
+    assert c1.stops_armed[0].order.order_id == 1001
+    assert c1.stops_armed[0].order.perm_id == 9002
+    assert inner.place_order_calls == calls_before + 1
+
+    working_stops = [o for o in inner.orders if o.order_type == "STP" and o.status == "Submitted"]
+    assert len(working_stops) == 1
+    assert working_stops[0].total_quantity == 40
+    assert working_stops[0].remaining == 40
+
+    rows_after, _, _ = coord.ledger.validate_integrity(account, "2026-06-06")
+    assert rows_after[0].stop_armed is True
+    assert rows_after[0].stop_covered_qty == 40
+    assert coord.ledger.reconcilable_reservations(account, "2026-06-06") == []
+
+    # Fresh restart on the now-migrated DB preserves confirmed coverage and performs zero new orders.
+    coord2 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    calls_before_restart = inner.place_order_calls
+    c2 = await coord2.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:59:00Z",
+    )
+    assert c2.reconciled_fills == []
+    assert c2.stops_armed == []
+    assert inner.place_order_calls == calls_before_restart
+    rows_restart, _, _ = coord2.ledger.validate_integrity(account, "2026-06-06")
+    assert rows_restart[0].stop_armed is True
+    assert rows_restart[0].stop_covered_qty == 40
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_protocol", [False, True])
+async def test_at10_legacy_db_control_confirms_existing_full_stop_without_duplicates(
+    tmp_path: Path, strict_protocol: bool
+) -> None:
+    """AT10 control: legacy DB (FILLED/40/stop_armed=1) + existing 40-share GTC stop -> confirms with zero orders."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text("profile: sim\n", encoding="utf-8")
+    db_path = tmp_path / "legacy_at10_control.sqlite"
+    account = "SIM_AT10_CTRL_PROTO" if strict_protocol else "SIM_AT10_CTRL"
+
+    entry_ref = _create_legacy_pre_at09_db(
+        db_path,
+        account=account,
+        client_id=77,
+        symbol="SYN2X_A",
+        qty=40,
+        filled_qty=40,
+        status="FILLED",
+        stop_armed=1,
+        stop_price=47.5,
+        order_id=5001,
+        perm_id=9001,
+        reservation_id="res_legacy_at10_ctrl",
+    )
+
+    broker = _ProtocolDeferredBroker(account=account) if strict_protocol else SimulatedBroker(account=account)
+    inner = broker._inner if strict_protocol else broker
+    inner.set_position("SYN2X_A", 40, avg_cost=50.0)
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="BUY",
+            order_type="LMT",
+            total_quantity=40,
+            client_id=77,
+            order_id=5001,
+            perm_id=9001,
+            order_ref=entry_ref,
+            status="Filled",
+            limit_price=50.0,
+            filled=40,
+            tif="DAY",
+        )
+    )
+    inner.orders.append(
+        BrokerOrder(
+            account=account,
+            symbol="SYN2X_A",
+            action="SELL",
+            order_type="STP",
+            total_quantity=40,
+            client_id=77,
+            order_id=1001,
+            perm_id=9002,
+            order_ref="SWING_STOP:res_legacy_at10_ctrl",
+            status="Submitted",
+            aux_price=47.5,
+            filled=0,
+            tif="GTC",
+        )
+    )
+
+    cfg = CoordinatorConfig(
+        account=account,
+        client_id=77,
+        db_path=db_path,
+        kill_switch_path=tmp_path / "KILL_SWITCH",
+        config_path=cfg_file,
+        arm=True,
+    )
+    coord = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+
+    # Migration leaves coverage unverified until broker confirms it.
+    migrated_rows, _, _ = coord.ledger.validate_integrity(account, "2026-06-06")
+    assert migrated_rows[0].stop_armed is False
+    assert migrated_rows[0].stop_covered_qty == 0
+
+    cash = AccountCashState(account, 10_000.0, 8_000.0, 8_000.0, 8_000.0, open_symbol_notional={"SYN2X_A": 2_000.0})
+    calls_before = inner.place_order_calls
+    c1 = await coord.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:58:00Z",
+    )
+    assert c1.uncertain_holdings is False
+    assert c1.reconciled_fills == []
+    assert c1.stops_armed == []
+    assert inner.place_order_calls == calls_before
+
+    working_stops = [o for o in inner.orders if o.order_type == "STP" and o.status == "Submitted"]
+    assert len(working_stops) == 1
+    assert working_stops[0].total_quantity == 40
+    assert working_stops[0].order_id == 1001
+    assert working_stops[0].perm_id == 9002
+
+    rows_after, _, _ = coord.ledger.validate_integrity(account, "2026-06-06")
+    assert rows_after[0].stop_armed is True
+    assert rows_after[0].stop_covered_qty == 40
+    assert coord.ledger.reconcilable_reservations(account, "2026-06-06") == []
+
+    # Subsequent restart is a strict no-op.
+    coord2 = SwingExecutionCoordinator(
+        config=cfg,
+        signal_provider=ToyCrossoverSignal(fast_window=3, slow_window=5, stop_pct=0.05),
+        broker=broker,
+    )
+    c2 = await coord2.run_entry_cycle(
+        bars_by_symbol={},
+        cash_state=cash,
+        session_day="2026-06-06",
+        as_of="2026-06-06T15:59:00Z",
+    )
+    assert c2.stops_armed == []
+    assert inner.place_order_calls == calls_before

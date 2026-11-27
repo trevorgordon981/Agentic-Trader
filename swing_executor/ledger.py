@@ -340,11 +340,27 @@ class SlotLedger:
             if "stop_armed" not in cols:
                 conn.execute("ALTER TABLE slot_reservations ADD COLUMN stop_armed INTEGER NOT NULL DEFAULT 0")
             if "stop_covered_qty" not in cols:
-                conn.execute("ALTER TABLE slot_reservations ADD COLUMN stop_covered_qty INTEGER NOT NULL DEFAULT 0")
-                conn.execute(
-                    "UPDATE slot_reservations SET stop_covered_qty = filled_qty "
-                    "WHERE stop_armed = 1 AND filled_qty > 0 AND stop_covered_qty = 0"
-                )
+                # Legacy schemas lacked stop_covered_qty, so stop_armed=1 could mask an
+                # underprotected fill after a rejected stop resize. Never infer full coverage
+                # from legacy stop_armed=1; default stop_covered_qty=0 and clear stop_armed
+                # so the next startup/reconciliation cycle verifies fresh broker stop coverage.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    cols = {
+                        row["name"]
+                        for row in conn.execute("PRAGMA table_info(slot_reservations)").fetchall()
+                    }
+                    if "stop_covered_qty" not in cols:
+                        conn.execute(
+                            "ALTER TABLE slot_reservations ADD COLUMN stop_covered_qty INTEGER NOT NULL DEFAULT 0"
+                        )
+                        conn.execute(
+                            "UPDATE slot_reservations SET stop_armed = 0 WHERE stop_armed = 1"
+                        )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_slot_res_active ON slot_reservations(account, status, symbol)"
             )
