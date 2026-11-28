@@ -84,13 +84,13 @@ for 2x leveraged-ETF swing accounts while strictly excluding proprietary alpha:
 
 ## 5-Minute Offline Demo (Zero Broker / Zero Network)
 
-Supported Python: **Python 3.10–3.14** (CI runs on Python 3.12).
+**Requires Python >= 3.11** (supports Python 3.10–3.14; recommended `python3.11 -m venv .venv` for the offline demo; GitHub Actions CI and the default `tests/conftest.py` interpreter guard run on Python 3.12).
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python3 scripts/demo_offline_simulation.py
+PYTHONPATH=$PWD python scripts/demo_offline_simulation.py
 ```
 
 Expected output:
@@ -123,6 +123,8 @@ machine-readable execution trace.
 
 ## Recovery & Safety Verification Tests
 
+> Note: `tests/conftest.py` enforces Python >= 3.12 by default to match CI (`python-version: "3.12"`). On Python 3.11, prefix `EXITMGR_ALLOW_ANY_PYTHON=1` when running the targeted safety suite.
+
 Run the targeted fail-closed audit and 2x swing stop-race recovery suite:
 
 ```bash
@@ -134,6 +136,17 @@ Run the full repository test suite (mirrors GitHub Actions CI):
 ```bash
 PYTHONPATH=$PWD pytest -q --timeout=60 tests/
 ```
+
+## Measured Results
+
+Software and test-harness verification numbers only (no live-trading return, profitability, or alpha claims — see the disclaimer at the top of this README):
+
+| Verification Check | Environment | Result | Runtime |
+| --- | --- | --- | --- |
+| Offline proposal-to-close simulation (`scripts/demo_offline_simulation.py`) | macOS, isolated Python 3.11.14 venv | Pass (`exit 0`, all 4 fail-closed gates + 2x swing trace) | `0.48s` wall |
+| Targeted audit & swing safety suite (`test_audit_findings_at01_at05.py`, `test_swing_executor.py`) | macOS, Python 3.11.14 (`EXITMGR_ALLOW_ANY_PYTHON=1`) | `95 passed, 0 failed` | `3.69s` pytest (`3.99s` wall) |
+| GitHub Actions CI: `offline-demo-and-safety` | `ubuntu-latest`, Python 3.12 | Pass (offline demo + `95 passed in 2.42s`) | `21s` job |
+| GitHub Actions CI: full 4-shard `pytest` suite (226 test modules) | `ubuntu-latest`, Python 3.12 | `4,369 passed, 21 skipped, 5 xfailed, 0 failed` (`58 subtests passed`) | `1m05s` slowest shard (`10.52s`–`41.83s` pytest across shards) |
 
 ## Runtime Modes (Read / Preview / Paper / Live)
 
